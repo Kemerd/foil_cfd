@@ -34,7 +34,8 @@ struct PolarPoint {
     float yplusMean = 0.0f;
 };
 
-PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel) {
+PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel,
+                    bool usePatch = true) {
     PolarPoint pt;
     pt.aoa = aoa;
     pt.wallModel = wallModel;
@@ -46,7 +47,12 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel) {
     PhysicalParams phys;
     phys.chord_m     = 1.2f;
     phys.airspeed_ms = 35.7632f; // the app default (80 mph)
-    const LatticeScaling scaling = computeScaling(phys, kNc);
+    // HiFi-style lattice speed: at u_lat 0.08 the first sweep diverged on
+    // the fine level beyond AoA 12 (cold impulsive starts at the tau clamp
+    // — the app survives these via mesh-sequencing preconvergence, which
+    // this standalone tool does not replicate). 0.05 lowers the lattice
+    // Mach enough to ride out the start-up transient at every AoA.
+    const LatticeScaling scaling = computeScaling(phys, kNc, 0.05f);
 
     const std::vector<std::uint8_t> clean =
         buildCleanFoilFlags(foil, aoa, layout);
@@ -69,7 +75,7 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel) {
     const PatchBox box = derivePatchBox(layout.dims, clean,
                                         cellsOf(0.20f), cellsOf(0.50f),
                                         cellsOf(0.10f), cellsOf(0.20f));
-    if (box.valid()) {
+    if (usePatch && box.valid()) {
         const DomainLayout fineLayout = makeFineLayout(layout, box, 2);
         std::vector<std::uint8_t> fine(
             static_cast<std::size_t>(fineLayout.dims.cellCount()),
@@ -85,8 +91,11 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel) {
             std::printf("  (patch unavailable: %s)\n", err.c_str());
     }
 
+    // 5 flow-throughs: the trailing force window covers [3, 5] FT, fully
+    // clear of the impulsive-start transient (the first sweep's 3 FT left
+    // the window sampling start-up drag spikes — Cd read 5-10x high).
     const int totalSteps =
-        static_cast<int>(3.0f * scaling.flowThroughSteps(layout.dims.nx));
+        static_cast<int>(5.0f * scaling.flowThroughSteps(layout.dims.nx));
     for (int done = 0; done < totalSteps; done += 512) {
         if (solver.stepN(std::min(512, totalSteps - done)) != cudaSuccess)
             return pt;
@@ -111,13 +120,34 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const AirfoilLoadResult load =
         loadAirfoilDat(FOILCFD_AIRFOIL_DIR "/ls413.dat");
     if (!load.ok) {
         std::printf("ls413.dat load failed: %s\n",
                     load.rejectionReason.c_str());
         return 1;
+    }
+
+    // --probe: the drag-anomaly isolation experiment. The full sweeps read
+    // absolute Cd 5-10x above any plausible value while Cl stayed sane.
+    // Three AoA-0 cases isolate where the excess lives: coarse-only plain
+    // walls, the 2x patch (fine-grid force path + restriction), and the
+    // wall model on top of the patch.
+    if (argc > 1 && std::string(argv[1]) == "--probe") {
+        struct { const char* label; bool wm; bool patch; } cases[] = {
+            {"coarse, plain BB ", false, false},
+            {"2x patch, plain BB", false, true},
+            {"2x patch, WM on  ", true, true},
+        };
+        std::printf("Cd anomaly probe, AoA 0:\n");
+        for (const auto& c : cases) {
+            const PolarPoint pt = runPoint(load.airfoil, 0.0f, c.wm, c.patch);
+            std::printf("  %s  Cl %7.3f  Cd %7.4f%s\n", c.label, pt.cl,
+                        pt.cd, pt.ok ? "" : "  FAILED");
+            std::fflush(stdout);
+        }
+        return 0;
     }
 
     const PhysicalParams phys{}; // defaults only used for the banner below
