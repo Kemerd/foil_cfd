@@ -6,7 +6,7 @@
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA-green.svg)](#requirements)
 [![CUDA 12.8+](https://img.shields.io/badge/CUDA-12.8%2B-76b900.svg)](#requirements)
 
-[Preview of software](preview.jpg)
+![Preview of software](preview.jpg)
 
 Load your airfoil. Set your angle of attack. Watch a million particles stream over the wing
 in real time. Bolt on vortex generators, drag a slider, and see the separation bubble react
