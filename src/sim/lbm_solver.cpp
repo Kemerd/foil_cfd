@@ -249,6 +249,35 @@ struct LBMSolver::Impl {
                      ///< finest resolution — this is the level whose wall
                      ///< stress the readout reports when active).
 
+    // ---- interpolated bounce-back (q-LIBB) per level -----------------------
+    // The dense per-cell-per-direction cut-fraction field the hot kernel reads
+    // (QLinkView). Only allocated on levels that carry RESOLVED vanes — in
+    // practice the fine and nested (finer) patches; the coarse grid's vanes are
+    // too under-resolved for q-LIBB to mean anything, so it stays unallocated.
+    struct QLevel {
+        bool           active = false;
+        std::uint8_t*  dQFrac  = nullptr; ///< [ncells*kQ] cut fraction bytes.
+        std::uint32_t* dFFMask = nullptr; ///< [ncells] bit q: x_ff fluid.
+        int            links   = 0;       ///< Resolved q-links (UI readout).
+        int            fallback = 0;      ///< Thin-vane links left at half-way.
+
+        QLinkView view() const {
+            return active ? QLinkView{dQFrac, dFFMask} : QLinkView{};
+        }
+        void free() {
+            cudaFree(dQFrac);  cudaFree(dFFMask);
+            *this = QLevel{};
+        }
+    };
+    bool   qlibbEnabled = false; ///< User/app switch (survives re-init).
+    QLevel qCoarse;              ///< (Normally inactive — vanes unresolved here.)
+    QLevel qFine;
+    QLevel qFiner;
+    // NOTE: the analytic vane slabs + q-link construction live in the GEOM layer
+    // (vg.h buildVaneQLinks/densifyQLinks); the app builds the dense fields and
+    // hands them here via setFineQLinks/setFinerQLinks, so the solver stays
+    // geom-free and just owns the device mirror.
+
     // Host copies the FINE wall-list rebuild needs (the coarse analogs are
     // hostFlags / surfaceRefFlags above): the live fine flags as uploaded by
     // initRefinement/setRefinedFlags, and the clean (VG-free) fine reference.
@@ -337,6 +366,47 @@ struct LBMSolver::Impl {
         return cudaSuccess;
     }
 
+    /// @brief Upload a densified q-LIBB field into a level's device mirror.
+    /// Frees the previous mirror first; leaves the level inactive (plain
+    /// bounce-back) when the field is empty/disabled or any allocation fails.
+    /// @param ql        The level's q mirror to (re)build.
+    /// @param qFrac     Dense per-cell-per-dir cut bytes (ncells*kQ), or empty.
+    /// @param ffMask    Dense per-cell two-node-usable mask (ncells).
+    /// @param levelNcells Cell count of the level.
+    /// @param links     Resolved-link count (UI readout).
+    /// @param fallback  Thin-vane links left at half-way (UI readout).
+    cudaError_t uploadQLevel(QLevel& ql,
+                             const std::vector<std::uint8_t>& qFrac,
+                             const std::vector<std::uint32_t>& ffMask,
+                             long long levelNcells, int links, int fallback) {
+        ql.free();
+        if (!qlibbEnabled || links == 0
+            || qFrac.size() != static_cast<std::size_t>(levelNcells) * kQ
+            || ffMask.size() != static_cast<std::size_t>(levelNcells))
+            return cudaSuccess;
+
+        const std::size_t qBytes =
+            static_cast<std::size_t>(levelNcells) * kQ * sizeof(std::uint8_t);
+        const std::size_t mBytes =
+            static_cast<std::size_t>(levelNcells) * sizeof(std::uint32_t);
+        if (auto err = cudaMalloc(reinterpret_cast<void**>(&ql.dQFrac), qBytes);
+            err != cudaSuccess) { ql.free(); return err; }
+        if (auto err = cudaMalloc(reinterpret_cast<void**>(&ql.dFFMask), mBytes);
+            err != cudaSuccess) { ql.free(); return err; }
+        cudaMemcpyAsync(ql.dQFrac, qFrac.data(), qBytes,
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(ql.dFFMask, ffMask.data(), mBytes,
+                        cudaMemcpyHostToDevice, stream);
+        if (auto err = cudaStreamSynchronize(stream); err != cudaSuccess) {
+            ql.free();
+            return err;
+        }
+        ql.active   = true;
+        ql.links    = links;
+        ql.fallback = fallback;
+        return cudaSuccess;
+    }
+
     /// @brief (Re)build the coarse wall-cell list from the current host
     /// flags. No-op (free only) when the wall model is off.
     void rebuildWallModelCoarse() {
@@ -404,6 +474,7 @@ struct LBMSolver::Impl {
         cudaFree(finer.flags); finer.flags = nullptr;
         finer = FineLevel{};
         wmFiner.free();
+        qFiner.free();
         finerHostFlags.clear();
         finerSurfaceRefFlags.clear();
     }
@@ -416,9 +487,10 @@ struct LBMSolver::Impl {
         for (FPop*& p : fine.f) { cudaFree(p); p = nullptr; }
         cudaFree(fine.flags); fine.flags = nullptr;
         fine = FineLevel{};
-        // The fine wall-model mirror indexes fine-level cells; it dies with
-        // the level (a later initRefinement rebuilds it).
+        // The fine wall-model + q-LIBB mirrors index fine-level cells; they die
+        // with the level (a later initRefinement rebuilds them).
         wmFine.free();
+        qFine.free();
         fineHostFlags.clear();
         fineSurfaceRefFlags.clear();
     }
@@ -680,6 +752,7 @@ struct LBMSolver::Impl {
         freeFine();
         wmCoarse.free(); // wmFine already died with freeFine(); the wmEnabled
                          // SETTING survives so re-init reapplies the policy.
+        qCoarse.free();  // qFine/qFiner died with freeFine(); the setting survives.
         for (FPop*& p : f) { cudaFree(p); p = nullptr; }
         cudaFree(flags); flags = nullptr;
         cudaFree(rho); rho = nullptr;
@@ -949,6 +1022,67 @@ WallModelReadout LBMSolver::wallModelReadout() const {
     return r;
 }
 
+// ------ interpolated bounce-back (q-LIBB) ------
+
+void LBMSolver::setQLIBBEnabled(bool enabled) {
+    Impl& s = *impl_;
+    if (s.qlibbEnabled == enabled) return;
+    s.qlibbEnabled = enabled;
+    if (enabled) return; // uploads (re)build the fields; nothing to do here.
+    // Turning off: free every level's q field immediately so the next step
+    // runs the plain bounce-back kernel instantiation.
+    s.qCoarse.free();
+    s.qFine.free();
+    s.qFiner.free();
+}
+
+bool LBMSolver::qlibbEnabled() const { return impl_->qlibbEnabled; }
+
+void LBMSolver::setCoarseQLinks(const std::vector<std::uint8_t>& qFrac,
+                                const std::vector<std::uint32_t>& ffMask,
+                                int links, int fallback) {
+    Impl& s = *impl_;
+    if (!s.initialized) return;
+    s.uploadQLevel(s.qCoarse, qFrac, ffMask, s.ncells, links, fallback);
+}
+
+void LBMSolver::setFineQLinks(const std::vector<std::uint8_t>& qFrac,
+                              const std::vector<std::uint32_t>& ffMask,
+                              int links, int fallback) {
+    Impl& s = *impl_;
+    if (!s.initialized || !s.fine.active) return;
+    s.uploadQLevel(s.qFine, qFrac, ffMask, s.fine.ncells, links, fallback);
+}
+
+void LBMSolver::setFinerQLinks(const std::vector<std::uint8_t>& qFrac,
+                               const std::vector<std::uint32_t>& ffMask,
+                               int links, int fallback) {
+    Impl& s = *impl_;
+    if (!s.initialized || !s.finer.active) return;
+    s.uploadQLevel(s.qFiner, qFrac, ffMask, s.finer.ncells, links, fallback);
+}
+
+long long LBMSolver::fineCellCount() const {
+    return impl_->fine.active ? impl_->fine.ncells : 0;
+}
+
+long long LBMSolver::finerCellCount() const {
+    return impl_->finer.active ? impl_->finer.ncells : 0;
+}
+
+QLIBBReadout LBMSolver::qlibbReadout() const {
+    const Impl& s = *impl_;
+    QLIBBReadout r;
+    r.enabled = s.qlibbEnabled;
+    if (!s.qlibbEnabled) return r;
+    for (const Impl::QLevel* q : {&s.qCoarse, &s.qFine, &s.qFiner}) {
+        if (!q->active) continue;
+        r.links    += q->links;
+        r.fallback += q->fallback;
+    }
+    return r;
+}
+
 void LBMSolver::applyEditedFlags(const std::vector<std::uint8_t>& flags) {
     Impl& s = *impl_;
     if (!s.initialized) return;
@@ -1021,7 +1155,8 @@ cudaError_t LBMSolver::stepN(int n) {
 
         const cudaError_t err = launchStreamCollide(
             s.view(s.src), s.view(1 - s.src), params,
-            s.rho, s.u, s.v, s.w, s.stream, s.wmCoarse.slipView());
+            s.rho, s.u, s.v, s.w, s.stream, s.wmCoarse.slipView(),
+            s.qCoarse.view());
         if (err != cudaSuccess) return err;
 
         // The freshly written buffer needs its spanwise ghost planes synced
@@ -1063,7 +1198,7 @@ cudaError_t LBMSolver::stepN(int n) {
                 if (auto e = launchStreamCollide(
                         s.fineView(s.fine.src), s.fineView(1 - s.fine.src),
                         fineParams, nullptr, nullptr, nullptr, nullptr,
-                        s.stream, s.wmFine.slipView());
+                        s.stream, s.wmFine.slipView(), s.qFine.view());
                     e != cudaSuccess)
                     return e;
                 if (auto e = launchRefreshGhostZ(s.fine.f[1 - s.fine.src],
@@ -1105,7 +1240,7 @@ cudaError_t LBMSolver::stepN(int n) {
                                 s.finerView(s.finer.src),
                                 s.finerView(1 - s.finer.src), finerParams,
                                 nullptr, nullptr, nullptr, nullptr, s.stream,
-                                s.wmFiner.slipView());
+                                s.wmFiner.slipView(), s.qFiner.view());
                             e != cudaSuccess)
                             return e;
                         if (auto e = launchRefreshGhostZ(

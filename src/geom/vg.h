@@ -32,6 +32,7 @@ struct VGParams {
   float gap_h;      // intra-pair gap in heights (pairs; default 2.5)
   int   count;      // number of units across the span
   bool  commonFlowDown; // pair orientation
+  bool  enabled = true; // when false: voxelized and rendered as ghost only
 };
 
 /// @brief Sensible starting values matching the plan's "typical" annotations
@@ -79,8 +80,13 @@ SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil, const VGParams& pa
 /// @param aoa_deg Current angle of attack (vanes rotate with the foil).
 /// @param layout  Foil placement/scale inside the grid.
 /// @param flags   Host flag field, modified in place.
+/// @param slabsOut Optional: appends one VaneSlab OBB per stamped vane (the
+///                 analytic side-face descriptor the q-LIBB build ray-intersects
+///                 — see voxelizer.h). nullptr (default) keeps the legacy
+///                 stamp-only behavior, so existing call sites are untouched.
 void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil, float aoa_deg,
-                const DomainLayout& layout, std::vector<std::uint8_t>& flags);
+                const DomainLayout& layout, std::vector<std::uint8_t>& flags,
+                std::vector<VaneSlab>* slabsOut = nullptr);
 
 /// @brief Stamp a whole VG configuration: copy of the cached clean-foil flags
 /// + every entry voxelized + one TE-closure pass at the end. This is the
@@ -90,11 +96,78 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil, float aoa_de
 /// @param aoa_deg       Angle of attack.
 /// @param layout        Domain layout.
 /// @param cleanFoilFlags The cached clean-foil flag field (NOT modified).
+/// @param slabsOut Optional: appends the analytic VaneSlab OBBs of every stamped
+///                 vane (for q-LIBB). nullptr keeps legacy behavior.
 /// @return New flag field = clean foil mask OR all VG voxels.
 std::vector<std::uint8_t> buildFlagsWithVGs(
     const std::vector<VGParams>& vgs, const AirfoilGeometry& airfoil,
     float aoa_deg, const DomainLayout& layout,
-    const std::vector<std::uint8_t>& cleanFoilFlags);
+    const std::vector<std::uint8_t>& cleanFoilFlags,
+    std::vector<VaneSlab>* slabsOut = nullptr);
+
+// ===========================================================================
+// Interpolated bounce-back (q-LIBB) link list. For every fluid cell whose pull
+// of direction q lands on VANE solid, we store the exact fractional cut q in
+// [0,1] of the true vane side-face along that link (ray-OBB intersection
+// against the persisted VaneSlabs), so the hot kernel can place the wall at the
+// real sub-cell position (Bouzidi 2001) instead of snapping to q=0.5. SoA so
+// the solver cudaMemcpy's each array straight into its device mirror.
+// ===========================================================================
+
+/// Clamp on the stored cut fraction: the Bouzidi q>=1/2 branch divides by 2q,
+/// and q->0 extrapolation is noisy, so links resolving outside [kQMin, 1] snap
+/// to plain half-way bounce-back (fraction 0.5) rather than risk instability.
+inline constexpr float kQLibbMin = 0.05f;
+
+/// @brief One interpolated-bounce-back link: a (cell, direction) pair whose
+/// pull crosses a vane side face, with the analytic cut fraction.
+struct QLink {
+    long long cellIdx; ///< UNPADDED fluid-cell index x + nx*(y + ny*z).
+    std::uint8_t dir;  ///< Lattice direction q (1..18) that hits the vane.
+    std::uint8_t ffFluid; ///< 1 if the second fluid node x-2c_q is Fluid (the
+                          ///< q<1/2 two-node branch is usable), else 0.
+    float q;           ///< Cut fraction in [kQLibbMin, 1], from the fluid node.
+};
+
+/// @brief SoA q-link list, one entry per cut link (built parallel to the wall
+/// list but for the COMPLEMENTARY set: vane links, which the wall list drops).
+struct QLinkList {
+    std::vector<long long>    cellIdx;
+    std::vector<std::uint8_t> dir;
+    std::vector<std::uint8_t> ffFluid;
+    std::vector<float>        q;
+    std::size_t size() const { return cellIdx.size(); }
+};
+
+/// @brief Build the q-LIBB link list from the live flags + the analytic vane
+/// slabs. For each fluid cell, each pull direction q whose upstream cell is
+/// VANE solid (Solid in @p activeFlags, Fluid in @p cleanFlags) is ray-cast
+/// against the nearest VaneSlab to recover the true cut fraction. Links whose
+/// fraction falls outside [kQLibbMin, 1], or that would read an Interface shell
+/// cell, are dropped (the kernel keeps plain bounce-back there).
+/// @param dims        Grid dimensions of the flag fields.
+/// @param activeFlags Live flag field (foil + VGs).
+/// @param cleanFlags  Clean-foil flag field (VG-free) — vane provenance test.
+/// @param slabs       Persisted vane OBBs (voxelizeVG/buildFlagsWithVGs output).
+/// @return The q-link list; empty when there are no resolved vane links.
+QLinkList buildVaneQLinks(const GridDims& dims,
+                          const std::vector<std::uint8_t>& activeFlags,
+                          const std::vector<std::uint8_t>& cleanFlags,
+                          const std::vector<VaneSlab>& slabs);
+
+/// @brief Densify a QLinkList into the per-cell device-field layout the hot
+/// kernel reads (QLinkView): @p qFrac sized ncells*kQ (byte b = round(q*255),
+/// 0 = no q-link), @p ffMask sized ncells (bit q set when the q<1/2 two-node
+/// branch is usable). Both are zero-initialized, so cells/links without a stored
+/// q decode to plain half-way bounce-back. Keeps the sim layer geom-free: the
+/// app builds + densifies, the solver just uploads the raw arrays.
+/// @param links   The sparse q-link list (buildVaneQLinks output).
+/// @param ncells  Cell count of the level (dims.cellCount()).
+/// @param qFrac   Output, resized to ncells*kQ.
+/// @param ffMask  Output, resized to ncells.
+void densifyQLinks(const QLinkList& links, long long ncells,
+                   std::vector<std::uint8_t>& qFrac,
+                   std::vector<std::uint32_t>& ffMask);
 
 // ===========================================================================
 // Resolution guard (plan 6.1): a vane shorter than ~8 cells is voxel noise,
@@ -130,6 +203,7 @@ inline int recommendedRefineFactorForVGs(const std::vector<VGParams>& vgs,
                                          int chordCells) {
     int rec = 1;
     for (const VGParams& vg : vgs) {
+        if (!vg.enabled) continue; // disabled VGs don't drive refinement
         const float h = vgHeightCells(vg, chordCells);
         if (h <= 0.0f) continue;
         rec = std::max(rec, static_cast<int>(std::ceil(

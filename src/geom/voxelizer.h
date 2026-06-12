@@ -29,6 +29,26 @@ struct VGParams;
 /// explicit patch-local cell coordinate rather than a fraction of the
 /// (patch-sized) grid. Negative values (the default) keep the fractional
 /// behavior, so every existing call site is untouched.
+/// @brief Analytic descriptor of one voxelized vane, kept so the interpolated
+/// bounce-back (q-LIBB) can recover the TRUE sub-cell surface position instead
+/// of the stair-stepped voxel approximation. A vane is modeled as an oriented
+/// box (OBB): a center in lattice cells and three orthonormal axes — n3 the
+/// wall-normal (height), d3 the chordwise axis (length), b3 the thickness — with
+/// a half-extent along each. The two THICKNESS faces (planes through
+/// center ± halfThick*b3, normal ±b3) are the side surfaces a crossing lattice
+/// link cuts; q is the ray-parameter of that intersection. Curvature over a
+/// few-percent-chord vane is small, so one OBB per stamped vane is accurate
+/// enough and far cheaper than a per-slice list.
+struct VaneSlab {
+    Vec3f center;       ///< OBB center, lattice cells.
+    Vec3f nAxis;        ///< Unit wall-normal (height) axis.
+    Vec3f dAxis;        ///< Unit chordwise (length) axis.
+    Vec3f bAxis;        ///< Unit thickness axis (the side-face normal).
+    float halfHeight = 0.0f; ///< Half-extent along nAxis (cells).
+    float halfLength = 0.0f; ///< Half-extent along dAxis (cells).
+    float halfThick  = 0.0f; ///< Half-extent along bAxis (cells) — the side faces.
+};
+
 struct DomainLayout {
     GridDims dims;            ///< Lattice dimensions (e.g. 768 x 320 x 96).
     int   chordCells = 256;   ///< N_c — chord length in cells.

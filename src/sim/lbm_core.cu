@@ -7,6 +7,7 @@
 #include "lbm_core.cuh"
 
 #include <cmath>
+#include <type_traits> // std::true_type/false_type tags for the 2x2 dispatch
 #include <cuda_fp16.h> // half-bit decode of the wall-model slip field
 
 namespace foilcfd {
@@ -209,7 +210,7 @@ __global__ void initFromMacroKernel(FPop* __restrict__ f,
 /// back links (lbm_wallmodel.cuh); WM = false is the exact pre-wall-model
 /// kernel — the if constexpr blocks vanish, so the plain path stays
 /// bit-identical and pays nothing.
-template <bool WM>
+template <bool WM, bool QLIBB>
 __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     FPop* __restrict__ dst,
                                     const std::uint8_t* __restrict__ flags,
@@ -221,7 +222,8 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     long long nxny, int nx,
                                     float tau0, float magicLambda,
                                     float smagPrefactor, float uInlet,
-                                    int writeMacro, WallSlipView slip) {
+                                    int writeMacro, WallSlipView slip,
+                                    QLinkView qlink) {
     const long long cell =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (cell >= ncells) return;
@@ -326,6 +328,40 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
         const long long cs = solid ? pcell
                                    : (slipY ? pslipY : (slipZ ? pslipZ : pn));
         fpop[q] = load_f(src, static_cast<long long>(qs) * ncellsPad + cs);
+
+        // ---- interpolated bounce-back (q-LIBB, Bouzidi 2001) --------------
+        // On a solid link carrying an analytic cut fraction qf, place the wall
+        // at the TRUE sub-cell position of the vane side face instead of the
+        // implicit q=0.5 of the half-way value just loaded. The plain value
+        // fpop[q] already holds f~_qbar(pcell) (the half-way result); we
+        // overwrite it with the Bouzidi linear interpolation.
+        if constexpr (QLIBB) {
+            if (solid) {
+                const std::uint8_t qb = qlink.qFrac[cell * kQ + q];
+                if (qb != 0) {
+                    const float qf = static_cast<float>(qb) * (1.0f / 255.0f);
+                    // f~_q(pcell): the OUTGOING population at this node (the one
+                    // that would stream into the wall) — direction q at pcell.
+                    const float fOut =
+                        load_f(src, static_cast<long long>(q) * ncellsPad + pcell);
+                    if (qf >= 0.5f) {
+                        // Single-node branch: blend outgoing with the half-way
+                        // reflected value already in fpop[q].
+                        const float inv2q = 0.5f / qf;
+                        fpop[q] = inv2q * fOut + (1.0f - inv2q) * fpop[q];
+                    } else if (qlink.ffMask[cell] & (1u << q)) {
+                        // Two-node branch: needs the second fluid node x_ff =
+                        // x + c_q (opposite the wall). Read its outgoing q pop.
+                        const long long pff =
+                            pIdx(x + d_cx[q], y + d_cy[q], z + d_cz[q], nx, nxny);
+                        const float fOutFF =
+                            load_f(src, static_cast<long long>(q) * ncellsPad + pff);
+                        fpop[q] = 2.0f * qf * fOut + (1.0f - 2.0f * qf) * fOutFF;
+                    }
+                    // else: x_ff solid (thin vane) -> keep the half-way value.
+                }
+            }
+        }
 
         if constexpr (WM) {
             // Ladd moving-wall bounce-back: the population returning off a
@@ -739,7 +775,7 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 const StepParams& params,
                                 float* macroRho, float* macroU, float* macroV,
                                 float* macroW, cudaStream_t stream,
-                                WallSlipView slip) {
+                                WallSlipView slip, QLinkView qlink) {
     const long long ncells = src.dims.cellCount();
     if (ncells <= 0 || !src.f || !dst.f || !src.flags) return cudaErrorInvalidValue;
     const bool wantMacro = params.writeMacro && macroRho && macroU && macroV && macroW;
@@ -750,21 +786,25 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
         ? 18.0f * 1.41421356f * params.smagorinskyCs * params.smagorinskyCs
         : 0.0f;
 
-    // Template dispatch keeps the plain path's machine code untouched: the
-    // WM=false instantiation IS the pre-wall-model kernel.
-    if (slip.active()) {
-        streamCollideKernel<true><<<gridFor(ncells), kBlock, 0, stream>>>(
-            src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
-            ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
-            params.tau, params.magicLambda, smagPre, params.uInlet,
-            wantMacro ? 1 : 0, slip);
-    } else {
-        streamCollideKernel<false><<<gridFor(ncells), kBlock, 0, stream>>>(
-            src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
-            ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
-            params.tau, params.magicLambda, smagPre, params.uInlet,
-            wantMacro ? 1 : 0, slip);
-    }
+    // 2x2 template dispatch over (WM, QLIBB) keeps every path's machine code
+    // untouched: the <false,false> instantiation IS the original kernel, and a
+    // disabled feature's if-constexpr block vanishes (zero cost).
+    const bool wm = slip.active();
+    const bool ql = qlink.active();
+    auto launch = [&](auto wmTag, auto qlTag) {
+        streamCollideKernel<decltype(wmTag)::value, decltype(qlTag)::value>
+            <<<gridFor(ncells), kBlock, 0, stream>>>(
+                src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
+                ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
+                params.tau, params.magicLambda, smagPre, params.uInlet,
+                wantMacro ? 1 : 0, slip, qlink);
+    };
+    using T = std::true_type;
+    using F = std::false_type;
+    if (wm && ql)        launch(T{}, T{});
+    else if (wm && !ql)  launch(T{}, F{});
+    else if (!wm && ql)  launch(F{}, T{});
+    else                 launch(F{}, F{});
     return cudaGetLastError();
 }
 

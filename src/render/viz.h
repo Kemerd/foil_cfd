@@ -122,6 +122,7 @@ struct VizSettings {
     ParticleColorBy particleColorBy = ParticleColorBy::VorticityMag;
     Colormap        particleColormap = Colormap::Viridis;
     float           particlePointSize = 1.5f;
+    float           particleOpacity   = 1.0f; ///< User opacity multiplier (0 = invisible, 2 = extra bright).
     // Normalization scales for the particle color scalar (full-palette value).
     // Speed is in lattice units (u_lat ~ 0.05-0.12, wake peaks higher);
     // vorticity magnitude is in lattice 1/step units (shear-layer scale).

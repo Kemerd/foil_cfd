@@ -1038,6 +1038,12 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
         const SurfaceFrame frame = surfaceFrameAt(airfoil, vg.x_c, /*upper=*/true);
         if (!frame.valid) continue; // out-of-range station: nothing to draw
 
+        // Disabled VGs render as a desaturated ghost so the user can see their
+        // position without them contributing to the sim.
+        const Vec3f activeColor  = vgColor;
+        const Vec3f disabledColor(0.45f, 0.45f, 0.48f); // muted steel grey
+        const Vec3f& drawColor   = vg.enabled ? activeColor : disabledColor;
+
         // Surface frame -> lattice space (same AoA rotation as the foil).
         const Vec2f p2 = xf.point(frame.point);
         const Vec2f t2 = xf.direction(normalized(frame.tangent));
@@ -1071,12 +1077,12 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
                 // Wedge: toe upstream, full height at the downstream end,
                 // one device-height wide (vg.h convention).
                 appendWedge(verts, root - L * (len * 0.5f) - W * (h * 0.5f),
-                            L * len, N * h, W * h, vgColor);
+                            L * len, N * h, W * h, drawColor);
             } else {
                 // Thin plate centered on the station footprint.
                 appendParallelepiped(verts,
                                      root - L * (len * 0.5f) - W * (thick * 0.5f),
-                                     L * len, N * h, W * thick, vgColor);
+                                     L * len, N * h, W * thick, drawColor);
             }
         };
 
@@ -1456,14 +1462,13 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glEnable(GL_PROGRAM_POINT_SIZE);
         glUseProgram(im.progParticles);
         glUniformMatrix4fv(im.uPViewProj, 1, GL_FALSE, viewProj.m);
-        glUniform1f(im.uPPointSize, std::max(settings.particlePointSize, 1.0f));
+        glUniform1f(im.uPPointSize, settings.particlePointSize);
         glUniform1i(im.uPColormap,
                     settings.particleColormap == Colormap::Coolwarm ? 1 : 0);
-        // Brightness compensates pool density: more particles, dimmer points,
-        // same integrated glow.
-        const float alpha = std::clamp(
-            0.28f * std::sqrt(1.0e6f / static_cast<float>(im.particleCount)),
-            0.02f, 1.0f);
+        // Brightness compensates pool density (more particles → dimmer points,
+        // same integrated glow), then scaled by the user opacity slider.
+        const float density = 0.28f * std::sqrt(1.0e6f / static_cast<float>(im.particleCount));
+        const float alpha = std::clamp(density * settings.particleOpacity, 0.0f, 2.0f);
         glUniform1f(im.uPAlpha, alpha);
         glBindVertexArray(im.particleVAO);
         glDrawArrays(GL_POINTS, 0, im.particleCount);

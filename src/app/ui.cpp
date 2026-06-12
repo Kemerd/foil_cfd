@@ -862,15 +862,35 @@ void drawVGEditorPanel(UIContext& ctx) {
     int deleteIdx = -1, duplicateIdx = -1;
     for (int i = 0; i < static_cast<int>(p.vgs.size()); ++i) {
         ImGui::PushID(i);
+        VGParams& vg = p.vgs[static_cast<size_t>(i)];
+
+        // Build the header label; grey it out when the VG is disabled so the
+        // state is visible at a glance without opening the entry.
         char header[64];
         std::snprintf(header, sizeof(header), "VG %d  (x/c %.2f)###vg%d",
-                      i + 1, p.vgs[static_cast<size_t>(i)].x_c, i);
+                      i + 1, vg.x_c, i);
+        if (!vg.enabled)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         const bool open = ImGui::CollapsingHeader(
             header, i == p.selectedVG ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+        if (!vg.enabled)
+            ImGui::PopStyleColor();
         if (ImGui::IsItemClicked()) p.selectedVG = i; // guidance panel anchor
         if (open) {
             ImGui::Indent();
-            if (drawVGEntry(p.vgs[static_cast<size_t>(i)], chordCells, p.vgXcMin, p.vgXcMax)) {
+            // Quick enable/disable toggle — skips voxelization when off.
+            bool en = vg.enabled;
+            if (ImGui::Checkbox("Enabled", &en)) {
+                vg.enabled = en;
+                p.selectedVG = i;
+                ev.vgEdited = true;
+            }
+            ImGui::SameLine();
+            helpMarker("When unchecked this VG is excluded from the simulation "
+                       "but kept in the list and shown as a grey ghost in the "
+                       "3D view — useful for quick on/off comparisons without "
+                       "losing the placement.");
+            if (drawVGEntry(vg, chordCells, p.vgXcMin, p.vgXcMax)) {
                 p.selectedVG = i;
                 ev.vgEdited = true;
             }
@@ -1479,7 +1499,11 @@ void drawViewPanel(UIContext& ctx) {
         // Fade applies to both the shaded solid and the wireframe cage. The
         // mesh keeps writing depth at any opacity, so the fog/Q occlusion
         // against the body never changes — only how bright the body reads.
-        ImGui::SliderFloat("Opacity", &p.viz.foilOpacity, 0.05f, 1.0f, "%.2f");
+        // "##foilOpacity" suffix keeps the visible label "Opacity" but gives a
+        // unique ImGui ID — the PARTICLES section below has its own "Opacity"
+        // slider, and two identical labels would collide on one shared ID.
+        ImGui::SliderFloat("Opacity##foilOpacity", &p.viz.foilOpacity, 0.05f,
+                           1.0f, "%.2f");
         helpMarker("Dims the foil/VG mesh (solid or wireframe) so the flow "
                    "around it stays the star. 1 = fully opaque.");
         ImGui::Unindent();
@@ -1506,8 +1530,10 @@ void drawViewPanel(UIContext& ctx) {
         int cm = static_cast<int>(p.viz.particleColormap);
         if (ImGui::Combo("Colormap", &cm, kMaps4, 4))
             p.viz.particleColormap = static_cast<Colormap>(cm);
-        ImGui::SliderFloat("Point size", &p.viz.particlePointSize, 0.5f, 4.0f,
+        ImGui::SliderFloat("Point size", &p.viz.particlePointSize, 0.5f, 10.0f,
                            "%.1f px");
+        ImGui::SliderFloat("Opacity##particleOpacity", &p.viz.particleOpacity,
+                           0.0f, 2.0f, "%.2f");
     }
 
     // ---- slices: one per axis (plan 9.1 mode 2) ----
@@ -1696,6 +1722,27 @@ void drawMeshPanel(UIContext& ctx) {
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
                                "nested VG box active at %dx (coarse)",
                                r.refine.finerEffectiveFactor);
+        }
+
+        // Interpolated bounce-back: sub-cell-precise vane side surfaces.
+        if (ImGui::Checkbox("Sub-cell vane surfaces (q-LIBB)",
+                            &p.refine.qlibbVanes)) {
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("Places each vortex-generator vane's wall at its TRUE "
+                   "sub-cell position (interpolated bounce-back, Bouzidi 2001) "
+                   "instead of snapping it to the voxel grid, so slanted vane "
+                   "faces stop stair-stepping. Like sub-pixel rendering for the "
+                   "vane sides: same cells, smoother surface. Thin vanes that "
+                   "lack a second fluid node fall back to plain bounce-back.");
+        if (r.refine.qlibbActive) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                               "%d vane links sub-cell resolved%s",
+                               r.refine.qlibbLinks,
+                               r.refine.qlibbFallback > 0 ? "" : " (all)");
+            if (r.refine.qlibbFallback > 0)
+                ImGui::TextDisabled("%d thin-vane links at half-way",
+                                    r.refine.qlibbFallback);
         }
     }
 

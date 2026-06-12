@@ -19,6 +19,14 @@ constexpr float kPi = 3.14159265358979f;
 constexpr std::uint8_t kFluid = static_cast<std::uint8_t>(CellFlag::Fluid);
 constexpr std::uint8_t kSolid = static_cast<std::uint8_t>(CellFlag::Solid);
 
+/// @brief Unpadded linear index x + nx*(y + ny*z) (z already in range).
+inline long long cellIndex(int x, int y, int z, const GridDims& dims) {
+    return static_cast<long long>(x)
+         + static_cast<long long>(dims.nx)
+               * (static_cast<long long>(y)
+                  + static_cast<long long>(dims.ny) * static_cast<long long>(z));
+}
+
 /// @brief Mark one lattice cell Solid if it is currently Fluid. z wraps
 /// periodically (the spanwise BC is periodic, plan 4.2, so a VG array sliding
 /// off one z face must reappear on the other); x/y outside the interior are
@@ -70,12 +78,43 @@ inline void stampCell(std::vector<std::uint8_t>& flags, const GridDims& dims,
 void stampVane(const AirfoilGeometry& airfoil, float aoaRad,
                const DomainLayout& layout, std::vector<std::uint8_t>& flags,
                float x_c, float zCenter, float betaRad, float hCells,
-               float lenCells, float halfW, bool ramp) {
+               float lenCells, float halfW, bool ramp,
+               std::vector<VaneSlab>* slabsOut = nullptr) {
     // Center frame gives the reference tangent used to convert axis distance
     // into a chordwise-station advance (vanes are ~3h long, a few % chord —
     // treating the tangent's x-projection as constant over that span is fine).
     const SurfaceFrame center = surfaceFrameAt(airfoil, x_c, /*upper=*/true);
     if (!center.valid) return;
+
+    // Build the analytic OBB descriptor from the CENTER slice (one slab per
+    // vane is enough — the side faces are near-flat over a few-% chord). The
+    // axes match the per-slice frame below; the box spans the embedded root
+    // through the crest in height, the full length, and the half-thickness.
+    if (slabsOut) {
+        const float chordC = static_cast<float>(layout.chordCells);
+        const Vec2f cpr = rotated(center.point - Vec2f(0.25f, 0.0f), -aoaRad);
+        const Vec2f cnr = rotated(center.normal, -aoaRad);
+        const Vec2f ctr = rotated(center.tangent, -aoaRad);
+        const Vec3f cRoot(layout.anchorX() + cpr.x * chordC,
+                          layout.anchorY() + cpr.y * chordC, zCenter);
+        const Vec3f cn3(cnr.x, cnr.y, 0.0f);
+        const Vec3f cd3(std::cos(betaRad) * ctr.x, std::cos(betaRad) * ctr.y,
+                        std::sin(betaRad));
+        const Vec3f cb3 = normalized(cross(cn3, cd3));
+        // Height spans [-kRootEmbed, hCells]; its mid-point lifts the center.
+        constexpr float kRootEmbedSlab = 1.5f;
+        const float halfHt = 0.5f * (hCells + kRootEmbedSlab);
+        const float midHt  = 0.5f * (hCells - kRootEmbedSlab);
+        VaneSlab slab;
+        slab.center     = cRoot + cn3 * midHt;
+        slab.nAxis      = normalized(cn3);
+        slab.dAxis      = normalized(cd3);
+        slab.bAxis      = cb3;
+        slab.halfHeight = halfHt;
+        slab.halfLength = 0.5f * lenCells;
+        slab.halfThick  = halfW;
+        slabsOut->push_back(slab);
+    }
 
     const float cosB = std::cos(betaRad);
     const float sinB = std::sin(betaRad);
@@ -141,7 +180,10 @@ SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil,
 
 void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
                 float aoa_deg, const DomainLayout& layout,
-                std::vector<std::uint8_t>& flags) {
+                std::vector<std::uint8_t>& flags,
+                std::vector<VaneSlab>* slabsOut) {
+    // Disabled VGs are skipped entirely — they contribute no solid cells.
+    if (!vg.enabled) return;
     if (!airfoil.isValid() || layout.dims.nz < 1) return;
 
     // Device dimensions in lattice cells. The 1-cell floor mirrors the
@@ -173,7 +215,7 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
             // One vane per unit, all yawed the same way — a single vane is
             // just a co-rotating array of count 1.
             stampVane(airfoil, aoaRad, layout, flags, x_c, zc, beta, h, len,
-                      0.5f * thick, /*ramp=*/false);
+                      0.5f * thick, /*ramp=*/false, slabsOut);
             break;
         case VGType::CounterRotatingPair: {
             // Two mirrored vanes per unit, centers gap_h device heights
@@ -184,9 +226,9 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
             const float halfGap = 0.5f * vg.gap_h * h;
             const float betaNear = vg.commonFlowDown ? beta : -beta;
             stampVane(airfoil, aoaRad, layout, flags, x_c, zc - halfGap,
-                      betaNear, h, len, 0.5f * thick, /*ramp=*/false);
+                      betaNear, h, len, 0.5f * thick, /*ramp=*/false, slabsOut);
             stampVane(airfoil, aoaRad, layout, flags, x_c, zc + halfGap,
-                      -betaNear, h, len, 0.5f * thick, /*ramp=*/false);
+                      -betaNear, h, len, 0.5f * thick, /*ramp=*/false, slabsOut);
             break;
         }
         case VGType::Ramp:
@@ -204,17 +246,154 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
 std::vector<std::uint8_t> buildFlagsWithVGs(
     const std::vector<VGParams>& vgs, const AirfoilGeometry& airfoil,
     float aoa_deg, const DomainLayout& layout,
-    const std::vector<std::uint8_t>& cleanFoilFlags) {
+    const std::vector<std::uint8_t>& cleanFoilFlags,
+    std::vector<VaneSlab>* slabsOut) {
     // Plan 6.2 flow: copy the cached clean mask, OR every VG in, run the TE
     // closure once at the end so vane roots get the same single-cell-gap
     // sealing the foil TE does. The clean flags are never modified — they are
     // the warm-start cache key's geometry half.
     std::vector<std::uint8_t> flags = cleanFoilFlags;
     for (const VGParams& vg : vgs) {
-        voxelizeVG(vg, airfoil, aoa_deg, layout, flags);
+        voxelizeVG(vg, airfoil, aoa_deg, layout, flags, slabsOut);
     }
     closeTrailingEdgeGaps(layout.dims, flags);
     return flags;
+}
+
+// ===========================================================================
+// Interpolated bounce-back (q-LIBB) link list construction.
+// ===========================================================================
+
+namespace {
+
+/// @brief Entry parameter t in [0,1] where the ray origin + t*dir first enters
+/// the oriented box @p slab, or -1 if it misses within the segment. Standard
+/// slab method projected onto the OBB's three orthonormal axes.
+float rayOBBEntry(const Vec3f& origin, const Vec3f& dir, const VaneSlab& slab) {
+    // Vector from the box center to the ray origin, in world cells.
+    const Vec3f p = origin - slab.center;
+    // Project origin and direction onto each box axis -> three 1D slab tests.
+    const Vec3f axes[3]   = {slab.nAxis, slab.dAxis, slab.bAxis};
+    const float halfs[3]  = {slab.halfHeight, slab.halfLength, slab.halfThick};
+    float tMin = 0.0f, tMax = 1.0f; // clamp to the link segment [0,1]
+    for (int a = 0; a < 3; ++a) {
+        const float e = dot(p, axes[a]);    // origin offset along this axis
+        const float f = dot(dir, axes[a]);  // direction component
+        const float h = halfs[a];
+        if (std::fabs(f) < 1e-7f) {
+            // Ray parallel to this slab: miss unless the origin is between.
+            if (-e - h > 0.0f || -e + h < 0.0f) return -1.0f;
+        } else {
+            float t1 = (-e - h) / f;
+            float t2 = (-e + h) / f;
+            if (t1 > t2) std::swap(t1, t2);
+            tMin = std::max(tMin, t1);
+            tMax = std::min(tMax, t2);
+            if (tMin > tMax) return -1.0f;
+        }
+    }
+    return tMin; // first entry into the box along the segment
+}
+
+} // namespace
+
+QLinkList buildVaneQLinks(const GridDims& dims,
+                          const std::vector<std::uint8_t>& activeFlags,
+                          const std::vector<std::uint8_t>& cleanFlags,
+                          const std::vector<VaneSlab>& slabs) {
+    QLinkList out;
+    if (slabs.empty() || activeFlags.size() != cleanFlags.size()) return out;
+
+    const std::uint8_t kInterface =
+        static_cast<std::uint8_t>(CellFlag::Interface);
+
+    // True when (x,y,z) (z wrapped) is Solid in the given field.
+    auto solidAt = [&](const std::vector<std::uint8_t>& f, int x, int y, int z) {
+        if (x < 0 || x >= dims.nx || y < 0 || y >= dims.ny) return false;
+        const int zw = ((z % dims.nz) + dims.nz) % dims.nz;
+        return f[cellIndex(x, y, zw, dims)] == kSolid;
+    };
+    auto flagAt = [&](int x, int y, int z) -> std::uint8_t {
+        if (x < 0 || x >= dims.nx || y < 0 || y >= dims.ny) return kSolid;
+        const int zw = ((z % dims.nz) + dims.nz) % dims.nz;
+        return activeFlags[cellIndex(x, y, zw, dims)];
+    };
+
+    for (int z = 0; z < dims.nz; ++z) {
+        for (int y = 0; y < dims.ny; ++y) {
+            for (int x = 0; x < dims.nx; ++x) {
+                const long long cell = cellIndex(x, y, z, dims);
+                if (activeFlags[cell] != kFluid) continue;
+
+                for (int q = 1; q < kQ; ++q) {
+                    // Pull neighbor (x - c_q): the device kernel bounces here.
+                    const int sx = x - kCx[q];
+                    const int sy = y - kCy[q];
+                    const int sz = z - kCz[q];
+                    // Must be VANE solid: Solid live, Fluid in the clean foil.
+                    if (!solidAt(activeFlags, sx, sy, sz)) continue;
+                    if (solidAt(cleanFlags, sx, sy, sz)) continue; // foil, skip
+
+                    // Ray from THIS fluid node toward the vane neighbor. dir is
+                    // the OUTGOING lattice direction (-c_q in the pull picture),
+                    // pointing fluid -> solid, so q is measured from the fluid.
+                    const Vec3f origin(static_cast<float>(x) + 0.5f,
+                                       static_cast<float>(y) + 0.5f,
+                                       static_cast<float>(z) + 0.5f);
+                    const Vec3f dir(static_cast<float>(-kCx[q]),
+                                    static_cast<float>(-kCy[q]),
+                                    static_cast<float>(-kCz[q]));
+                    // Intersect against every slab; take the nearest entry.
+                    float qFrac = -1.0f;
+                    for (const VaneSlab& slab : slabs) {
+                        const float t = rayOBBEntry(origin, dir, slab);
+                        if (t >= 0.0f && (qFrac < 0.0f || t < qFrac)) qFrac = t;
+                    }
+                    if (qFrac < 0.0f) continue; // no analytic hit -> plain BB
+
+                    // Clamp guard: outside [kQLibbMin, 1] keep plain BB.
+                    if (qFrac < kQLibbMin || qFrac > 1.0f) continue;
+
+                    // The wall sits on the link between this fluid node and the
+                    // solid neighbor at (x - c_q). The SECOND fluid node, one
+                    // step further from the wall (the q<1/2 Bouzidi branch needs
+                    // it), is therefore on the OPPOSITE side: x_ff = x + c_q.
+                    const int ffx = x + kCx[q];
+                    const int ffy = y + kCy[q];
+                    const int ffz = z + kCz[q];
+                    const std::uint8_t ffFlag = flagAt(ffx, ffy, ffz);
+                    if (ffFlag == kInterface) continue; // stale source, skip
+                    const std::uint8_t ffIsFluid =
+                        (ffFlag == kFluid) ? 1u : 0u;
+
+                    out.cellIdx.push_back(cell);
+                    out.dir.push_back(static_cast<std::uint8_t>(q));
+                    out.ffFluid.push_back(ffIsFluid);
+                    out.q.push_back(qFrac);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+void densifyQLinks(const QLinkList& links, long long ncells,
+                   std::vector<std::uint8_t>& qFrac,
+                   std::vector<std::uint32_t>& ffMask) {
+    qFrac.assign(static_cast<std::size_t>(ncells) * kQ, 0);
+    ffMask.assign(static_cast<std::size_t>(ncells), 0u);
+    for (std::size_t i = 0; i < links.size(); ++i) {
+        const long long cell = links.cellIdx[i];
+        const int q = links.dir[i];
+        // Quantize q in (0,1] to a non-zero byte (1..255); 0 stays "no q-link".
+        const float qc = std::clamp(links.q[i], kQLibbMin, 1.0f);
+        std::uint8_t b = static_cast<std::uint8_t>(
+            std::lround(qc * 255.0f));
+        if (b == 0) b = 1; // never collide with the "no link" sentinel
+        qFrac[static_cast<std::size_t>(cell) * kQ + q] = b;
+        if (links.ffFluid[i])
+            ffMask[static_cast<std::size_t>(cell)] |= (1u << q);
+    }
 }
 
 // ===========================================================================

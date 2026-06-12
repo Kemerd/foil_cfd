@@ -207,6 +207,23 @@ struct WallSlipView {
     bool active() const { return uwx != nullptr && uwy != nullptr && uwz != nullptr; }
 };
 
+/// @brief Read-only device view of the interpolated-bounce-back (q-LIBB) link
+/// field: per UNPADDED cell and per direction q (1..18), the analytic cut
+/// fraction of the vane side face, quantized into a uint8 (planar layout,
+/// cellCount()*kQ entries). 0 = no q-link on that link (the kernel keeps plain
+/// half-way bounce-back); a stored byte b in [1,255] decodes to
+/// q = b/255 in (0,1], and the top bit of a SEPARATE per-cell ffMask records
+/// whether the second fluid node exists (the q<1/2 two-node branch is usable).
+/// Allocated only on levels that carry RESOLVED vanes (the fine / nested patch),
+/// where the per-direction field is cheap; never on the bulk coarse grid.
+struct QLinkView {
+    const std::uint8_t*  qFrac   = nullptr; ///< [cell*kQ + q] cut fraction byte.
+    const std::uint32_t* ffMask  = nullptr; ///< [cell] bit q: x_ff fluid (q<1/2 ok).
+
+    /// @brief True when a q-LIBB field is supplied this step.
+    bool active() const { return qFrac != nullptr && ffMask != nullptr; }
+};
+
 // ===========================================================================
 // Per-step kernel parameters, grouped so the launch wrappers stay stable as
 // the collision model gains terms.
@@ -270,11 +287,14 @@ cudaError_t launchSpanwisePerturbation(DeviceLatticeView lattice, float amplitud
 /// @param slip      Wall-model slip field (iMEM wall function). Default
 ///                  (inactive) view selects the plain bounce-back kernel
 ///                  instantiation — bit-identical to the pre-wall-model path.
+/// @param qlink     Interpolated-bounce-back (q-LIBB) link field. Default
+///                  (inactive) keeps plain half-way bounce-back everywhere.
 cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 const StepParams& params,
                                 float* macroRho, float* macroU, float* macroV,
                                 float* macroW, cudaStream_t stream,
-                                WallSlipView slip = WallSlipView{});
+                                WallSlipView slip = WallSlipView{},
+                                QLinkView qlink = QLinkView{});
 
 /// @brief NaN watchdog (plan 4.5): checks a strided sample of cells (~1/4093,
 /// prime stride so the sample set cannot alias onto boundary columns of

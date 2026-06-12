@@ -491,6 +491,35 @@ void applyWallModelPolicy(App& app) {
     app.solver.setWallModelEnabled(enable);
 }
 
+/// Build the q-LIBB sub-cell vane field for one refinement level and hand it to
+/// the solver. Ray-casts every vane link against the analytic slabs
+/// (buildVaneQLinks), densifies to the per-cell device layout (densifyQLinks),
+/// counts resolved vs fallen-back links, and uploads via the level's setter.
+/// The solver only keeps it when q-LIBB is enabled. level: 1 = fine, 2 = finer.
+/// @param fallbackOut Receives the count of vane links left at half-way (links
+///                    with no analytic hit / outside the clamp) for the readout.
+void uploadQLinksForLevel(App& app, const GridDims& dims,
+                          const std::vector<std::uint8_t>& active,
+                          const std::vector<std::uint8_t>& clean,
+                          const std::vector<VaneSlab>& slabs, int level) {
+    const long long ncells = dims.cellCount();
+    std::vector<std::uint8_t>  qFrac;
+    std::vector<std::uint32_t> ffMask;
+    int links = 0, fallback = 0;
+    if (!slabs.empty()) {
+        const QLinkList ql = buildVaneQLinks(dims, active, clean, slabs);
+        densifyQLinks(ql, ncells, qFrac, ffMask);
+        links = static_cast<int>(ql.size());
+        // Of the resolved links, those whose two-node branch is unusable (thin
+        // vane: x_ff solid) AND whose cut is < 1/2 silently keep the half-way
+        // value in the kernel — surface that as the fallback count.
+        for (std::size_t i = 0; i < ql.size(); ++i)
+            if (!ql.ffFluid[i] && ql.q[i] < 0.5f) ++fallback;
+    }
+    if (level == 1) app.solver.setFineQLinks(qFrac, ffMask, links, fallback);
+    else            app.solver.setFinerQLinks(qFrac, ffMask, links, fallback);
+}
+
 /// (Re)build the two-level refinement patch (plan M-refine) for the current
 /// geometry: derive the box from the VG-merged flags (vanes must sit inside),
 /// voxelize foil + VGs at 2x into the fine flag field, stamp the Interface
@@ -508,6 +537,10 @@ void applyRefinement(App& app) {
         factor = std::max(factor, recommendedRefineFactorForVGs(
                                       app.params.vgs, app.layout.chordCells));
     }
+
+    // Keep the solver's q-LIBB switch in sync with the UI before any q-link
+    // upload below — uploadQLinksForLevel only takes effect when it is on.
+    app.solver.setQLIBBEnabled(app.params.refine.qlibbVanes);
 
     // Tearing down the fine level always tears down the nested VG level too
     // (the solver enforces the same invariant; this keeps the App-side mirror
@@ -556,8 +589,11 @@ void applyRefinement(App& app) {
         static_cast<std::size_t>(fineLayout.dims.cellCount()),
         static_cast<std::uint8_t>(CellFlag::Fluid));
     voxelizeAirfoil(app.airfoil, app.params.aoaDeg, fineLayout, fine);
+    // Capture the analytic vane slabs for q-LIBB sub-cell vane surfaces.
+    std::vector<VaneSlab> fineSlabs;
     for (const VGParams& vg : app.params.vgs)
-        voxelizeVG(vg, app.airfoil, app.params.aoaDeg, fineLayout, fine);
+        voxelizeVG(vg, app.airfoil, app.params.aoaDeg, fineLayout, fine,
+                   &fineSlabs);
     closeTrailingEdgeGaps(fineLayout.dims, fine);
     stampInterfaceShell(fineLayout.dims, fine);
 
@@ -575,15 +611,20 @@ void applyRefinement(App& app) {
     // Fine CLEAN reference for the wall model: the foil alone at fine
     // resolution (no VGs, no shell) — the fine wall list keys its normals
     // and VG-vane exclusion off this exactly like the coarse level keys off
-    // cleanFlags (sim-module contract: setRefinedSurfaceReference).
-    {
-        std::vector<std::uint8_t> fineClean(
-            static_cast<std::size_t>(fineLayout.dims.cellCount()),
-            static_cast<std::uint8_t>(CellFlag::Fluid));
-        voxelizeAirfoil(app.airfoil, app.params.aoaDeg, fineLayout, fineClean);
-        closeTrailingEdgeGaps(fineLayout.dims, fineClean);
-        app.solver.setRefinedSurfaceReference(fineClean);
-    }
+    // cleanFlags (sim-module contract: setRefinedSurfaceReference). Kept here
+    // because q-LIBB's vane-provenance test needs the same clean field.
+    std::vector<std::uint8_t> fineClean(
+        static_cast<std::size_t>(fineLayout.dims.cellCount()),
+        static_cast<std::uint8_t>(CellFlag::Fluid));
+    voxelizeAirfoil(app.airfoil, app.params.aoaDeg, fineLayout, fineClean);
+    closeTrailingEdgeGaps(fineLayout.dims, fineClean);
+    app.solver.setRefinedSurfaceReference(fineClean);
+
+    // q-LIBB sub-cell vane surfaces on the fine level: ray-cast the vane links
+    // against the analytic slabs, densify, and hand the field to the solver
+    // (it uploads only when q-LIBB is enabled).
+    uploadQLinksForLevel(app, fineLayout.dims, fine, fineClean, fineSlabs,
+                         /*level=*/1);
 
     app.patchBox  = box;
     app.fineFlags = std::move(fine);
@@ -634,15 +675,19 @@ void applyRefinement(App& app) {
                 static_cast<std::size_t>(finerLayout.dims.cellCount()),
                 static_cast<std::uint8_t>(CellFlag::Fluid));
             voxelizeAirfoil(app.airfoil, app.params.aoaDeg, finerLayout, finer);
+            // Capture vane slabs at the FINEST resolution — this is the level
+            // where q-LIBB matters most (vanes are best resolved here).
+            std::vector<VaneSlab> finerSlabs;
             for (const VGParams& vg : app.params.vgs)
-                voxelizeVG(vg, app.airfoil, app.params.aoaDeg, finerLayout, finer);
+                voxelizeVG(vg, app.airfoil, app.params.aoaDeg, finerLayout, finer,
+                           &finerSlabs);
             closeTrailingEdgeGaps(finerLayout.dims, finer);
             stampInterfaceShell(finerLayout.dims, finer);
 
             std::string err2;
             if (app.solver.initFinerRefinement(box2, kFinerFactor, finer,
                                                &err2)) {
-                // Clean (VG-free) finer reference for the wall model.
+                // Clean (VG-free) finer reference for the wall model + q-LIBB.
                 std::vector<std::uint8_t> finerClean(
                     static_cast<std::size_t>(finerLayout.dims.cellCount()),
                     static_cast<std::uint8_t>(CellFlag::Fluid));
@@ -650,6 +695,10 @@ void applyRefinement(App& app) {
                                 finerClean);
                 closeTrailingEdgeGaps(finerLayout.dims, finerClean);
                 app.solver.setRefinedFinerSurfaceReference(finerClean);
+
+                // q-LIBB on the nested level (the headline win for VG fidelity).
+                uploadQLinksForLevel(app, finerLayout.dims, finer, finerClean,
+                                     finerSlabs, /*level=*/2);
 
                 app.finerBox   = box2;
                 app.finerFlags = std::move(finer);
@@ -1297,6 +1346,11 @@ void updateReadouts(App& app) {
             rr.finerCY0 = ri.box.y0 + inv * static_cast<float>(ri.finerBox.y0);
             rr.finerCY1 = ri.box.y0 + inv * static_cast<float>(ri.finerBox.y1);
         }
+        // q-LIBB sub-cell vane surfaces.
+        const QLIBBReadout qr = app.solver.qlibbReadout();
+        rr.qlibbActive   = qr.enabled && qr.links > 0;
+        rr.qlibbLinks    = qr.links;
+        rr.qlibbFallback = qr.fallback;
     }
     // The presolve runs synchronously inside the apply functions, so there is
     // never a mid-flight progress value to report between frames.

@@ -151,6 +151,12 @@ struct UIParams {
                                  ///< effective with VGs + an active fine patch;
                                  ///< degrades gracefully (OOM / tiny box) to the
                                  ///< 2x-only behavior.
+        bool  qlibbVanes = true; ///< Interpolated bounce-back (q-LIBB): place
+                                 ///< the vane wall at its TRUE sub-cell position
+                                 ///< instead of stair-stepping to the voxel grid
+                                 ///< (Bouzidi 2001). Effective only on the fine /
+                                 ///< nested levels where vanes are resolved; thin
+                                 ///< vanes fall back to plain bounce-back per link.
 
         /// Patch active at all (factor 1 = pure uniform grid).
         bool enabled() const { return factor >= 2; }
@@ -253,6 +259,11 @@ struct UIReadouts {
         // Nested box corners in COARSE lattice cells (for the 3D overlay):
         // patch origin + finerBox(fine cells) / factor.
         float    finerCX0 = 0, finerCY0 = 0, finerCX1 = 0, finerCY1 = 0;
+
+        // -- q-LIBB sub-cell vane surfaces --
+        bool     qlibbActive   = false; ///< Interpolated bounce-back live.
+        int      qlibbLinks    = 0;     ///< Vane links with a sub-cell cut.
+        int      qlibbFallback = 0;     ///< Thin-vane links left at half-way.
     };
     RefinementReadout refine;
 

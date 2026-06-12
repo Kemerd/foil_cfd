@@ -90,6 +90,16 @@ struct WallModelReadout {
     int   degenerate  = 0;   ///< Build: cells dropped for unresolvable normals.
 };
 
+/// @brief Live status of the interpolated bounce-back (q-LIBB) sub-cell vane
+/// surfaces, for the UI. Reports how many vane links resolve to a true
+/// sub-cell cut versus how many fell back to plain half-way bounce-back (thin
+/// vanes / out-of-range cuts), summed across the active levels.
+struct QLIBBReadout {
+    bool enabled  = false; ///< q-LIBB switched on by the app.
+    int  links    = 0;     ///< Vane links carrying an analytic cut fraction.
+    int  fallback = 0;     ///< Vane links left at half-way (thin/clamped).
+};
+
 /// @brief Status of the two-level refinement patch (plan M-refine), for the
 /// UI Mesh panel. All fields are derived at initRefinement() time.
 struct RefinementInfo {
@@ -295,6 +305,45 @@ public:
     /// Performs a small synchronous device read — call at UI rate, not per
     /// frame.
     WallModelReadout wallModelReadout() const;
+
+    // ------ interpolated bounce-back (q-LIBB) sub-cell vane surfaces ------
+
+    /// @brief Switch sub-cell vane surfaces (interpolated bounce-back) on/off.
+    /// ON makes the next setQLinks*() uploads take effect; OFF frees the q
+    /// fields and every link reverts to plain half-way bounce-back. The setting
+    /// survives re-init (the app re-applies it after a geometry rebuild).
+    void setQLIBBEnabled(bool enabled);
+
+    /// @brief Current q-LIBB switch state.
+    bool qlibbEnabled() const;
+
+    /// @brief Upload the densified q-LIBB cut-fraction field for a refinement
+    /// level (the app builds it via geom: buildVaneQLinks + densifyQLinks). The
+    /// solver owns the device mirror and frees it with the level. Coarse-level
+    /// vanes are too under-resolved for q-LIBB, so in practice only the fine and
+    /// nested levels are uploaded — but the API is uniform.
+    /// @param qFrac    Dense per-cell-per-direction cut bytes (ncells*kQ).
+    /// @param ffMask   Dense per-cell two-node-usable mask (ncells).
+    /// @param links    Resolved link count (UI readout).
+    /// @param fallback Thin-vane/clamped links left at half-way (UI readout).
+    void setCoarseQLinks(const std::vector<std::uint8_t>& qFrac,
+                         const std::vector<std::uint32_t>& ffMask,
+                         int links, int fallback);
+    void setFineQLinks(const std::vector<std::uint8_t>& qFrac,
+                       const std::vector<std::uint32_t>& ffMask,
+                       int links, int fallback);
+    void setFinerQLinks(const std::vector<std::uint8_t>& qFrac,
+                        const std::vector<std::uint32_t>& ffMask,
+                        int links, int fallback);
+
+    /// @brief Cell count of a level (for the app to size the dense q arrays):
+    /// coarse = dims().cellCount(); fine/finer from refinementInfo(). Convenience
+    /// so the app never duplicates the padded/unpadded bookkeeping.
+    long long fineCellCount() const;
+    long long finerCellCount() const;
+
+    /// @brief Live q-LIBB diagnostics (zeroed when disabled).
+    QLIBBReadout qlibbReadout() const;
 
     /// @brief Run @p n fused stream-collide steps, swapping the ping-pong
     /// buffers each step. Applies the ramped tau (units.h rampedTau) while the

@@ -59,6 +59,16 @@ target_include_directories(test_voxelizer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_voxelizer PRIVATE CUDA::cudart)
 add_test(NAME test_voxelizer COMMAND test_voxelizer)
 
+# q-LIBB link-list geometry (host: cut fraction, clamp, ffFluid, densify).
+add_executable(test_qlibb
+    test_qlibb.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/vg.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp)
+target_include_directories(test_qlibb PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_qlibb PRIVATE CUDA::cudart)
+add_test(NAME test_qlibb COMMAND test_qlibb)
+
 # Wall-model cell list builder (wall_model.h): selection/link masks, stair-
 # step normals (flat, 45-degree wedge, sphere), periodic z, determinism, VG
 # exclusion, sample fallback. Header-includes lbm_core.cuh for the flag enum,
@@ -144,7 +154,7 @@ set_tests_properties(m5_integration PROPERTIES LABELS "gpu;slow" TIMEOUT 900)
 
 # Per-test wall-clock budgets (seconds). M0 is specified < 3 min; M2 < 5 min.
 set_tests_properties(test_units test_airfoil test_voxelizer test_manifest
-    test_wallmodel test_vgaudit
+    test_wallmodel test_vgaudit test_qlibb
     PROPERTIES TIMEOUT 60)
 set_tests_properties(cuda_smoke PROPERTIES TIMEOUT 120)
 set_tests_properties(m0_taylor_green PROPERTIES TIMEOUT 180)
