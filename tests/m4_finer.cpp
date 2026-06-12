@@ -199,9 +199,19 @@ int main() {
     // Effective resolution vs coarse is 2x (fine) * 2x (finer) = 4x.
     TCHECK(ri.factor * ri.finerFactor == 4);
 
-    // The freestream reference: equilibrium init drives u = u_lat everywhere.
+    // The freestream reference. The field now initializes AT REST and the inlet
+    // ramps up (no impulsive shock), so u = u_lat is the SETTLED state. March one
+    // flow-through past the velocity ramp so the domain is uniformly at u_lat
+    // before asserting the nested interface holds it. ~3840 steps/flow-through.
     const float u0 = scaling.u_lat;
     const float tol = 0.01f * u0; // 1% of freestream
+    {
+        const cudaError_t werr = solver.stepN(4500);
+        TCHECK_MSG(werr == cudaSuccess, "warm-up stepN failed: %s",
+                   cudaGetErrorString(werr));
+        TCHECK_MSG(!solver.nanDetected(), "watchdog tripped during warm-up: %s",
+                   solver.nanDiagnosis().c_str());
+    }
 
     bool clean = true;
     for (int step = kSampleEvery; step <= kTotalSteps; step += kSampleEvery) {

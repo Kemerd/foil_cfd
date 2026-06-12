@@ -515,6 +515,14 @@ struct LBMSolver::Impl {
                           : scaling.tau;
     }
 
+    /// @brief Inlet/freestream velocity for the step about to run, honoring the
+    /// startup velocity ramp (eases from rest so the impulsive-start pressure
+    /// shock never forms). Outside the ramp it is the full target u_lat.
+    float effectiveU() const {
+        return rampActive ? rampedU(scaling, steps - rampStartStep, dims.nx)
+                          : scaling.u_lat;
+    }
+
     /// @brief Poll an event, absorbing ONLY the expected cudaErrorNotReady
     /// from the per-thread last-error slot (it is flow control, not a
     /// failure). Genuine errors are deliberately left in place so they keep
@@ -830,12 +838,16 @@ void LBMSolver::reset() {
     s.midStamp = -1;
     cudaMemsetAsync(s.nanDev, 0, sizeof(int), s.stream);
 
-    // Both ping-pong buffers get the equilibrium inflow + the spanwise speck
-    // perturbation (fresh starts must break quasi-2D coherence). The init
-    // kernels run over the padded domain with z-periodic formulas, so the
-    // ghost planes are consistent by construction — no refresh needed here.
+    // Both ping-pong buffers initialize AT REST (u = 0), not at freestream:
+    // the inlet ramp (effectiveU) then accelerates the flow from zero so the
+    // pressure field develops smoothly around the body instead of ringing an
+    // impulsive shock off the edges. The spanwise speck still seeds the 3D
+    // coherence-breaking ripple (scaled by the target u_lat so its relative
+    // strength is unchanged once the flow is up to speed). The init kernels run
+    // over the padded domain with z-periodic formulas, so the ghost planes are
+    // consistent by construction — no refresh needed here.
     for (int i = 0; i < 2; ++i) {
-        launchInitEquilibrium(s.view(i), s.scaling.u_lat, s.stream);
+        launchInitEquilibrium(s.view(i), /*uInlet=*/0.0f, s.stream);
         launchSpanwisePerturbation(s.view(i),
                                    kSpeckAmplitudeFrac * s.scaling.u_lat,
                                    kSpeckSeed, s.stream);
@@ -991,7 +1003,9 @@ cudaError_t LBMSolver::stepN(int n) {
         params.tau = s.effectiveTau();
         params.magicLambda = kTRTMagicLambda;
         params.smagorinskyCs = kSmagorinskyCs;
-        params.uInlet = s.scaling.u_lat;
+        // Ramped inlet: eases from rest over the startup window so the inlet
+        // never over-drives the still-developing field (no impulsive shock).
+        params.uInlet = s.effectiveU();
         // Macroscopic stores feed rendering once per frame: only the batch's
         // final step pays the extra 16 B/cell of write traffic (plan 11).
         params.writeMacro = (i == n - 1);

@@ -210,10 +210,12 @@ float runPlate(const GridDims& dims, const LatticeScaling& scaling,
     if (!initOk) return -1.0f;
     solver.setWallModelEnabled(wallModel);
 
-    // 2.6 flow-throughs: the force gate opens at 2.0 and the trailing
-    // average then covers a fully developed window.
+    // 3.6 flow-throughs: the force gate opens at 2.0 and the trailing average
+    // then covers a fully developed window. The extra flow-through (was 2.6)
+    // absorbs the startup inlet-velocity ramp — the field accelerates from rest
+    // now, so the boundary layer needs longer to develop and thicken downstream.
     const float ftSteps = scaling.flowThroughSteps(kNx);
-    const int totalSteps = static_cast<int>(2.6f * ftSteps);
+    const int totalSteps = static_cast<int>(3.6f * ftSteps);
     const int chunk = 512;
 
     std::vector<float> yplusHist;

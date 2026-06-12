@@ -159,9 +159,11 @@ struct UIParams {
 
     /// Mesh-sequencing startup (plan M-refine part 2): cold starts first
     /// converge a 4x-coarser companion sim (~seconds), then upsample its
-    /// macroscopic field onto the full grid — the flow starts developed
-    /// instead of impulsive and the force gate opens much sooner.
-    bool preconvergeCoarse = true;
+    /// macroscopic field onto the full grid. DISABLED by default and removed
+    /// from the UI: the rest-init + inlet-velocity ramp starts runs cleanly
+    /// without the seed (whose upsampled field could carry a wall kink that
+    /// rings on the foil). The code path stays behind this flag, just dormant.
+    bool preconvergeCoarse = false;
 
     // -- sim panel --
     bool running = true;                   ///< Run/pause.

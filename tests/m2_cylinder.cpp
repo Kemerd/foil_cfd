@@ -37,7 +37,9 @@ constexpr float kRe      = 150.0f;
 
 // Transient long enough for the street to lock in (~9 shedding periods,
 // ~3.5 flow-throughs), then ~17 periods of lift sampled for the spectrum.
-constexpr int kTransientSteps = 25000;
+// Bumped to absorb the startup INLET-VELOCITY ramp (the field now accelerates
+// from rest, so shedding locks in later than under the old impulsive start).
+constexpr int kTransientSteps = 40000;
 constexpr int kSampleEvery    = 16;    // steps between lift samples
 constexpr int kSampleCount    = 3000;  // -> 48000 sampled steps
 

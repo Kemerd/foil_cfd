@@ -30,6 +30,11 @@ uniform float uFreestream;       // normalized freestream speed (u_inf/scale):
                                  // the "calm air" baseline disturbance is
                                  // measured FROM, so it reads as haze even
                                  // though it is not literally zero speed.
+uniform float uLowSpeedFade;     // normalized speed below which a cell fades to
+                                 // transparent (linear 0 at speed 0 -> 1 at
+                                 // this speed). During the startup velocity ramp
+                                 // the whole field is slow, so it visibly fades
+                                 // IN as the flow accelerates. 0 disables.
 
 out vec4 fragColor;
 
@@ -155,6 +160,13 @@ void main() {
         // depth to an alpha (resolution independent: more steps != more fog).
         float sigma = mix(sigmaSlow, sigmaFast, disturb);
         float a = 1.0 - exp(-sigma * stepLen);
+
+        // Low-speed fade: cells slower than uLowSpeedFade fade toward fully
+        // transparent (alpha -> 0), so during the startup velocity ramp the
+        // whole still field is invisible and the flow appears to FADE IN as it
+        // accelerates. Linear ramp 0..1 over [0, uLowSpeedFade]; off when 0.
+        if (uLowSpeedFade > 0.0)
+            a *= clamp(s / uLowSpeedFade, 0.0, 1.0);
 
         vec3 shade = palette(uColormap, s);
         accumRgb += (1.0 - accumA) * a * shade;

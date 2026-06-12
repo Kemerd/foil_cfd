@@ -1760,23 +1760,11 @@ void drawMeshPanel(UIContext& ctx) {
         }
     }
 
-    // ---- startup: mesh-sequencing pre-convergence ----
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextDisabled("STARTUP");
-    ImGui::Checkbox("Pre-converge at 4x coarse", &p.preconvergeCoarse);
-    helpMarker(
-        "Mesh sequencing: every cold start first converges a 4x-coarser "
-        "companion sim (seconds — its grid is 1/64 the cells), then upsamples "
-        "that developed flow onto the full grid and continues. The wake and "
-        "circulation arrive almost immediately instead of convecting in from "
-        "scratch, so the Cl/Cd gate opens much sooner. The settle window "
-        "still applies — readouts stay gated until the fine-grid flow has "
-        "re-adjusted.");
-    if (r.preconvergeProgress >= 0.0f) {
-        ImGui::ProgressBar(r.preconvergeProgress, ImVec2(-1, 0));
-        ImGui::TextDisabled("pre-converging coarse companion...");
-    }
+    // (The mesh-sequencing pre-convergence option was removed: the rest-init +
+    // inlet-velocity ramp now starts every run cleanly, so the coarse-companion
+    // seed — which could upsample a kinked field onto the foil — is no longer
+    // wanted. The runPreconverge() path stays dormant behind preconvergeCoarse,
+    // which now defaults off.)
 
     ImGui::End();
 }

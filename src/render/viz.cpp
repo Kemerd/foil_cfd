@@ -545,7 +545,7 @@ struct Visualizer::Impl {
     // Velocity volume (the hero wind-tunnel smoke mode).
     GLint uVViewProj = -1, uVDims = -1, uVEye = -1, uVVol = -1, uVDepth = -1;
     GLint uVViewport = -1, uVInvVP = -1, uVColormap = -1, uVSlowOpacity = -1,
-          uVDensity = -1, uVFreestream = -1;
+          uVDensity = -1, uVFreestream = -1, uVLowSpeedFade = -1;
 
     // -- particle pool (hero mode) --
     GLuint particleVAO = 0, posVBO = 0, keyVBO = 0;
@@ -868,6 +868,7 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
         impl_->uVSlowOpacity = glGetUniformLocation(impl_->progVol, "uSlowOpacity");
         impl_->uVDensity    = glGetUniformLocation(impl_->progVol, "uDensity");
         impl_->uVFreestream = glGetUniformLocation(impl_->progVol, "uFreestream");
+        impl_->uVLowSpeedFade = glGetUniformLocation(impl_->progVol, "uLowSpeedFade");
     }
 
     // ---- particle pool (the two interop buffer registrations) -------------
@@ -1505,9 +1506,15 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         // Freestream baseline in the SAME normalized units the volume stores
         // (speed / speedScale), so the shader's disturbance is measured from
         // the actual inflow rather than a hardcoded level.
-        glUniform1f(im.uVFreestream,
-                    std::max(settings.freestreamLatticeSpeed, 1e-4f)
-                        / std::max(settings.velocitySpeedScale, 1e-6f));
+        const float freestreamNorm =
+            std::max(settings.freestreamLatticeSpeed, 1e-4f)
+                / std::max(settings.velocitySpeedScale, 1e-6f);
+        glUniform1f(im.uVFreestream, freestreamNorm);
+        // Low-speed fade threshold in the same normalized units: a fraction of
+        // the freestream, so the still startup field fades in as it accelerates.
+        glUniform1f(im.uVLowSpeedFade,
+                    std::clamp(settings.lowSpeedFadeFrac, 0.0f, 1.0f)
+                        * freestreamNorm);
         // Unit 0: speed volume, unit 1: scene depth.
         glUniform1i(im.uVVol, 0);
         glUniform1i(im.uVDepth, 1);

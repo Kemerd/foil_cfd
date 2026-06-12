@@ -102,9 +102,20 @@ int main() {
     // grid (vacuously, all zero solids are "covered" by the patch).
     TCHECK(solver.refinementInfo().forcesFromFine);
 
-    // The freestream reference: equilibrium init drives u = u_lat everywhere.
+    // The freestream reference. The field now initializes AT REST and the inlet
+    // ramps up (no impulsive shock), so u = u_lat is the SETTLED state, not the
+    // t=0 state. March one flow-through past the velocity ramp so the domain is
+    // uniformly at u_lat before we assert the interface holds it. nx/u_lat ~=
+    // 3840 steps for one flow-through; 4500 leaves margin.
     const float u0 = scaling.u_lat;
     const float tol = 0.01f * u0; // 1% of freestream
+    {
+        const cudaError_t werr = solver.stepN(4500);
+        TCHECK_MSG(werr == cudaSuccess, "warm-up stepN failed: %s",
+                   cudaGetErrorString(werr));
+        TCHECK_MSG(!solver.nanDetected(), "watchdog tripped during warm-up: %s",
+                   solver.nanDiagnosis().c_str());
+    }
 
     bool clean = true;
     for (int step = kSampleEvery; step <= kTotalSteps; step += kSampleEvery) {

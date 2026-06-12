@@ -280,4 +280,39 @@ inline float rampedTau(const LatticeScaling& scaling, long long step, int nx) {
     return 3.0f * nuNow + 0.5f;
 }
 
+// ---------------------------------------------------------------------------
+// Startup INLET-VELOCITY ramp: a fresh field is initialized AT REST (u=0), and
+// the inlet velocity eases from 0 up to the target u_lat over the startup
+// window. Slamming the full freestream in at t=0 leaves the fluid moving past a
+// stationary solid with a flat (uniform) pressure field — not a valid flow
+// state — so the first collisions emit a violent pressure correction that rings
+// off the leading/trailing edges as an acoustic shock (the "shockwave from the
+// foil" on every reset/init). Accelerating from rest lets the stagnation /
+// suction pressure field develop smoothly around the body, no shock to radiate.
+// ---------------------------------------------------------------------------
+
+/// @brief Fraction of the startup ramp window over which the inlet velocity
+/// eases in. Kept shorter than the full viscosity ramp so the flow reaches
+/// speed (and the force gate's flow-through clock becomes meaningful) well
+/// before the viscosity has finished relaxing.
+inline constexpr float kVelocityRampFraction = 0.5f;
+
+/// @brief Inlet/freestream lattice velocity to drive this step (0-based step
+/// since the fresh start). Smoothstep ease from 0 to scaling.u_lat over
+/// kVelocityRampFraction of the viscosity-ramp window, then constant. The
+/// smoothstep (zero initial slope) avoids even the gentle kink a linear ramp
+/// would leave at t=0.
+/// @param scaling The run's lattice scaling (provides target u_lat).
+/// @param step    Steps since the fresh start.
+/// @param nx      Domain length in cells (sets the ramp window with the factors).
+inline float rampedU(const LatticeScaling& scaling, long long step, int nx) {
+    const long long rampSteps = static_cast<long long>(
+        kVelocityRampFraction * static_cast<float>(kStartupRampNxFactor)
+            * static_cast<float>(nx));
+    if (rampSteps <= 0 || step >= rampSteps) return scaling.u_lat;
+    const float t = static_cast<float>(step) / static_cast<float>(rampSteps);
+    const float s = t * t * (3.0f - 2.0f * t); // smoothstep: 0->1, flat ends
+    return scaling.u_lat * s;
+}
+
 } // namespace foilcfd

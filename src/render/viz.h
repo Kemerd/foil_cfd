@@ -105,6 +105,13 @@ struct VizSettings {
                                       ///< (NOT a hard cull: slow air stays a
                                       ///< faint haze so structure underneath
                                       ///< it is still visible).
+    float lowSpeedFadeFrac   = 0.15f; ///< Cells slower than this FRACTION of the
+                                      ///< freestream fade to transparent (the
+                                      ///< shader's uLowSpeedFade is this times
+                                      ///< the normalized freestream speed). The
+                                      ///< startup velocity ramp leaves the whole
+                                      ///< field slow, so the flow appears to
+                                      ///< fade IN as it accelerates. 0 disables.
     float volumeDensity      = 0.85f; ///< Opacity gain for disturbed (fast/wake)
                                       ///< air at the top of the ramp.
     int   volumeUpdateEveryNFrames = 2; ///< Recompute cadence (cheap, but the
