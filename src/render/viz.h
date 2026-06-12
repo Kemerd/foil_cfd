@@ -131,9 +131,11 @@ struct VizSettings {
         {true,  SliceAxis::Z, -1, SliceField::VorticityZ, Colormap::Coolwarm, 1.0f},
     };
 
-    // -- Q-criterion isosurface (mode 3 — the default hero view) --
-    bool  showQRaycast = true;    ///< Default ON: opaque first-hit raycast of
-                                  ///< the Q-criterion vortex skins (hotkey 3).
+    // -- Q-criterion isosurface (mode 3 — the vortex-skin overlay) --
+    bool  showQRaycast = false;   ///< Default OFF: the rainbow velocity volume
+                                  ///< above is the hero view; toggle the opaque
+                                  ///< first-hit vortex-skin raycast on with
+                                  ///< hotkey 3 when wanted.
     float qThreshold   = 0.25f;   ///< Iso threshold on the NORMALIZED Q in [0,1].
     float qScale       = 5e-4f;   ///< Q value mapped to 1.0 in the volume
                                   ///< texture (lattice 1/step^2 units). Sized
