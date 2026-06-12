@@ -104,6 +104,17 @@ public:
     /// @param flags New host flag field (clean foil mask OR'd with VG voxels).
     void applyEditedFlags(const std::vector<std::uint8_t>& flags);
 
+    /// @brief Provide the CLEAN-FOIL (VG-free) flag field the suction-surface
+    /// extraction (extractSuctionDelta99 / separationOnsetXc) measures from.
+    /// The live flags may carry VG voxels, and a vane crossing the mid-span
+    /// plane would otherwise become the "surface": delta99 would be measured
+    /// from the vane crest and the vane's own recirculation would register as
+    /// a false separation onset — corrupting the Lin-2002 guidance precisely
+    /// in VG-on configurations. Call after init()/setFlags() whenever the
+    /// clean geometry changes; VG-only edits do not need a new reference.
+    /// @param cleanFlags Clean-foil host flag field (must match init dims).
+    void setSurfaceReference(const std::vector<std::uint8_t>& cleanFlags);
+
     /// @brief Run @p n fused stream-collide steps, swapping the ping-pong
     /// buffers each step. Applies the ramped tau (units.h rampedTau) while the
     /// startup ramp is active. Polls the NaN watchdog every 200 steps; on

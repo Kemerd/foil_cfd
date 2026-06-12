@@ -115,6 +115,14 @@ struct LBMSolver::Impl {
     // Host flag copy (snapshot hashing, surface extraction).
     std::vector<std::uint8_t> hostFlags;
 
+    // Clean-foil (VG-free) reference flags for the suction-surface extraction.
+    // The live hostFlags include VG voxels, and a vane crossing the mid-span
+    // plane would raise topSolidY to the vane crest — delta99 would then be
+    // measured from the vane and the vane's own recirculation would read as a
+    // false separation onset, corrupting the Lin-2002 guidance exactly in
+    // VG-on configurations. When empty, hostFlags is used (no VGs possible).
+    std::vector<std::uint8_t> surfaceRefFlags;
+
     // ---- extraction caches (refreshed lazily from const readout methods,
     // hence mutable) ---------------------------------------------------------
     mutable std::vector<float> midU, midV; ///< Mid-span planes of u, v.
@@ -139,11 +147,22 @@ struct LBMSolver::Impl {
                           : scaling.tau;
     }
 
+    /// @brief Poll an event, absorbing ONLY the expected cudaErrorNotReady
+    /// from the per-thread last-error slot (it is flow control, not a
+    /// failure). Genuine errors are deliberately left in place so they keep
+    /// surfacing through stepN's return path — an unconditional
+    /// cudaGetLastError() here used to wipe real launch failures every frame.
+    static bool eventDone(cudaEvent_t ev) {
+        const cudaError_t st = cudaEventQuery(ev);
+        if (st == cudaErrorNotReady) (void)cudaGetLastError();
+        return st == cudaSuccess;
+    }
+
     /// @brief Drain any completed async readbacks (timing, force, watchdog)
     /// WITHOUT stalling: events that are still in flight are left alone.
     void pollAsync() {
         // Batch timing -> per-step estimate for the pacer + MLUPS readout.
-        if (timingPending && cudaEventQuery(evT1) == cudaSuccess) {
+        if (timingPending && eventDone(evT1)) {
             float ms = 0.0f;
             if (cudaEventElapsedTime(&ms, evT0, evT1) == cudaSuccess
                 && timingBatchN > 0) {
@@ -206,19 +225,27 @@ struct LBMSolver::Impl {
         return cudaSuccess;
     }
 
-    /// @brief Recompute the mid-span suction-surface description from the
-    /// host flags: per-column topmost solid row plus the solid x extent.
-    /// O(nx*ny) on one plane — instant, runs only on flag changes.
+    /// @brief Recompute the mid-span suction-surface description: per-column
+    /// topmost solid row plus the solid x extent. Reads the CLEAN-FOIL
+    /// reference flags when the app has provided them (so VG voxels in the
+    /// live flags can never contaminate the delta99/separation readouts);
+    /// falls back to the live flags otherwise. O(nx*ny) on one plane —
+    /// instant, runs only on flag changes.
     void rebuildSurfaceCache() {
         topSolidY.assign(static_cast<std::size_t>(dims.nx), -1);
         xLE = dims.nx; xTE = -1;
         const int zmid = dims.nz / 2;
         const long long planeBase = nxny * zmid;
         const auto solid = static_cast<std::uint8_t>(CellFlag::Solid);
+        // The reference is only trusted when it matches the live grid size —
+        // a stale reference from a previous resolution must never index OOB.
+        const std::vector<std::uint8_t>& src =
+            (surfaceRefFlags.size() == hostFlags.size()) ? surfaceRefFlags
+                                                         : hostFlags;
         for (int y = 0; y < dims.ny; ++y) {
             const long long rowBase = planeBase + static_cast<long long>(dims.nx) * y;
             for (int x = 0; x < dims.nx; ++x) {
-                if (hostFlags[static_cast<std::size_t>(rowBase + x)] == solid) {
+                if (src[static_cast<std::size_t>(rowBase + x)] == solid) {
                     topSolidY[static_cast<std::size_t>(x)] = y; // y ascends: last write wins = topmost
                     xLE = std::min(xLE, x);
                     xTE = std::max(xTE, x);
@@ -265,6 +292,7 @@ struct LBMSolver::Impl {
             if (*ev) { cudaEventDestroy(*ev); *ev = nullptr; }
         }
         hostFlags.clear();
+        surfaceRefFlags.clear();
         midU.clear(); midV.clear(); midStamp = -1;
         topSolidY.clear(); surfValid = false;
         initialized = false;
@@ -404,6 +432,16 @@ void LBMSolver::setFlags(const std::vector<std::uint8_t>& flags) {
     reset(); // geometry replaced wholesale -> cold restart (plan 9.2)
 }
 
+void LBMSolver::setSurfaceReference(const std::vector<std::uint8_t>& cleanFlags) {
+    Impl& s = *impl_;
+    if (!s.initialized) return;
+    if (cleanFlags.size() != static_cast<std::size_t>(s.ncells)) return;
+    s.surfaceRefFlags = cleanFlags;
+    // The live flags may already include VG voxels (init/setFlags receive the
+    // merged field) — re-derive the surface description from the clean foil.
+    s.rebuildSurfaceCache();
+}
+
 void LBMSolver::applyEditedFlags(const std::vector<std::uint8_t>& flags) {
     Impl& s = *impl_;
     if (!s.initialized) return;
@@ -491,7 +529,10 @@ cudaError_t LBMSolver::stepN(int n) {
         if (++s.stepsSinceWatchdog >= kWatchdogPeriodSteps && !s.nanPending) {
             s.stepsSinceWatchdog = 0;
             cudaMemsetAsync(s.nanDev, 0, sizeof(int), s.stream);
-            launchNaNWatchdog(s.view(s.src), s.nanDev, s.stream);
+            // The step counter rotates the sampled residue class (977 is
+            // coprime to the watchdog's prime stride), so repeated checks
+            // sweep different cells instead of re-probing one fixed set.
+            launchNaNWatchdog(s.view(s.src), s.nanDev, s.steps * 977, s.stream);
             cudaMemcpyAsync(s.hNan, s.nanDev, sizeof(int),
                             cudaMemcpyDeviceToHost, s.stream);
             cudaEventRecord(s.evNan, s.stream);

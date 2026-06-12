@@ -238,13 +238,30 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 float* macroRho, float* macroU, float* macroV,
                                 float* macroW, cudaStream_t stream);
 
-/// @brief NaN watchdog (plan 4.5): checks a strided sample of cells (~1/4096)
-/// in the given buffer and sets *d_nanFlag to nonzero if any sampled f is
-/// NaN/Inf. Host polls the flag every ~200 steps and pauses the sim on trip.
-/// @param lattice   Buffer to sample.
-/// @param d_nanFlag Device int (single value); caller zeroes it beforehand.
+/// @brief NaN watchdog (plan 4.5): checks a strided sample of cells (~1/4093,
+/// prime stride so the sample set cannot alias onto boundary columns of
+/// power-of-two grids) in the given buffer and sets *d_nanFlag to nonzero if
+/// any sampled f is NaN/Inf. Host polls the flag every ~200 steps and pauses
+/// the sim on trip.
+/// @param lattice      Buffer to sample.
+/// @param d_nanFlag    Device int (single value); caller zeroes it beforehand.
+/// @param sampleOffset Per-launch rotation of the sampled residue class
+///                     (reduced mod the stride internally); pass something
+///                     derived from the step counter so successive checks
+///                     sweep different cells.
 cudaError_t launchNaNWatchdog(DeviceLatticeView lattice, int* d_nanFlag,
-                              cudaStream_t stream);
+                              long long sampleOffset, cudaStream_t stream);
+
+/// @brief Fill a device float array with a constant value. Exists because
+/// cudaMemset splats bytes only: the macroscopic density must be primed to
+/// the LBM rest value 1.0 before the first step so pre-step renders and
+/// snapshot captures see a physical field (rho = 0 would equilibrate to an
+/// all-zero population set and divide by zero on the next collide).
+/// @param d_dst Device float array.
+/// @param count Number of floats to write.
+/// @param value Fill value.
+cudaError_t launchFillFloat(float* d_dst, long long count, float value,
+                            cudaStream_t stream);
 
 /// @brief Momentum-exchange force reduction (plan 4.4): for every fluid cell
 /// with a SOLID neighbor, accumulate f_q + f_qbar momentum transfer across

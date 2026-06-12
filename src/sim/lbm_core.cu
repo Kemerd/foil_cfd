@@ -420,17 +420,30 @@ __global__ void refreshGhostZFlagsKernel(std::uint8_t* __restrict__ flags,
 }
 
 // ===========================================================================
-// NaN watchdog (plan 4.5): strided 1/4096 sample; the sum of all 19
+// NaN watchdog (plan 4.5): strided ~1/4093 sample; the sum of all 19
 // populations is NaN/Inf iff any member is (NaN propagates; +/-Inf either
 // survives or collapses to NaN), so one isfinite() covers the whole cell.
+//
+// The stride MUST NOT share factors with the grid dimensions: a power-of-two
+// stride aliases with power-of-two nx*ny (e.g. on a 64^3 grid every multiple
+// of 4096 lands on the x=0,y=0 inlet column, which is rewritten to clean
+// equilibrium each step — the watchdog could never trip). 4093 is prime, so
+// the sample set sweeps every x/y column for any realistic grid dimension.
+// A per-launch offset additionally rotates which residue class is sampled,
+// so successive checks cover different cells over time.
 // ===========================================================================
+
+/// Prime sampling stride for the watchdog — coprime to any practical grid
+/// dimension, so the strided sample cannot collapse onto boundary columns.
+constexpr long long kWatchdogStride = 4093;
 
 __global__ void nanWatchdogKernel(const FPop* __restrict__ f,
                                   long long ncells, long long ncellsPad,
-                                  long long nxny, int* __restrict__ d_flag) {
+                                  long long nxny, long long offset,
+                                  int* __restrict__ d_flag) {
     const long long t =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const long long cell = t * 4096;
+    const long long cell = t * kWatchdogStride + offset;
     if (cell >= ncells) return;
     const long long pcell = cell + nxny;
     float s = 0.0f;
@@ -576,6 +589,21 @@ __global__ void applyFlagEditsKernel(FPop* __restrict__ fA, FPop* __restrict__ f
     }
 }
 
+// ===========================================================================
+// Generic float fill: cudaMemset can only splat bytes, but the macroscopic
+// density must start at the LBM rest value 1.0 (a rho = 0 init renders a
+// bogus pressure field and, worse, poisons compact snapshots captured before
+// the first step — equilibrium(rho = 0) is an all-zero population set that
+// divides by zero on the very next collide).
+// ===========================================================================
+
+__global__ void fillFloatKernel(float* __restrict__ dst, long long n,
+                                float value) {
+    const long long i =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = value;
+}
+
 /// @brief 1D grid size for @p n threads at the standard block size.
 inline unsigned int gridFor(long long n) {
     return static_cast<unsigned int>((n + kBlock - 1) / kBlock);
@@ -684,13 +712,25 @@ cudaError_t launchApplyFlagEdits(DeviceLatticeView lattice, FPop* fOther,
 }
 
 cudaError_t launchNaNWatchdog(DeviceLatticeView lattice, int* d_nanFlag,
-                              cudaStream_t stream) {
+                              long long sampleOffset, cudaStream_t stream) {
     const long long ncells = lattice.dims.cellCount();
     if (ncells <= 0 || !lattice.f || !d_nanFlag) return cudaErrorInvalidValue;
     const long long nxny = static_cast<long long>(lattice.dims.nx) * lattice.dims.ny;
-    const long long samples = (ncells + 4095) / 4096;
+    // Reduce the caller-supplied offset into [0, stride): the kernel's bounds
+    // guard then keeps every sampled cell inside the interior region.
+    const long long offset =
+        ((sampleOffset % kWatchdogStride) + kWatchdogStride) % kWatchdogStride;
+    const long long samples = (ncells + kWatchdogStride - 1) / kWatchdogStride;
     nanWatchdogKernel<<<gridFor(samples), kBlock, 0, stream>>>(
-        lattice.f, ncells, lattice.dims.paddedCellCount(), nxny, d_nanFlag);
+        lattice.f, ncells, lattice.dims.paddedCellCount(), nxny, offset,
+        d_nanFlag);
+    return cudaGetLastError();
+}
+
+cudaError_t launchFillFloat(float* d_dst, long long count, float value,
+                            cudaStream_t stream) {
+    if (!d_dst || count <= 0) return cudaErrorInvalidValue;
+    fillFloatKernel<<<gridFor(count), kBlock, 0, stream>>>(d_dst, count, value);
     return cudaGetLastError();
 }
 
