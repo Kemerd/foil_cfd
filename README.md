@@ -135,6 +135,50 @@ ray-parity voxelization, and the same force readouts. Caveats (by design, v1):
   the z-boundaries to free-slip walls in STL mode.
 - Triangle cap: 2M.
 
+## Mesh refinement
+
+FoilCFD's solver operates on a uniform logical grid — every cell has the same LBM collision
+math, same memory layout, same FLOPS cost. Mesh refinement doesn't change that. Instead it
+bends the **physical coordinate map**: a tanh-based stretching function that packs more cells
+per metre into regions where resolution matters most, without adding a single cell or
+consuming any extra VRAM.
+
+The **Mesh** panel (tabbed with Sim/View, right column) exposes four presets:
+
+| Preset | What it does |
+|---|---|
+| **Off** | Perfectly uniform — today's default, zero overhead |
+| **Balanced** | 2× denser at the leading edge and suction surface BL; 4× in the VG zone; 0.5× in the far field |
+| **Aggressive** | 4× LE, 8× VG zone, 0.3× far field — maximum safe contrast |
+| **Custom** | All seven zone-weight sliders unlocked |
+
+**Seven refinement zones**, each with an independent density weight:
+
+1. **Far upstream** — inlet far-field; coarser saves cells for where they count
+2. **Near upstream** — ~0.8c ahead of leading edge; transition ramp
+3. **Leading edge** — suction peak, stagnation point, LE curvature; high accuracy here matters for Cl
+4. **Top surface BL** — wall-normal direction on the suction side; resolves the boundary layer that the VG guidance panel reads
+5. **VG zone** — ultra-fine band centered on the VG station (auto-tracks the VG editor); this is where the vortex generation mechanism lives
+6. **Near wake** — 0–1.5c behind the trailing edge; the vortex shedding and VG vortex rollup
+7. **Far wake** — downstream freestream; coarser
+
+**How it works:** the stretching is computed once at startup as a piecewise tanh density
+function integrated into a coordinate CDF. This gives a lookup table `physX[i]` mapping each
+logical cell index to its physical x position. The voxelizer uses these tables when stamping
+the airfoil and VGs, so geometry lands at the right physical location regardless of the
+stretching profile. The LBM hot path (collision + streaming kernels) is completely untouched.
+
+**Accuracy note:** LBM's collision operator assumes `dx = dy = dz`. Stretching introduces a
+metric correction of order `(stretch_ratio - 1) × Ma²` — at the default lattice Mach 0.08
+and ratios up to 8:1 this is around 0.5% of the existing compressibility error, well within
+acceptable tolerance for VG placement decisions. The zone-weight bounds in the UI are capped
+at 10:1 to stay firmly in that regime. Don't use Aggressive mode for high-AoA stall studies;
+do use it for VG height/station sensitivity sweeps.
+
+The VG zone centre auto-tracks the first VG station in the editor (configurable in the Mesh
+panel). A live domain diagram in the panel shows relative cell density across the domain so
+you can see exactly what you're buying before committing.
+
 ## How it works (one paragraph)
 
 FoilCFD solves the lattice-Boltzmann equation on a D3Q19 lattice: every cell holds 19
