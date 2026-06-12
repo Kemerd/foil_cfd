@@ -6,6 +6,8 @@
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA-green.svg)](#requirements)
 [![CUDA 12.8+](https://img.shields.io/badge/CUDA-12.8%2B-76b900.svg)](#requirements)
 
+[Preview of software](preview.jpg)
+
 Load your airfoil. Set your angle of attack. Watch a million particles stream over the wing
 in real time. Bolt on vortex generators, drag a slider, and see the separation bubble react
 *right now* — not after an overnight mesh-and-solve marathon.
@@ -32,8 +34,6 @@ app itself doesn't slow down to match: per-frame solver work is capped at 10 ms 
 safety), so the visualizer stays at interactive framerates (typically **60+ FPS**,
 render-bound), advancing ~5–6 solver steps per rendered frame. Faster airspeeds and
 finer grids both shrink dt, so the steps-per-real-second count grows linearly with each.
-
-![Selftest render](screenshots/selftest.png)
 
 *(Screenshots: clean vs. VG'd wing comparison pair coming with milestone M4 —
 `screenshots/m4_clean.png` / `screenshots/m4_vg.png`)*
