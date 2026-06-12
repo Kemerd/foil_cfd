@@ -1065,6 +1065,54 @@ void drawReadoutsPanel(UIContext& ctx) {
         ImGui::Text("L/D %.2f", ld);
         ImGui::SetWindowFontScale(1.0f);
     }
+
+    // ---- performance + progress block -------------------------------------
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("PERFORMANCE");
+
+    // Processing rate: million lattice-cell updates per second — the honest
+    // "how much is the GPU chewing through" number for an LBM solver.
+    ImGui::Text("Rate     %.0f MLUPS", r.perf.mlups);
+    helpMarker("Million lattice cell updates per second. Every cell of the "
+               "grid recomputes every step; this is cells x steps per wall "
+               "second.");
+
+    // GPU load (driver query; hidden when the management library is absent)
+    // and VRAM pressure on one line.
+    if (r.gpuUtilPercent >= 0) {
+        ImGui::Text("GPU      %d%%    VRAM  %.0f%%", r.gpuUtilPercent,
+                    r.vramUsedFraction * 100.0f);
+    } else {
+        ImGui::Text("VRAM     %.0f%%", r.vramUsedFraction * 100.0f);
+    }
+
+    // Simulated physical time (NOT wall time): steps x dt, shown in ms — a
+    // full converged run is typically only a few hundred milliseconds of
+    // real airflow.
+    ImGui::Text("Sim time %.2f ms", r.simElapsedMs);
+    helpMarker("Physical time simulated since the last cold start "
+               "(steps x dt). Airflow develops in milliseconds of real time "
+               "even when the computation takes minutes.");
+
+    // ETA until the Cl/Cd gate opens. Three states: counting down, done, or
+    // no estimate (paused / no timing sample yet).
+    if (r.etaSeconds > 0.0) {
+        const int total = static_cast<int>(r.etaSeconds + 0.5);
+        if (total >= 60) {
+            ImGui::Text("ETA      %dm %02ds", total / 60, total % 60);
+        } else {
+            ImGui::Text("ETA      %ds", total);
+        }
+        helpMarker("Estimated wall-clock time until the force readouts "
+                   "converge (the gate above opens). Based on the measured "
+                   "step rate, so it tightens as the run settles.");
+    } else if (r.etaSeconds == 0.0) {
+        ImGui::TextDisabled("ETA      converged");
+    } else {
+        ImGui::TextDisabled("ETA      --");
+    }
+
     ImGui::End();
 }
 
