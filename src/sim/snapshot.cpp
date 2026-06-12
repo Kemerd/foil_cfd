@@ -18,6 +18,11 @@
 #include <vector>
 
 #include "lbm_solver.h"
+// UTF-8 path conversion for error/log strings: path::string() goes through
+// the ANSI code page on MSVC and can THROW for non-ASCII cache paths (the
+// cache lives next to the exe, i.e. under the user's possibly non-ASCII
+// profile) — a throw on the cache worker thread would terminate the app.
+#include "../platform/platform.h"
 
 namespace foilcfd {
 
@@ -288,7 +293,9 @@ bool CompactSnapshot::saveToFile(const std::filesystem::path& path,
     }
     std::ofstream os(path, std::ios::binary | std::ios::trunc);
     if (!os) {
-        if (error) *error = "cannot open " + path.string() + " for writing";
+        if (error)
+            *error = "cannot open " + platform::pathToUtf8(path)
+                   + " for writing";
         return false;
     }
 
@@ -331,7 +338,9 @@ bool CompactSnapshot::saveToFile(const std::filesystem::path& path,
     }
     os.flush();
     if (!os.good()) {
-        if (error) *error = "write failed (disk full?) at " + path.string();
+        if (error)
+            *error = "write failed (disk full?) at "
+                   + platform::pathToUtf8(path);
         return false;
     }
     return true;
@@ -343,11 +352,12 @@ bool CompactSnapshot::loadFromFile(const std::filesystem::path& path,
     s.hasData = false;
     std::ifstream is(path, std::ios::binary);
     if (!is) {
-        if (error) *error = "cannot open " + path.string();
+        if (error) *error = "cannot open " + platform::pathToUtf8(path);
         return false;
     }
     auto reject = [&](const char* why) {
-        if (error) *error = std::string(why) + ": " + path.string();
+        if (error)
+            *error = std::string(why) + ": " + platform::pathToUtf8(path);
         return false;
     };
 
@@ -471,7 +481,7 @@ struct DiskSnapshotCache::Impl {
             if (!std::filesystem::remove(oldest, ec)) {
                 // Locked by another process? Log and stop rather than spin.
                 std::fprintf(stderr, "[cache] eviction of %s failed\n",
-                             oldest.string().c_str());
+                             platform::pathToUtf8(oldest).c_str());
                 break;
             }
             used = (used > oldestSize) ? used - oldestSize : 0;
@@ -556,7 +566,7 @@ bool DiskSnapshotCache::store(const CompactSnapshot& snapshot,
             std::filesystem::file_size(finalPath, ec));
     std::filesystem::rename(tmpPath, finalPath, ec);
     if (ec) {
-        if (error) *error = "rename to " + finalPath.string()
+        if (error) *error = "rename to " + platform::pathToUtf8(finalPath)
                           + " failed: " + ec.message();
         std::filesystem::remove(tmpPath, ec);
         return false;

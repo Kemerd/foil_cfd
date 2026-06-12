@@ -182,11 +182,15 @@ GLuint buildProgram(const std::filesystem::path& dir, const char* vertName,
                     const char* fragName, std::string* error) {
     std::string vsSrc, fsSrc;
     if (!readTextFile(dir / vertName, &vsSrc)) {
-        if (error) *error = "cannot read shader " + (dir / vertName).string();
+        if (error)
+            *error = "cannot read shader "
+                   + platform::pathToUtf8(dir / vertName);
         return 0;
     }
     if (!readTextFile(dir / fragName, &fsSrc)) {
-        if (error) *error = "cannot read shader " + (dir / fragName).string();
+        if (error)
+            *error = "cannot read shader "
+                   + platform::pathToUtf8(dir / fragName);
         return 0;
     }
     const GLuint vs = compileStage(GL_VERTEX_SHADER, vsSrc, vertName, error);
@@ -672,7 +676,7 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
     if (impl_->shaderDir.empty()) {
         if (error) {
             *error = "assets/shaders not found (searched up from "
-                   + platform::executableDirectory().string()
+                   + platform::pathToUtf8(platform::executableDirectory())
                    + " and the working directory)";
         }
         return false;
@@ -1322,12 +1326,15 @@ bool Visualizer::screenshotPNG(const std::filesystem::path& path,
     fp = std::fopen(path.string().c_str(), "wb");
 #endif
     if (!fp) {
-        if (error) *error = "cannot open " + path.string() + " for writing";
+        // pathToUtf8, not string(): the error text must not itself throw on
+        // a non-ASCII path (the very case most likely to hit this branch).
+        if (error)
+            *error = "cannot open " + platform::pathToUtf8(path) + " for writing";
         return false;
     }
     const bool ok = std::fwrite(png.data(), 1, png.size(), fp) == png.size();
     std::fclose(fp);
-    if (!ok && error) *error = "short write to " + path.string();
+    if (!ok && error) *error = "short write to " + platform::pathToUtf8(path);
     return ok;
 }
 
