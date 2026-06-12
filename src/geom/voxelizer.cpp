@@ -32,8 +32,16 @@ std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims) {
             const std::size_t row = static_cast<std::size_t>(dims.nx)
                                   * (static_cast<std::size_t>(y)
                                      + static_cast<std::size_t>(dims.ny) * z);
-            // y faces first so the x-face stamps below win at the edges —
-            // inlet/outlet columns must be inlet/outlet all the way up.
+            // y faces first; the inlet stamp below wins at the x=0 edges
+            // (the inlet column rewrites its storage every step, so corner
+            // reads always see fresh equilibrium). The OUTLET column instead
+            // yields to the slip planes at its two corners: an outlet corner
+            // cell would zero-gradient-copy from (nx-2, 0/ny-1, z) — a slip
+            // MARKER whose f storage is never written — and feed that frozen
+            // cold-start equilibrium into the interior corner links forever.
+            // With slip winning, the corner markers are never read (slip
+            // pulls redirect to the adjacent outlet cells, rewritten every
+            // step) and every outlet cell copies from a live fluid column.
             if (y == 0)
                 for (int x = 0; x < dims.nx; ++x)
                     flags[row + x] = static_cast<std::uint8_t>(CellFlag::SlipBottom);
@@ -41,7 +49,8 @@ std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims) {
                 for (int x = 0; x < dims.nx; ++x)
                     flags[row + x] = static_cast<std::uint8_t>(CellFlag::SlipTop);
             flags[row + 0] = static_cast<std::uint8_t>(CellFlag::Inlet);
-            flags[row + dims.nx - 1] = static_cast<std::uint8_t>(CellFlag::Outlet);
+            if (y != 0 && y != dims.ny - 1)
+                flags[row + dims.nx - 1] = static_cast<std::uint8_t>(CellFlag::Outlet);
         }
     }
     return flags;

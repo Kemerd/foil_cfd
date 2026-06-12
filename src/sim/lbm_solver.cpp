@@ -131,6 +131,13 @@ struct LBMSolver::Impl {
     int  xLE = 0, xTE = 0;                 ///< Solid extent at mid-span.
     bool surfValid = false;
 
+    // STL slip-z mode (plan 7.4): when the z faces carry SlipFront/SlipBack
+    // walls, those two planes are marker cells — the body and all force-
+    // generating links live in only nz-2 planes, so the force-coefficient
+    // reference area must use the FLUID span, not the raw nz (a raw-nz
+    // normalization reads ~2/nz low on absolute Cl/Cd in that mode).
+    bool zSlipWalls = false;
+
     // ------------------------------------------------------------------
 
     /// @brief View over one f buffer (padded pointers, real dims).
@@ -177,7 +184,7 @@ struct LBMSolver::Impl {
         // steps elapsed since the previous folded sample so the effective
         // window is the configured flow-through count regardless of how many
         // steps each frame ran.
-        if (forcePending && cudaEventQuery(evForce) == cudaSuccess) {
+        if (forcePending && eventDone(evForce)) {
             const float windowSteps =
                 std::max(1.0f, emaWindowFlowThroughs * flowThroughSteps());
             const float dSteps =
@@ -194,16 +201,13 @@ struct LBMSolver::Impl {
             forcePending = false;
         }
         // Watchdog verdict.
-        if (nanPending && cudaEventQuery(evNan) == cudaSuccess) {
+        if (nanPending && eventDone(evNan)) {
             if (*hNan != 0) {
                 nanLatched = true;
                 tauAtTrip = effectiveTau();
             }
             nanPending = false;
         }
-        // cudaEventQuery's cudaErrorNotReady is expected flow control, not a
-        // failure — clear it so it can't masquerade as a launch error later.
-        cudaGetLastError();
     }
 
     /// @brief Upload an unpadded host flag field into the padded device
@@ -220,6 +224,17 @@ struct LBMSolver::Impl {
             err != cudaSuccess)
             return err;
         hostFlags = newFlags;
+        // Detect STL slip-z mode from the z=0 plane (the import flow stamps
+        // every fluid cell of that plane SlipFront): determines the fluid
+        // span used by the force-coefficient normalization.
+        const auto slipF = static_cast<std::uint8_t>(CellFlag::SlipFront);
+        zSlipWalls = false;
+        for (long long i = 0; i < nxny; ++i) {
+            if (hostFlags[static_cast<std::size_t>(i)] == slipF) {
+                zSlipWalls = true;
+                break;
+            }
+        }
         rebuildSurfaceCache();
         midStamp = -1; // velocity planes are stale relative to new geometry
         return cudaSuccess;
@@ -369,7 +384,12 @@ bool LBMSolver::init(const GridDims& dims, const LatticeScaling& scaling,
 
     // Macroscopic fields start at quiescent defaults so render/extraction
     // reads are defined before the first stepped frame writes real values.
-    cudaMemsetAsync(s.rho, 0, s.ncells * sizeof(float), stream);
+    // Density primes to the LBM rest value 1.0, NOT 0: the pressure slice
+    // shows cs^2*(rho-1) (so rho=0 would render a saturated -1/3 field), and
+    // a compact snapshot captured before the first step must restore to a
+    // valid quiescent state — equilibrium(rho=0) is all-zero populations and
+    // the next collide would divide by zero, NaN-flooding the whole field.
+    launchFillFloat(s.rho, s.ncells, 1.0f, stream);
     cudaMemsetAsync(s.u, 0, s.ncells * sizeof(float), stream);
     cudaMemsetAsync(s.v, 0, s.ncells * sizeof(float), stream);
     cudaMemsetAsync(s.w, 0, s.ncells * sizeof(float), stream);
@@ -592,8 +612,12 @@ ForceReadout LBMSolver::forces() const {
     // Coefficient normalization lives in units.h (single conversion source):
     // drag is the streamwise (x) force, lift the vertical (y) force — AoA is
     // baked into the geometry, so the inflow stays axis-aligned (plan 4.2).
-    r.cd = s.scaling.forceToCoefficient(s.emaFx, s.dims.nz);
-    r.cl = s.scaling.forceToCoefficient(s.emaFy, s.dims.nz);
+    // Reference span: with periodic z the geometry truly spans all nz cells;
+    // with STL slip-z walls the z=0/nz-1 planes are markers and the body
+    // occupies only nz-2 fluid planes (plan 7.4).
+    const int spanCells = s.zSlipWalls ? std::max(1, s.dims.nz - 2) : s.dims.nz;
+    r.cd = s.scaling.forceToCoefficient(s.emaFx, spanCells);
+    r.cl = s.scaling.forceToCoefficient(s.emaFy, spanCells);
     r.liftToDrag = (std::fabs(r.cd) > 1e-6f) ? r.cl / r.cd : 0.0f;
     r.valid = s.emaSeeded && (s.steps >= s.gateOpenAtSteps);
     return r;
@@ -757,6 +781,11 @@ const std::uint8_t* LBMSolver::deviceFlags() const {
     // buffer is contiguous and starts one ghost plane in, so offsetting the
     // base pointer makes their indexing exact — no second flag copy.
     return impl_->flags ? impl_->flags + impl_->nxny : nullptr;
+}
+
+DeviceLatticeView LBMSolver::latticeView() const {
+    // Padded bases, real dims — exactly what the launch wrappers index with.
+    return impl_->view(impl_->src);
 }
 
 float* LBMSolver::activeDeviceF() { return impl_->f[impl_->src]; }

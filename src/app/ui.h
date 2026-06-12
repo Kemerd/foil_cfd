@@ -90,6 +90,9 @@ struct UIReadouts {
     float currentTau = 0.0f;
     bool  nanTripped = false;
     std::string nanDiagnosis;              ///< Shown in the watchdog error popup.
+    bool  cudaErrorTripped = false;        ///< Frame loop latched a CUDA failure
+                                           ///< (TDR/launch error) — sim stopped.
+    std::string cudaErrorDiagnosis;        ///< cudaGetErrorString + failing stage.
     float vramUsedFraction = 0.0f;         ///< Warn above 0.8 (plan 4.6).
 
     // -- forces (EMA, gated) --
@@ -109,7 +112,9 @@ struct UIReadouts {
 struct UIEvents {
     bool reloadAirfoil   = false; ///< Airfoil/NACA selection changed -> rebuild + cold start.
     bool aoaChanged      = false; ///< Slider RELEASED (plan 13: not per-tick) -> revoxel + cold start.
-    bool airspeedChanged = false; ///< Rescale units, restart ramp; cache stays valid (plan 13).
+    bool airspeedChanged = false; ///< Airspeed OR chord edited: pure units
+                                  ///< rescale (grid/u_lat/flags untouched),
+                                  ///< restart ramp; cache stays valid (plan 13).
     bool resolutionChanged = false; ///< Preset/chord switch -> full re-init.
     bool vgEdited        = false; ///< VG list/params changed on release -> WARM restart (plan 6.2).
     bool resetCold       = false; ///< Explicit reset button.

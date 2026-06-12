@@ -891,10 +891,15 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
         // One yawed vane plate (or wedge) rooted at span position zc.
         auto emitVane = [&](float zc, float betaDeg) {
             const float beta = betaDeg * (kPiF / 180.0f);
-            // Rotate the downstream tangent about the surface normal by beta
-            // (T is perpendicular to N, so Rodrigues reduces to two terms).
-            const Vec3f NxT = cross(N, T);
-            const Vec3f L = normalized(T * std::cos(beta) + NxT * std::sin(beta));
+            // Vane axis must reproduce the voxelizer's FROZEN convention
+            // (vg.cpp stampVane: d3 = (cosB*t.x, cosB*t.y, +sinB)): positive
+            // beta sweeps the downstream end toward +z. On the upper surface
+            // cross(N, T) = (0, 0, -1), so a Rodrigues rotation about N would
+            // yaw the drawn vane OPPOSITE to the voxelized solid (z-mirror) —
+            // blend the +z axis in directly instead. The AoA rotation is
+            // purely in-plane, so the z component is unaffected.
+            const Vec3f L = normalized(T * std::cos(beta)
+                                       + Vec3f(0.0f, 0.0f, 1.0f) * std::sin(beta));
             const Vec3f W = normalized(cross(N, L)); // in-surface, across the vane
             const Vec3f root(p2.x, p2.y, zc);
             if (vg.type == VGType::Ramp) {

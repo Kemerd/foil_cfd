@@ -178,8 +178,19 @@ public:
     const float* deviceRho() const;
 
     /// @brief Device flag field (cellCount bytes) — particle kernels need it
-    /// for solid-entry respawn.
+    /// for solid-entry respawn. NOTE: this pointer is ghost-OFFSET for the
+    /// UNPADDED x + nx*(y + ny*z) convention; it is NOT the padded base that
+    /// DeviceLatticeView::flags requires. External code building a lattice
+    /// view (e.g. to call launchForceReduction) must use latticeView() — a
+    /// view assembled from this pointer reads every flag one z-plane high.
     const std::uint8_t* deviceFlags() const;
+
+    /// @brief Lattice view over the CURRENT source f buffer with the PADDED
+    /// base pointers the lbm_core.cuh launch wrappers require (kernels index
+    /// flags as flags[cell + nx*ny]). This is the supported way for external
+    /// callers (tests, future tools) to run launchForceReduction or other
+    /// core kernels against the live state.
+    DeviceLatticeView latticeView() const;
 
     /// @brief Device pointer to the CURRENT source f buffer. The buffer is
     /// z-ghost PADDED: kQ * GridDims::paddedCellCount() FPop entries (frozen

@@ -219,9 +219,13 @@ void handleHotkeys(UIContext& ctx) {
     const ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput) return; // typing a NACA code, not toggling views
     UIParams& p = *ctx.params;
+    // Plan 9.1 mode hotkeys: 1 = particles, 2 = slices, 3 = Q-criterion
+    // raycast (the "screenshot mode"). The foil mesh is not a plan mode and
+    // lives on 4 so all three numbered modes match the spec.
     if (ImGui::IsKeyPressed(ImGuiKey_1, false)) p.viz.showParticles = !p.viz.showParticles;
     if (ImGui::IsKeyPressed(ImGuiKey_2, false)) p.viz.showSlices    = !p.viz.showSlices;
-    if (ImGui::IsKeyPressed(ImGuiKey_3, false)) p.viz.showFoilMesh  = !p.viz.showFoilMesh;
+    if (ImGui::IsKeyPressed(ImGuiKey_3, false)) p.viz.showQRaycast  = !p.viz.showQRaycast;
+    if (ImGui::IsKeyPressed(ImGuiKey_4, false)) p.viz.showFoilMesh  = !p.viz.showFoilMesh;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) p.running = !p.running;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) ctx.events->frameFoilView = true;
 }
@@ -342,8 +346,15 @@ void drawAirfoilPanel(UIContext& ctx) {
                "ramp, but the cached flow stays valid (plan: airspeed is not "
                "part of the snapshot key).");
 
+    // Chord is a pure UNITS rescale, exactly like airspeed: grid dims, u_lat,
+    // and the flag field are untouched (only dx/dt/Re-target change), so it
+    // rides the cheap scaling-changed path — a full re-init would needlessly
+    // cold-start the flow and destroy the warm cache on every Re-sweep tick.
     ImGui::SliderFloat("Chord", &p.chordM, 0.2f, 4.0f, "%.2f m");
-    if (ImGui::IsItemDeactivatedAfterEdit()) ev.resolutionChanged = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) ev.airspeedChanged = true;
+    helpMarker("Physical chord length. Like airspeed, this only rescales the "
+               "unit conversion (target Reynolds number) — the cached flow "
+               "stays valid.");
 
     // ---- resolution presets + High Fidelity ----
     ImGui::Spacing();
@@ -687,6 +698,23 @@ void drawSimPanel(UIContext& ctx) {
     UIEvents& ev = *ctx.events;
     if (!ImGui::Begin("Simulation")) { ImGui::End(); return; }
 
+    // ---- CUDA failure surface (plan 4.5 TDR robustness): a launch/interop
+    // error latched by the frame loop pauses the sim for the session and is
+    // reported here instead of silently spinning on a frozen field ----
+    if (r.cudaErrorTripped) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.30f, 0.08f, 0.08f, 1.0f));
+        ImGui::BeginChild("##cudabox", ImVec2(-1, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+        ImGui::TextColored(kColBad, "GPU ERROR — simulation stopped");
+        ImGui::TextWrapped("%s", r.cudaErrorDiagnosis.c_str());
+        ImGui::TextWrapped("Restart FoilCFD to recover. If this follows a "
+                           "display timeout on a huge grid, see the TdrDelay "
+                           "note in BUILDING.md.");
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
     // ---- NaN watchdog error surface: loud, on top, with the diagnosis ----
     if (r.nanTripped) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.30f, 0.08f, 0.08f, 1.0f));
@@ -818,7 +846,24 @@ void drawViewPanel(UIContext& ctx) {
     ImGui::TextDisabled("MODES");
     ImGui::Checkbox("Particles  [1]", &p.viz.showParticles);
     ImGui::Checkbox("Slices  [2]", &p.viz.showSlices);
-    ImGui::Checkbox("Foil mesh  [3]", &p.viz.showFoilMesh);
+    ImGui::Checkbox("Q-criterion isosurface  [3]", &p.viz.showQRaycast);
+    helpMarker("Screen-space volume raycast of the Q-criterion (vortex-core "
+               "regions where rotation beats strain). The 3D texture updates "
+               "every few frames — this is the screenshot mode.");
+    if (p.viz.showQRaycast) {
+        ImGui::Indent();
+        // Threshold on the NORMALIZED Q in (0,1): the volume texture stores
+        // Q/qScale clamped to [0,1], so 1.0 would select nothing.
+        ImGui::SliderFloat("Threshold", &p.viz.qThreshold, 0.005f, 0.99f,
+                           "%.3f", ImGuiSliderFlags_Logarithmic);
+        // Contrast knob: which raw Q maps to 1.0 in the volume (re-uploaded
+        // on the renderer's own cadence — no event needed, viz reads
+        // VizSettings each frame).
+        ImGui::SliderFloat("Q scale", &p.viz.qScale, 1e-6f, 1e-3f, "%.1e",
+                           ImGuiSliderFlags_Logarithmic);
+        ImGui::Unindent();
+    }
+    ImGui::Checkbox("Foil mesh  [4]", &p.viz.showFoilMesh);
     if (ImGui::Button("Focus foil  [F]")) ev.frameFoilView = true;
 
     // ---- particles ----

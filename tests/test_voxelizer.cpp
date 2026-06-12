@@ -37,8 +37,12 @@ std::uint8_t flagOf(CellFlag f) { return static_cast<std::uint8_t>(f); }
 
 // -----------------------------------------------------------------------
 // buildBoundaryFlags: Inlet plane at x=0, Outlet at x=nx-1, free-slip y
-// faces, Fluid bulk, NO z-face flags (z is periodic). Inlet/outlet win at
-// the y-face corners so those columns are uniform top to bottom.
+// faces, Fluid bulk, NO z-face flags (z is periodic). The inlet wins at
+// its y-face corners (its storage is rewritten every step, so corner reads
+// stay fresh); the OUTLET yields to the slip planes at its corners — an
+// outlet corner would zero-gradient-copy from a slip marker cell whose f
+// storage is never written, leaking frozen cold-start equilibrium into the
+// interior corner links forever.
 // -----------------------------------------------------------------------
 void checkBoundaryFlags() {
     const GridDims dims{8, 6, 3};
@@ -52,8 +56,9 @@ void checkBoundaryFlags() {
                 std::uint8_t expect = flagOf(CellFlag::Fluid);
                 if (y == 0) expect = flagOf(CellFlag::SlipBottom);
                 if (y == dims.ny - 1) expect = flagOf(CellFlag::SlipTop);
-                if (x == 0) expect = flagOf(CellFlag::Inlet);   // x stamps win
-                if (x == dims.nx - 1) expect = flagOf(CellFlag::Outlet);
+                if (x == 0) expect = flagOf(CellFlag::Inlet);   // inlet wins
+                if (x == dims.nx - 1 && y != 0 && y != dims.ny - 1)
+                    expect = flagOf(CellFlag::Outlet);          // slip wins at corners
                 if (flags[idx(dims, x, y, z)] != expect) {
                     std::printf("  flag mismatch at (%d,%d,%d): got %d want %d\n",
                                 x, y, z, flags[idx(dims, x, y, z)], expect);

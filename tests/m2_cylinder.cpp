@@ -162,8 +162,10 @@ int main() {
                        cudaGetErrorString(serr));
             break;
         }
-        DeviceLatticeView view{solver.activeDeviceF(), solver.deviceFlags(),
-                               solver.dims()};
+        // latticeView() hands back the PADDED base pointers the launch
+        // wrappers index with — deviceFlags() is ghost-offset for unpadded
+        // consumers, and a view built from it reads flags one z-plane high.
+        const DeviceLatticeView view = solver.latticeView();
         const cudaError_t ferr =
             launchForceReduction(view, DeviceForceAccumulator{dForce}, nullptr);
         if (ferr != cudaSuccess) {

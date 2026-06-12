@@ -32,7 +32,11 @@ struct DomainLayout {
 /// @brief Build a fresh flag field with ONLY the domain boundary conditions
 /// stamped (plan 4.2): Inlet at x=0, Outlet at x=nx-1, SlipBottom at y=0,
 /// SlipTop at y=ny-1, Fluid everywhere else. z is periodic, so z faces stay
-/// Fluid. Voxelizers OR solids into the result afterward.
+/// Fluid. Corner precedence: the inlet wins over the slip planes (its
+/// storage refreshes every step), but the outlet YIELDS to them — an outlet
+/// corner cell would zero-gradient-copy from a slip marker whose population
+/// storage is never written, freezing cold-start equilibrium into the
+/// interior corner links. Voxelizers OR solids into the result afterward.
 /// @param dims Grid dimensions.
 /// @return dims.cellCount() CellFlag bytes, index = x + nx*(y + ny*z).
 std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims);
