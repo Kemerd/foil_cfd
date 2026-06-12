@@ -48,10 +48,20 @@ vec3 inferno(float t) {
     return clamp(c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6))))), 0.0, 1.0);
 }
 
+// Full-saturation HSV hue sweep, blue (slow) -> green -> red (fast): the
+// classic wind-tunnel palette for the 3D hero modes.
+vec3 rainbow(float t) {
+    float h = (1.0 - clamp(t, 0.0, 1.0)) * 4.0;  // hue in sextants: 0=red..4=blue
+    vec3 k = mod(vec3(5.0, 3.0, 1.0) + h, 6.0);  // standard HSV channel offsets
+    return 1.0 - clamp(min(min(k, 4.0 - k), vec3(1.0)), 0.0, 1.0);
+}
+
 // Palette dispatch shared by particles and the volume raymarch (kept in sync
-// with the CUDA-side selector: 2 = inferno, 1 = coolwarm, else viridis).
+// with the CUDA-side selector: 3 = rainbow, 2 = inferno, 1 = coolwarm,
+// else viridis).
 vec3 palette(int which, float t) {
-    return (which == 2) ? inferno(t)
+    return (which == 3) ? rainbow(t)
+         : (which == 2) ? inferno(t)
          : (which == 1) ? coolwarm(t)
                         : viridis(t);
 }

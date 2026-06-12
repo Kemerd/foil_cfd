@@ -306,6 +306,24 @@ struct LBMSolver::Impl {
         for (cudaEvent_t* ev : {&evT0, &evT1, &evForce, &evNan}) {
             if (*ev) { cudaEventDestroy(*ev); *ev = nullptr; }
         }
+        // In-flight async readbacks died with their events/buffers above, so
+        // the pending latches must drop with them. A stale 'pending' that
+        // survives into the next init() polls FRESH, never-recorded events:
+        // cudaEventQuery treats those as complete, and cudaEventElapsedTime
+        // then returns cudaErrorInvalidResourceHandle — worse, it leaves that
+        // error in the sticky per-thread slot, so the next launch wrapper's
+        // cudaGetLastError() reports a phantom "sim step" failure (the
+        // resolution/HiFi/airspeed re-init crash).
+        timingPending = false;
+        timingBatchN  = 0;
+        forcePending  = false;
+        nanPending    = false;
+        // Pacing estimates are per-grid: a per-step time measured on a smaller
+        // grid would let the first post-reinit batch overshoot the TDR budget
+        // (adaptiveStepsForBudget grows from lastChosenN). Re-probe from 1.
+        emaStepMs   = 0.0;
+        lastStepMs  = 0.0;
+        lastChosenN = 0;
         hostFlags.clear();
         surfaceRefFlags.clear();
         midU.clear(); midV.clear(); midStamp = -1;

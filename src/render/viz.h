@@ -27,12 +27,14 @@ struct StlMesh;
 /// Hero-mode particle count (plan 9.1: 1,000,000 GL_POINTS).
 inline constexpr int kDefaultParticleCount = 1'000'000;
 
-/// @brief Colormaps offered for field rendering. NO rainbow/jet (plan 9.1):
-/// sequential viridis for speed-like scalars, diverging coolwarm for signed
-/// quantities (vorticity-z, pressure deviation), and inferno — a perceptually
-/// uniform "heat" map — for the velocity-volume wind-tunnel look. Numeric
-/// order matches the shader/kernel palette selector (0/1/2).
-enum class Colormap { Viridis, Coolwarm, Inferno };
+/// @brief Colormaps offered for field rendering. The quantitative views keep
+/// the plan-9.1 pairing — sequential viridis for speed-like scalars, diverging
+/// coolwarm for signed quantities (vorticity-z, pressure deviation) — plus
+/// two hero palettes for the 3D modes: inferno (perceptually uniform heat)
+/// and rainbow (full HSV sweep, the classic wind-tunnel speed-band look that
+/// the Q-isosurface defaults to). Numeric order matches the shader/kernel
+/// palette selector (0/1/2/3).
+enum class Colormap { Viridis, Coolwarm, Inferno, Rainbow };
 
 /// @brief What scalar drives particle color (plan 9.1).
 enum class ParticleColorBy { Speed, VorticityMag };
@@ -72,9 +74,11 @@ struct VizSettings {
     bool foilWireframe = false;   ///< Draw the foil/VG mesh as wireframe lines
                                   ///< instead of shaded solid (view option).
 
-    // -- velocity volume (mode 5, the wind-tunnel "smoke" hero look) --
-    bool  showVelocityVolume = true;  ///< Default ON: raymarch the speed field,
-                                      ///< color it, cull the quiet freestream.
+    // -- velocity volume (mode 5, the translucent "smoke" option) --
+    bool  showVelocityVolume = false; ///< Off by default — the opaque Q
+                                      ///< isosurface below is the hero mode;
+                                      ///< this fog view layers on top when
+                                      ///< wanted.
     Colormap volumeColormap  = Colormap::Inferno; ///< Hot map by default.
     float velocitySpeedScale = 0.16f; ///< Speed (lattice units) mapped to the
                                       ///< palette top — ~2x freestream u_lat so

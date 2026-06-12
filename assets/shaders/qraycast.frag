@@ -1,35 +1,36 @@
-// Q-criterion raycast fragment stage: fixed-step march of the eye ray through
-// the normalized Q volume (R8 3D texture); cells above the threshold light up
-// and composite front-to-back. The box is drawn with FRONT faces culled (back
-// faces rasterized) so the march also works with the camera inside the domain.
+// Q-criterion isosurface fragment stage: first-HIT raycast through the
+// normalized Q volume rendered as an OPAQUE surface — march until the ray
+// crosses the iso threshold, bisection-refine the crossing to sub-step
+// precision, shade with the gradient normal, and write the hit's true depth
+// to gl_FragDepth so the z-buffer composites the filaments against the foil
+// mesh (and everything else) exactly like rasterized geometry would.
 //
-// Two correctness pieces:
-//   1. The march terminates at the opaque scene (foil/VG mesh) by reading the
-//      depth-buffer copy in uSceneDepth, so geometry correctly occludes vortex
-//      cores that sit BEHIND it along the view ray (fixes the foil appearing
-//      to float over the isosurface from every angle).
-//   2. Optional velocity coloring (uColorByVel): instead of the fixed cyan
-//      core tint, sample the speed volume and colormap it, so the isosurface
-//      carries the same velocity field the volume mode shows.
+// This replaces the old translucent front-to-back fog compositing: vortex
+// tubes now read as crisp solid surfaces on the black background (the classic
+// wind-tunnel hero shot), and the depth write makes occlusion correct from
+// every angle with zero extra depth-texture plumbing.
+//
+// Coloring: either the fixed pale-cyan core tint, or (default) the local air
+// speed sampled from the companion speed volume pushed through the selected
+// palette — rainbow by default, so slow air shades blue, freestream green,
+// accelerated air red.
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 #version 330 core
 
 in vec3 vWorldPos; // back-face hit point, lattice cell space
 
 uniform sampler3D uVolume;       // normalized Q in [0,1]
-uniform sampler3D uSpeedVolume;  // normalized speed |u| in [0,1] (vel coloring)
-uniform sampler2D uSceneDepth;   // copied depth buffer of the opaque pass
+uniform sampler3D uSpeedVolume;  // normalized |u| in [0,1] (velocity coloring)
+uniform mat4  uViewProj;         // world -> clip, for the depth write
 uniform vec3  uDims;             // grid dimensions in cells
 uniform vec3  uEye;              // camera position, cell space
-uniform mat4  uInvViewProj;      // clip -> world, to un-project the depth fetch
-uniform vec2  uViewport;         // framebuffer size (pixels), for depth fetch
 uniform float uThreshold;        // iso threshold on normalized Q
 uniform int   uColorByVel;       // 0 = fixed cyan cores, 1 = speed colormap
 uniform int   uColormap;         // palette selector when coloring by velocity
 
 out vec4 fragColor;
 
-// ---- palette (kept in sync with particles.frag / the CUDA kernels) --------
+// ---- palettes (kept in sync with particles.frag / the CUDA kernels) -------
 vec3 viridis(float t) {
     const vec3 c0 = vec3( 0.2777273,  0.0054073,  0.3340998);
     const vec3 c1 = vec3( 0.1050930,  1.4046135,  1.3845902);
@@ -57,8 +58,17 @@ vec3 inferno(float t) {
     const vec3 c6 = vec3(25.13112, -12.24266, -23.07032);
     return clamp(c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6))))), 0.0, 1.0);
 }
+// Full-saturation HSV hue sweep, blue (slow) -> green -> red (fast). The
+// classic wind-tunnel palette: not perceptually uniform, but unbeatable for
+// reading speed bands on vortex structures at a glance.
+vec3 rainbow(float t) {
+    float h = (1.0 - clamp(t, 0.0, 1.0)) * 4.0;  // hue in sextants: 0=red..4=blue
+    vec3 k = mod(vec3(5.0, 3.0, 1.0) + h, 6.0);  // standard HSV channel offsets
+    return 1.0 - clamp(min(min(k, 4.0 - k), vec3(1.0)), 0.0, 1.0);
+}
 vec3 palette(int which, float t) {
-    return (which == 2) ? inferno(t)
+    return (which == 3) ? rainbow(t)
+         : (which == 2) ? inferno(t)
          : (which == 1) ? coolwarm(t)
                         : viridis(t);
 }
@@ -74,71 +84,85 @@ vec2 intersectBox(vec3 ro, vec3 rd) {
                 min(min(tmax3.x, tmax3.y), tmax3.z));
 }
 
-// Un-project a window-space depth sample into a WORLD-space position so its
-// eye distance is exact along the view ray, regardless of view angle.
-vec3 worldFromDepth(vec2 uv, float depth) {
-    vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
-    vec4 world = uInvViewProj * ndc;
-    return world.xyz / world.w;
-}
+float sampleQ(vec3 p) { return texture(uVolume, p / uDims).r; }
 
 void main() {
     vec3 rd = normalize(vWorldPos - uEye);
     vec2 hit = intersectBox(uEye, rd);
     float tNear = max(hit.x, 0.0);
     float tFar  = min(hit.y, length(vWorldPos - uEye));
-
-    // ---- occlude against the opaque scene (depth-buffer copy) -------------
-    vec2 uv = gl_FragCoord.xy / uViewport;
-    float sceneD = texture(uSceneDepth, uv).r;
-    if (sceneD < 1.0) {
-        float tFoil = length(worldFromDepth(uv, sceneD) - uEye);
-        tFar = min(tFar, tFoil);
-    }
     if (tFar <= tNear) discard;
 
-    const int   kSteps = 160;
+    // Fixed-step march with early exit on the first crossing; 256 steps keeps
+    // thin filaments from being skipped at the default domain size while the
+    // first-hit exit keeps the common case cheap.
+    const int kSteps = 256;
     float stepLen = (tFar - tNear) / float(kSteps);
-    vec3  texel   = 1.0 / uDims;
 
-    vec3  accumRgb = vec3(0.0);
-    float accumA   = 0.0;
-    vec3  L = normalize(vec3(-0.45, 0.80, 0.40)); // matches the mesh key light
-
-    for (int i = 0; i < kSteps; ++i) {
-        vec3 p = uEye + rd * (tNear + (float(i) + 0.5) * stepLen);
-        vec3 uvw = p / uDims;
-        float q = texture(uVolume, uvw).r;
-        if (q > uThreshold) {
-            // Gradient of the Q field = surface normal of the pseudo-iso.
-            float gx = texture(uVolume, uvw + vec3(texel.x, 0, 0)).r
-                     - texture(uVolume, uvw - vec3(texel.x, 0, 0)).r;
-            float gy = texture(uVolume, uvw + vec3(0, texel.y, 0)).r
-                     - texture(uVolume, uvw - vec3(0, texel.y, 0)).r;
-            float gz = texture(uVolume, uvw + vec3(0, 0, texel.z)).r
-                     - texture(uVolume, uvw - vec3(0, 0, texel.z)).r;
-            vec3 g = vec3(gx, gy, gz);
-            vec3 N = (dot(g, g) > 1e-12) ? normalize(-g) : -rd;
-            if (dot(N, rd) > 0.0) N = -N;
-
-            float diffuse = max(dot(N, L), 0.0);
-            float rim = pow(1.0 - clamp(dot(N, -rd), 0.0, 1.0), 2.0);
-            float density = smoothstep(uThreshold,
-                                       min(uThreshold + 0.1, 1.0), q);
-            // Surface color: pale cyan cores by default, or the speed colormap
-            // when the user asks the isosurface to carry the velocity field.
-            vec3 base = (uColorByVel == 1)
-                          ? palette(uColormap, texture(uSpeedVolume, uvw).r)
-                          : vec3(0.55, 0.85, 0.95);
-            vec3 shade = base * (0.25 + 0.75 * diffuse) + vec3(0.25) * rim;
-
-            float a = density * 0.35;
-            accumRgb += (1.0 - accumA) * a * shade;
-            accumA   += (1.0 - accumA) * a;
-            if (accumA > 0.95) break;
+    float tHit  = -1.0;
+    float qPrev = sampleQ(uEye + rd * tNear);
+    if (qPrev > uThreshold) {
+        tHit = tNear; // camera (or box entry) already inside a core
+    } else {
+        float tPrev = tNear;
+        for (int i = 1; i <= kSteps; ++i) {
+            float t = tNear + float(i) * stepLen;
+            float q = sampleQ(uEye + rd * t);
+            if (q > uThreshold) {
+                // Bisection-refine the crossing inside [tPrev, t]: six halvings
+                // give sub-1/64-step precision — silhouettes stay smooth even
+                // when the march stride is ~1.5 cells.
+                float a = tPrev, b = t;
+                for (int j = 0; j < 6; ++j) {
+                    float m = 0.5 * (a + b);
+                    if (sampleQ(uEye + rd * m) > uThreshold) b = m;
+                    else                                     a = m;
+                }
+                tHit = 0.5 * (a + b);
+                break;
+            }
+            tPrev = t;
+            qPrev = q;
         }
     }
+    if (tHit < 0.0) discard;
 
-    if (accumA <= 0.003) discard;
-    fragColor = vec4(accumRgb, accumA);
+    vec3 p   = uEye + rd * tHit;
+    vec3 uvw = p / uDims;
+    vec3 texel = 1.0 / uDims;
+
+    // Surface normal from the Q-field gradient (central differences in
+    // texture space). Fallback to the view direction on flat gradients.
+    float gx = texture(uVolume, uvw + vec3(texel.x, 0, 0)).r
+             - texture(uVolume, uvw - vec3(texel.x, 0, 0)).r;
+    float gy = texture(uVolume, uvw + vec3(0, texel.y, 0)).r
+             - texture(uVolume, uvw - vec3(0, texel.y, 0)).r;
+    float gz = texture(uVolume, uvw + vec3(0, 0, texel.z)).r
+             - texture(uVolume, uvw - vec3(0, 0, texel.z)).r;
+    vec3 g = vec3(gx, gy, gz);
+    vec3 N = (dot(g, g) > 1e-12) ? normalize(-g) : -rd;
+    if (dot(N, rd) > 0.0) N = -N; // always face the camera
+
+    // Base color: speed palette (the velocity field painted onto the vortex
+    // skins) or the legacy fixed cyan.
+    vec3 base = (uColorByVel == 1)
+                  ? palette(uColormap, texture(uSpeedVolume, uvw).r)
+                  : vec3(0.55, 0.85, 0.95);
+
+    // Saturated-but-shaded: strong ambient floor keeps the palette readable
+    // (the color IS the data), diffuse + a small specular give the tubes
+    // their roundness against the black background.
+    vec3  L = normalize(vec3(-0.45, 0.80, 0.40)); // matches the mesh key light
+    float diffuse = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(reflect(-L, N), -rd), 0.0), 24.0);
+    vec3 rgb = base * (0.45 + 0.55 * diffuse) + vec3(0.18) * spec;
+
+    // True depth for the hit point: project to clip space and convert NDC z
+    // to the [0,1] window range. Writing gl_FragDepth disables early-z for
+    // this draw, so the hardware test runs AFTER the shader with this value —
+    // exactly what makes foil-vs-filament occlusion per-pixel correct.
+    vec4 clip = uViewProj * vec4(p, 1.0);
+    gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+
+    fragColor = vec4(rgb, 1.0);
 }

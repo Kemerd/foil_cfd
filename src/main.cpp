@@ -1196,6 +1196,39 @@ int runSelftest(App& app) {
     glfwGetFramebufferSize(app.window, &fbw, &fbh);
     app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
 
+    // TEMP REPRO: exercise the grid-rebuild re-init path (volume interop must
+    // survive a Visualizer::init() cycle), then render + step again.
+    {
+        std::string rerr;
+        // Exercise the heaviest interop combination through the rebuild: the
+        // velocity volume AND the Q raycast both live (their 3D textures get
+        // released and lazily recreated across the init cycle).
+        app.params.viz.showVelocityVolume = true;
+        app.params.viz.showQRaycast = true;
+        std::fprintf(stderr, "[repro] re-init (volume+Q ON)...\n");
+        if (!initSimulation(app, /*reinit=*/true, &rerr)) {
+            std::fprintf(stderr, "[repro] re-init failed: %s\n", rerr.c_str());
+            return 1;
+        }
+        app.params.viz.freestreamLatticeSpeed = currentULat(app.params);
+        if (cudaError_t e = app.viz.updateFields(
+                app.solver.velocityField(), app.solver.deviceRho(),
+                app.solver.deviceFlags(), 1.0f, app.params.viz);
+            e != cudaSuccess) {
+            std::fprintf(stderr, "[repro] post-reinit updateFields: %s\n",
+                         cudaGetErrorString(e));
+            return 1;
+        }
+        app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
+        if (cudaError_t e = app.solver.stepN(20); e != cudaSuccess) {
+            std::fprintf(stderr, "[repro] post-reinit stepN: %s\n",
+                         cudaGetErrorString(e));
+            return 1;
+        }
+        cudaStreamSynchronize(app.stream);
+        std::fprintf(stderr, "[repro] survived re-init cycle\n");
+    }
+
     std::string err;
     const auto shotPath = std::filesystem::path("screenshots") / "selftest.png";
     if (!app.viz.screenshotPNG(shotPath, &err)) {

@@ -61,8 +61,15 @@ vec3 inferno(float t) {
     const vec3 c6 = vec3(25.13112, -12.24266, -23.07032);
     return clamp(c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6))))), 0.0, 1.0);
 }
+// Full-saturation HSV hue sweep, blue (slow) -> green -> red (fast).
+vec3 rainbow(float t) {
+    float h = (1.0 - clamp(t, 0.0, 1.0)) * 4.0;  // hue in sextants: 0=red..4=blue
+    vec3 k = mod(vec3(5.0, 3.0, 1.0) + h, 6.0);  // standard HSV channel offsets
+    return 1.0 - clamp(min(min(k, 4.0 - k), vec3(1.0)), 0.0, 1.0);
+}
 vec3 palette(int which, float t) {
-    return (which == 2) ? inferno(t)
+    return (which == 3) ? rainbow(t)
+         : (which == 2) ? inferno(t)
          : (which == 1) ? coolwarm(t)
                         : viridis(t);
 }
@@ -110,6 +117,21 @@ void main() {
     const int kSteps = 192;
     float stepLen = (tFar - tNear) / float(kSteps);
 
+    // ---- extinction coefficients (optical-depth space) ---------------------
+    // The two opacity sliders are TOTAL opacities over a reference path, not
+    // per-sample alphas — composing per-step values directly would saturate
+    // any low haze into an opaque slab over a long ray (a 768-cell crossing
+    // at even 5%/step is pitch black; that was the glowing-box artifact).
+    //   quiet air:     uSlowOpacity accumulated over the LONGEST domain axis,
+    //                  so a full crossing of calm air ends at exactly that
+    //                  faint total — visible, never a wall.
+    //   disturbed air: uDensity accumulated over a wake-feature scale (~64
+    //                  cells), so a vortex street reads solid without needing
+    //                  the whole domain behind it.
+    float maxDim = max(uDims.x, max(uDims.y, uDims.z));
+    float sigmaSlow = -log(max(1.0 - uSlowOpacity, 1e-4)) / maxDim;
+    float sigmaFast = -log(max(1.0 - uDensity,     1e-4)) / 64.0;
+
     vec3  accumRgb = vec3(0.0);
     float accumA   = 0.0;
 
@@ -121,22 +143,18 @@ void main() {
         // the foil shell and domain walls never tint the haze.
         if (s <= 0.0) continue;
 
-        // Opacity curve: quiet air (speed near the freestream baseline) keeps
-        // only the user's floor alpha (uSlowOpacity) so it reads as faint
-        // haze; air that departs from freestream — the wake slowdown and the
-        // suction-peak speedup alike — ramps up toward uDensity. Disturbance
-        // is the fractional deviation from the freestream level, normalized so
-        // a full stop (s -> 0) or a doubling both saturate.
+        // Disturbance: fractional deviation from the freestream baseline, so
+        // the wake slowdown and the suction-peak speedup both light up while
+        // calm air stays at the haze floor. Speed-ups read a touch stronger
+        // (acceleration over the suction surface is the headline feature).
         float base = max(uFreestream, 1e-3);
         float dev = (s - base) / base;            // signed fractional deviation
-        // Speed-ups read a touch stronger than slow-downs (acceleration over
-        // the suction surface is the headline feature), but both light up.
         float disturb = clamp(abs(dev) * 1.1 + max(dev, 0.0) * 0.4, 0.0, 1.0);
-        float a = mix(uSlowOpacity, uDensity, disturb);
 
-        // Per-step alpha scaled by step length so the look is resolution
-        // independent (more steps != denser fog).
-        a = 1.0 - pow(1.0 - clamp(a, 0.0, 1.0), stepLen);
+        // Blend extinction by disturbance, then convert this step's optical
+        // depth to an alpha (resolution independent: more steps != more fog).
+        float sigma = mix(sigmaSlow, sigmaFast, disturb);
+        float a = 1.0 - exp(-sigma * stepLen);
 
         vec3 shade = palette(uColormap, s);
         accumRgb += (1.0 - accumA) * a * shade;

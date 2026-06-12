@@ -221,6 +221,21 @@ __device__ float3 infernoColor(float t) {
                        fminf(fmaxf(r.z, 0.0f), 1.0f));
 }
 
+/// Full-saturation HSV hue sweep, blue (t=0) -> green -> red (t=1): the
+/// classic wind-tunnel palette for the 3D hero modes. Standard HSV->RGB
+/// channel formula with S = V = 1 (offsets 5/3/1 select R/G/B). Mirrors the
+/// GLSL rainbow() in the shaders so all render paths agree on color.
+__device__ float3 rainbowColor(float t) {
+    t = fminf(fmaxf(t, 0.0f), 1.0f);
+    const float h = (1.0f - t) * 4.0f; // hue in sextants: 0 = red .. 4 = blue
+    auto channel = [](float k) {
+        k = fmodf(k, 6.0f);
+        const float m = fminf(fminf(k, 4.0f - k), 1.0f);
+        return 1.0f - fmaxf(m, 0.0f);
+    };
+    return make_float3(channel(5.0f + h), channel(3.0f + h), channel(1.0f + h));
+}
+
 // ===========================================================================
 // Respawn helpers (plan 9.1: inlet respawn rate-balanced + volume re-seeding).
 // ===========================================================================
@@ -411,7 +426,8 @@ __global__ void sliceFillKernel(cudaSurfaceObject_t surface,
     }
     if (!isfinite(tNorm)) tNorm = 0.0f;
 
-    const float3 rgb = (prm.colormap == 2) ? infernoColor(tNorm)
+    const float3 rgb = (prm.colormap == 3) ? rainbowColor(tNorm)
+                     : (prm.colormap == 2) ? infernoColor(tNorm)
                      : (prm.colormap == 1) ? coolwarmColor(tNorm)
                                            : viridisColor(tNorm);
     surf2Dwrite(make_uchar4(static_cast<unsigned char>(rgb.x * 255.0f + 0.5f),
