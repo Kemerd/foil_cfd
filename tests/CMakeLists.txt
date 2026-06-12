@@ -1,0 +1,82 @@
+# FoilCFD test suite (plan section 10 milestones + section 3 test list).
+#
+# Host tests (always runnable):
+#   test_units     - units.h scaling/round-trip/clamp/ramp contract
+#   test_airfoil   - .dat loader (Lednicer ls413 + Selig a18), NACA generator
+#   test_voxelizer - boundary flags, diamond parity voxelization, TE closure
+# GPU tests (labeled "gpu" so CI-less machines exclude them: ctest -LE gpu):
+#   cuda_smoke      - toolchain canary (real kernel on the installed card)
+#   m0_taylor_green - 64^3 TG decay: monotone KE, no NaN over 50k steps
+#   m1_cavity       - Re 1000 lid-driven cavity vs Ghia et al. (1982)
+#   m2_cylinder     - D=40 cylinder at Re 150: lift-spectrum Strouhal in band
+# FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
+
+# ---------------------------------------------------------------------------
+# Solver objects shared by the three GPU milestone tests. Built once as a
+# static lib so lbm_core.cu goes through nvcc a single time; deliberately
+# limited to the sim/ module so geometry churn cannot break the GPU tests.
+# ---------------------------------------------------------------------------
+add_library(foilcfd_test_sim STATIC
+    ${CMAKE_SOURCE_DIR}/src/sim/lbm_core.cu
+    ${CMAKE_SOURCE_DIR}/src/sim/lbm_solver.cpp)
+target_include_directories(foilcfd_test_sim PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(foilcfd_test_sim PUBLIC CUDA::cudart)
+
+# ---------------------------------------------------------------------------
+# Host-only tests.
+# ---------------------------------------------------------------------------
+
+# units.h is header-only; no module sources needed.
+add_executable(test_units test_units.cpp)
+target_include_directories(test_units PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_units COMMAND test_units)
+
+# Airfoil parsing/generation. The absolute airfoils/ path is injected so the
+# test finds the in-tree reference files from any working directory.
+add_executable(test_airfoil
+    test_airfoil.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp)
+target_include_directories(test_airfoil PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_airfoil PRIVATE
+    FOILCFD_AIRFOIL_DIR="${CMAKE_SOURCE_DIR}/airfoils")
+add_test(NAME test_airfoil COMMAND test_airfoil)
+
+# Voxelizer parity + TE closure. voxelizer.h pulls lbm_core.cuh for the flag
+# enum/grid types, so the CUDA runtime headers must be on the include path
+# (CUDA::cudart carries them); no kernels are launched by this test.
+add_executable(test_voxelizer
+    test_voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp)
+target_include_directories(test_voxelizer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_voxelizer PRIVATE CUDA::cudart)
+add_test(NAME test_voxelizer COMMAND test_voxelizer)
+
+# ---------------------------------------------------------------------------
+# GPU tests.
+# ---------------------------------------------------------------------------
+
+# Toolchain smoke test: launches a real kernel, verifies results on host.
+add_executable(cuda_smoke cuda_smoke.cu)
+target_link_libraries(cuda_smoke PRIVATE CUDA::cudart)
+add_test(NAME cuda_smoke COMMAND cuda_smoke)
+
+# Physics milestones M0-M2 (plan section 10). Host TUs driving the solver's
+# public API; all device work happens inside the sim module.
+foreach(gpu_test IN ITEMS m0_taylor_green m1_cavity m2_cylinder)
+    add_executable(${gpu_test} ${gpu_test}.cpp)
+    target_link_libraries(${gpu_test} PRIVATE foilcfd_test_sim)
+    add_test(NAME ${gpu_test} COMMAND ${gpu_test})
+endforeach()
+
+# The "gpu" label lets machines without an NVIDIA card (or CI) skip every
+# device-touching test in one flag: ctest -LE gpu.
+set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder
+    PROPERTIES LABELS "gpu")
+
+# Per-test wall-clock budgets (seconds). M0 is specified < 3 min; M2 < 5 min.
+set_tests_properties(test_units test_airfoil test_voxelizer PROPERTIES TIMEOUT 60)
+set_tests_properties(cuda_smoke PROPERTIES TIMEOUT 120)
+set_tests_properties(m0_taylor_green PROPERTIES TIMEOUT 180)
+set_tests_properties(m1_cavity PROPERTIES TIMEOUT 300)
+set_tests_properties(m2_cylinder PROPERTIES TIMEOUT 300)

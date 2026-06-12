@@ -1,0 +1,39 @@
+# NASA TM X-72843 (McGhee & Beasley), figure 5, page 27 (PDF page 27 of NTRS
+# 19790004829): section lift curve for the LS(1)-0413 / GA(W)-2 airfoil.
+# Series: circle symbols, R = 2.2e6, M = 0.15, transition FIXED at x/c = 0.075
+# (roughness strip), Langley LTPT.
+# Method: visual raster read at 600 dpi (PyMuPDF render via
+# scripts/digitize_helper.py); axes calibrated against the printed tick labels
+# by gridline pixel profiling and verified with a full-grid overlay
+# (results/digitize_scratch/m1_p27_calib_overlay.png procedure, see
+# validation/nasa/SOURCES.md).
+# Pixel resolution: 1 px = 0.012 deg / 0.0012 cl at the read scale.
+# Uncertainty: alpha +/- 0.2 deg, cl +/- 0.02 (symbol-center reading + scan
+# skew); below alpha ~2 deg the three Reynolds series plot coincident, so the
+# shared cluster value is recorded for every Re with alpha +/- 0.3 deg,
+# cl +/- 0.03 there.
+# Sanity anchors: cl(0) = 0.45, dcl/dalpha([-2,+6]) ~ 0.105 /deg,
+# clmax = 1.69 at 16.0 deg (consistent with figure 12 Re-trend for 0413).
+# Digitized: 2026-06-10.
+alpha,cl
+-10.1,-0.70
+-8.2,-0.48
+-6.1,-0.24
+-5.1,-0.13
+-4.3,-0.03
+-3.1,0.10
+-2.2,0.20
+-1.2,0.32
+0.0,0.45
+1.0,0.55
+2.0,0.66
+4.0,0.88
+6.1,1.07
+8.4,1.29
+10.1,1.43
+12.5,1.59
+14.1,1.67
+16.0,1.69
+17.0,1.60
+18.1,1.45
+20.0,1.25

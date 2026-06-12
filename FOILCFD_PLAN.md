@@ -34,9 +34,12 @@ in the future. Accuracy-relevant consequences:
   upstream of separation onset, h = 0.1–1.0 δ99; Strausak flight-proven recipe: x/c ≈ 0.07,
   ±15° counter-rotating pairs, l = 3h). Compute δ99 along the suction surface from the sim
   and display the recommended h band at the selected station.
-- **Validation anchors** (see §15): digitized NASA lift curves + XFOIL polars copied from
-  `L:\Dev\glasair_vg_sim\validation` into `validation/`; M3 grows an automated trend check
-  against them.
+- **Validation anchors** (see §15): a small set of digitized NASA lift curves + XFOIL polars
+  (copied from `L:\Dev\glasair_vg_sim\validation`) serve as **developer-side solver QA only**
+  — they anchor the solver against one well-documented airfoil family; they are NOT a
+  user-facing feature and we make no claim of covering all airfoils. The scalable per-airfoil
+  reference path is **optional XFOIL integration (v1.x)**: shell out to xfoil.exe to generate
+  a polar for whatever foil the user loaded and overlay it as a reference curve.
 - Honesty stays: display effective vs target Re, gate force readouts until converged, and be
   explicit in the README that a user should tuft-test before drilling holes in their wing.
 
@@ -355,7 +358,50 @@ Single CUDA stream; interop map/unmap brackets only the GL-touching kernels.
 - **Don't trust first 2 flow-throughs** of any cold start for forces; gate the Cl/Cd display.
 - **ImGui sliders:** re-voxelize on release/`IsItemDeactivatedAfterEdit`, not every frame.
 
-## 14. README requirements
+## 14.5 Build environment facts (this machine — bake into BUILDING.md)
+- GPU: RTX 5090 (32 GB), driver 596.36. CUDA Toolkits installed: 10.1, 11.8, 12.3, 12.6, **12.9**.
+- **The `nvcc` on PATH is CUDA 10.1 — do NOT use it.** Target CUDA 12.9 at
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9`. With the Visual Studio generator,
+  select it via toolset: `cmake -B build -G "Visual Studio 17 2022" -A x64 -T cuda=12.9`.
+  If MSVC 17.14 is rejected by nvcc, add `--allow-unsupported-compiler` to CUDA flags.
+- Visual Studio 2022 Enterprise 17.14 (MSBuild + MSVC v143).
+- Document the exact working configure/build commands in `BUILDING.md` once verified.
+
+## 15. Reference data, citations, and the UIUC database (new)
+> **Scope note:** the copied NASA/XFOIL data below is *developer validation* for the solver
+> (milestone QA on the LS(1)-0413 family) — not a user-facing database, and intentionally not
+> "all NASA lift curves" (no such digitized dataset exists; each curve is hand-digitized from
+> PDF figures). Per-airfoil user-facing reference polars come later via optional XFOIL
+> integration (v1.x): generate a polar on demand for the loaded foil and overlay it.
+- **Copy from `L:\Dev\glasair_vg_sim`:**
+  - `docs\CITATIONS.md` -> `docs/CITATIONS.md` (keep provenance, extend — see below).
+  - `validation\nasa\digitized\*.csv` -> `validation/nasa/digitized/` (NASA TM X-72843 LS(1)-0413
+    lift curves at Re 2.2/4.3/6.4e6; Wentz CR-145139 GA(W)-2 curve).
+  - `validation\nasa\SOURCES.md` -> `validation/nasa/SOURCES.md`.
+  - `validation\xfoil\polar_*.csv` -> `validation/xfoil/` (LS(1)-0413 XFOIL polars, Re 1.5/3/6e6,
+    free + tripped; CSV contract `alpha,cl,cd,cdp,cm,xtr_top,xtr_bot`).
+  - `geometry\ls413.dat` -> `airfoils/ls413.dat` (LS(1)-0413, Lednicer format — good loader test).
+- **Extend CITATIONS.md with the Lehmann LBM references** (these inform §11 FP16 accessors and
+  a future in-place streaming upgrade):
+  - Lehmann, M.: *Esoteric Pull and Esoteric Push: Two Simple In-Place Streaming Schemes for the
+    Lattice Boltzmann Method on GPUs.* Computation 10, 92 (2022).
+  - Lehmann, M., Krause, M., Amati, G., Sega, M., Harting, J., Gekle, S.: *Accuracy and performance
+    of the lattice Boltzmann method with 64-bit, 32-bit, and customized 16-bit number formats.*
+    Phys. Rev. E 106, 015308 (2022).
+  - Lehmann, M.: *Computational study of microplastic transport at the water-air interface with a
+    memory-optimized lattice Boltzmann method.* PhD thesis (2023).
+  - Lehmann, M.: *Combined scientific CFD simulation and interactive raytracing with OpenCL.*
+    IWOCL'22 (2022).
+  - Lehmann, M.: *High Performance Free Surface LBM on GPUs.* Master's thesis (2019).
+  - Plus the VG-placement anchors already cited there (Lin 2002; Strausak 2021; Wentz & Seetharam;
+    McGhee & Beasley TM X-72843).
+- **UIUC database fetch:** `scripts/fetch_uiuc_airfoils.py` (helper script, NOT runtime; Windows
+  console / UTF-8 safe). Scrapes `https://m-selig.ae.illinois.edu/ads/coord_database.html`,
+  downloads every `.dat` into `airfoils/uiuc/` (~1600 files, ~15 MB) with polite rate limiting,
+  idempotent/resumable (skip existing). The database is small enough to commit to the repo once
+  fetched. App scans `airfoils/` recursively.
+
+## 16. README requirements
 Screenshots (M4 pair), 60-second quickstart, the fidelity-honesty section (§1 non-goals),
 UIUC database link + note that users drop `.dat` files into `airfoils/`, STL caveats (§7.4),
 license badge (PolyForm NC), and a short "how it works" with a one-paragraph LBM explainer.

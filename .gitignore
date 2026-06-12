@@ -1,0 +1,17 @@
+# Build output
+build/
+out/
+
+# Warm-start snapshot disk cache (generated at runtime)
+cache/
+
+# Visual Studio / IDE state
+.vs/
+*.user
+*.suo
+
+# Runtime captures
+screenshots/
+
+# CMake user presets
+CMakeUserPresets.json

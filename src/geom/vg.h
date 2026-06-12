@@ -1,0 +1,172 @@
+// Vortex generators (plan section 6): the parametric VG model (VGParams kept
+// verbatim from the plan), surface placement frames, voxelization into the
+// flag field, the under-resolution guard, and the Lin-2002 placement guidance
+// helpers that power the VG overlay (Mission statement).
+// FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "../sim/lbm_core.cuh"
+#include "airfoil.h"
+#include "voxelizer.h"
+
+namespace foilcfd {
+
+// ===========================================================================
+// Parametric model — struct kept VERBATIM from plan section 6.1. Field names
+// are API: the UI panel, voxelizer, and cache flow all bind to them.
+// ===========================================================================
+
+enum class VGType { SingleVane, CounterRotatingPair, CoRotatingArray, Ramp };
+struct VGParams {
+  VGType type;
+  float x_c;        // chordwise station, 0..1 (typical 0.05–0.30)
+  float height_c;   // device height / chord (typical 0.005–0.02)
+  float length_h;   // vane length in heights (default 3.0)
+  float beta_deg;   // incidence to local flow (default 16, range ±30)
+  float pitch_c;    // spanwise spacing between units (arrays/pairs)
+  float gap_h;      // intra-pair gap in heights (pairs; default 2.5)
+  int   count;      // number of units across the span
+  bool  commonFlowDown; // pair orientation
+};
+
+/// @brief Sensible starting values matching the plan's "typical" annotations
+/// and the Strausak flight-proven recipe defaults (x/c 0.07, beta ~15-16 deg,
+/// l = 3h, counter-rotating pairs).
+inline VGParams defaultVGParams() {
+    VGParams p{};
+    p.type           = VGType::CounterRotatingPair;
+    p.x_c            = 0.07f;
+    p.height_c       = 0.01f;
+    p.length_h       = 3.0f;
+    p.beta_deg       = 16.0f;
+    p.pitch_c        = 0.06f;
+    p.gap_h          = 2.5f;
+    p.count          = 4;
+    p.commonFlowDown = true;
+    return p;
+}
+
+// ===========================================================================
+// Placement and voxelization
+// ===========================================================================
+
+/// @brief Compute the placement frame for a VG entry: the airfoil surface
+/// point/tangent/normal at x_c on the UPPER (suction) surface — VGs mount
+/// there only in v1 — expressed in normalized chord coordinates. The frame is
+/// pre-AoA: voxelizeVGs applies the same quarter-chord rotation the airfoil
+/// voxelizer uses, so vanes stay glued to the surface at any AoA.
+/// @param airfoil The section the VG sits on.
+/// @param params  VG entry (only x_c is consumed here).
+/// @return SurfaceFrame with valid=false for out-of-range stations.
+SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil, const VGParams& params);
+
+/// @brief Voxelize one VG entry into the flag field, OR'ing SOLID over the
+/// existing clean-foil mask (plan 6.2: airfoil mask OR VG voxels).
+///
+/// Geometry: vanes are thin boxes 1-2 cells thick, height_c*N_c tall along
+/// the local surface normal, length_h heights long, yawed +/-beta_deg about
+/// the local normal; pairs place two mirrored vanes gap_h heights apart
+/// (commonFlowDown chooses orientation), arrays repeat every pitch_c along z,
+/// centered on the span. Ramp type stamps a right-triangular wedge prism in
+/// the same frame.
+/// @param vg      VG entry to stamp.
+/// @param airfoil Section providing the surface frame.
+/// @param aoa_deg Current angle of attack (vanes rotate with the foil).
+/// @param layout  Foil placement/scale inside the grid.
+/// @param flags   Host flag field, modified in place.
+void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil, float aoa_deg,
+                const DomainLayout& layout, std::vector<std::uint8_t>& flags);
+
+/// @brief Stamp a whole VG configuration: copy of the cached clean-foil flags
+/// + every entry voxelized + one TE-closure pass at the end. This is the
+/// function the UI edit flow calls on slider release (plan 6.2/9.2).
+/// @param vgs           All VG entries currently configured.
+/// @param airfoil       Section geometry.
+/// @param aoa_deg       Angle of attack.
+/// @param layout        Domain layout.
+/// @param cleanFoilFlags The cached clean-foil flag field (NOT modified).
+/// @return New flag field = clean foil mask OR all VG voxels.
+std::vector<std::uint8_t> buildFlagsWithVGs(
+    const std::vector<VGParams>& vgs, const AirfoilGeometry& airfoil,
+    float aoa_deg, const DomainLayout& layout,
+    const std::vector<std::uint8_t>& cleanFoilFlags);
+
+// ===========================================================================
+// Resolution guard (plan 6.1): a vane shorter than ~8 cells is voxel noise,
+// not a vortex generator. The UI warns rather than silently rendering junk.
+// ===========================================================================
+
+/// Minimum resolved vane height in cells before the under-resolution warning.
+inline constexpr int kMinVGHeightCells = 8;
+
+/// @brief Height of the vane in lattice cells at the given chord resolution.
+inline float vgHeightCells(const VGParams& vg, int chordCells) {
+    return vg.height_c * static_cast<float>(chordCells);
+}
+
+/// @brief True when the VG is under-resolved at this grid (height_c * N_c <
+/// kMinVGHeightCells). UI shows: "VG under-resolved — increase chord
+/// resolution or VG size".
+inline bool vgUnderResolved(const VGParams& vg, int chordCells) {
+    return vgHeightCells(vg, chordCells) < static_cast<float>(kMinVGHeightCells);
+}
+
+// ===========================================================================
+// Lin-2002 placement guidance (Mission statement). Source: Lin, J.C., "Review
+// of research on low-profile vortex generators to control boundary-layer
+// separation", Prog. Aerospace Sci. 38 (2002):
+//   - device height h = 0.1 .. 1.0 * delta99 (local BL thickness)
+//   - place devices 5 .. 10 device-heights UPSTREAM of separation onset
+// These helpers turn the live delta99 profile (LBMSolver::extractSuctionDelta99)
+// and detected separation point into the recommendation bands the overlay draws.
+// ===========================================================================
+
+/// Lin 2002 height band, as fractions of local delta99.
+inline constexpr float kLinHeightMinDelta99 = 0.1f;
+inline constexpr float kLinHeightMaxDelta99 = 1.0f;
+/// Lin 2002 "low-profile" sweet spot within that band: devices of 0.2-0.5
+/// delta99 achieved most of the separation control at a fraction of the
+/// device drag — the overlay highlights this inner band (docs/CITATIONS.md).
+inline constexpr float kLinSweetSpotMinDelta99 = 0.2f;
+inline constexpr float kLinSweetSpotMaxDelta99 = 0.5f;
+/// Lin 2002 upstream placement distance band, in device heights.
+inline constexpr float kLinUpstreamMinHeights = 5.0f;
+inline constexpr float kLinUpstreamMaxHeights = 10.0f;
+
+/// @brief A recommended [min,max] band in chord units, plus validity.
+struct GuidanceBand {
+    float minVal = 0.0f;
+    float maxVal = 0.0f;
+    bool  valid  = false; ///< False when inputs were unusable (e.g. attached
+                          ///< flow: no separation point to anchor a station band).
+};
+
+/// @brief Recommended VG height band (h/c) at a station, from the measured
+/// boundary-layer thickness there: h in [0.1, 1.0] * delta99 (Lin 2002).
+/// @param delta99_c Boundary-layer thickness at the station, chord units
+///                  (Delta99Sample::delta99_c). Non-positive -> invalid band.
+/// @return Height band in h/c units, directly comparable to VGParams::height_c.
+GuidanceBand recommendedHeightBand(float delta99_c);
+
+/// @brief The low-profile sweet spot inside the full Lin band: h in
+/// [0.2, 0.5] * delta99 — most of the separation-control benefit at a
+/// fraction of the parasitic drag (Lin 2002). Drawn as the highlighted inner
+/// band of the height overlay.
+/// @param delta99_c Boundary-layer thickness at the station, chord units.
+/// @return Sweet-spot band in h/c units; invalid when delta99_c <= 0.
+GuidanceBand recommendedSweetSpotHeightBand(float delta99_c);
+
+/// @brief Recommended chordwise station band for VG placement: 5-10 device
+/// heights upstream of the detected separation onset (Lin 2002).
+/// @param separationXc Separation onset station x/c (from
+///                     LBMSolver::separationOnsetXc()); < 0 means attached
+///                     flow and yields an invalid band.
+/// @param height_c     Device height h/c the user has configured (distances
+///                     are measured in this h). Non-positive -> invalid.
+/// @return Station band [x/c_min, x/c_max], clamped into [0, separationXc].
+GuidanceBand recommendedStationBand(float separationXc, float height_c);
+
+} // namespace foilcfd
