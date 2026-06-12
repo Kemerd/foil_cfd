@@ -74,4 +74,12 @@ double timerSeconds();
 /// was launched from.
 std::filesystem::path executableDirectory();
 
+/// @brief Instantaneous whole-GPU utilization percent [0..100], read from the
+/// driver's management library (loaded dynamically on first call so there is
+/// no hard link dependency; the handle is cached). Returns -1 when the
+/// library or a device is unavailable — callers should hide the readout
+/// rather than show a fake zero. Cheap enough for a few-Hz poll, but not a
+/// per-frame call.
+int gpuUtilizationPercent();
+
 } // namespace foilcfd::platform

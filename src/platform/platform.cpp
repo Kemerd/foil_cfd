@@ -182,4 +182,50 @@ std::filesystem::path executableDirectory() {
     return std::filesystem::current_path();
 }
 
+int gpuUtilizationPercent() {
+#ifdef _WIN32
+    // The driver's management library (nvml.dll, installed system-wide with
+    // the display driver) is loaded dynamically so the app keeps running on
+    // machines without it — no import-table dependency, no SDK lib to link.
+    // Only the three documented C entry points needed for the utilization
+    // query are resolved; minimal ABI mirror types are declared locally.
+    using NvmlReturn = int;                       // 0 == NVML_SUCCESS
+    using NvmlDevice = void*;
+    struct NvmlUtilization { unsigned int gpu; unsigned int memory; };
+    using FnInit       = NvmlReturn (*)();
+    using FnGetHandle  = NvmlReturn (*)(unsigned int, NvmlDevice*);
+    using FnGetUtil    = NvmlReturn (*)(NvmlDevice, NvmlUtilization*);
+
+    // One-time resolve, cached for the process lifetime. A failed resolve
+    // latches the device handle null so every later call is a cheap early-out.
+    static FnGetUtil  getUtil = nullptr;
+    static NvmlDevice device  = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (HMODULE lib = LoadLibraryW(L"nvml.dll")) {
+            const auto init = reinterpret_cast<FnInit>(
+                GetProcAddress(lib, "nvmlInit_v2"));
+            const auto handle = reinterpret_cast<FnGetHandle>(
+                GetProcAddress(lib, "nvmlDeviceGetHandleByIndex_v2"));
+            getUtil = reinterpret_cast<FnGetUtil>(
+                GetProcAddress(lib, "nvmlDeviceGetUtilizationRates"));
+            // Device 0 matches the app's single-GPU CUDA usage.
+            if (!init || !handle || !getUtil || init() != 0
+                || handle(0u, &device) != 0) {
+                getUtil = nullptr;
+                device = nullptr;
+            }
+        }
+    }
+    if (getUtil && device) {
+        NvmlUtilization u{};
+        if (getUtil(device, &u) == 0) {
+            return static_cast<int>(u.gpu);
+        }
+    }
+#endif
+    return -1; // unavailable: caller hides the readout
+}
+
 } // namespace foilcfd::platform

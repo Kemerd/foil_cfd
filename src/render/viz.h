@@ -121,12 +121,16 @@ struct VizSettings {
     // -- Q-criterion isosurface (mode 3 — the default hero view) --
     bool  showQRaycast = true;    ///< Default ON: opaque first-hit raycast of
                                   ///< the Q-criterion vortex skins (hotkey 3).
-    float qThreshold   = 0.70f;   ///< Iso threshold on the NORMALIZED Q in [0,1].
-                                  ///< High enough that startup-perturbation
-                                  ///< noise in the freestream stays invisible;
-                                  ///< real shear/wake structures sit well above.
-    float qScale       = 5e-5f;   ///< Q value mapped to 1.0 in the volume
-                                  ///< texture (lattice 1/step^2 units).
+    float qThreshold   = 0.25f;   ///< Iso threshold on the NORMALIZED Q in [0,1].
+    float qScale       = 5e-4f;   ///< Q value mapped to 1.0 in the volume
+                                  ///< texture (lattice 1/step^2 units). Sized
+                                  ///< to shear-layer cores (Q ~ 0.5*omega^2 at
+                                  ///< omega ~ 0.03-0.05/step) so the wake uses
+                                  ///< the full [0,1] range while freestream
+                                  ///< micro-turbulence (Q ~ 1e-5) normalizes
+                                  ///< to ~0.02 — far below any threshold. A
+                                  ///< too-small scale clamps BOTH to 1.0 and
+                                  ///< no threshold can separate them.
     int   qUpdateEveryNFrames = 4;///< Recompute cadence (plan 9.1: every N frames).
     bool  qColorByVelocity = true;///< Paint the isosurface with the local air
                                   ///< speed (shares the velocity volume) vs

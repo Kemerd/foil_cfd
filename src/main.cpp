@@ -794,8 +794,8 @@ void updateReadouts(App& app) {
     app.readouts.cudaErrorDiagnosis = app.cudaFailureMsg;
     app.readouts.forces = app.solver.forces();
 
-    // VRAM fraction (plan 4.6 warn-above-80%): a driver query, so poll it at
-    // ~2 Hz instead of every frame.
+    // VRAM fraction (plan 4.6 warn-above-80%) + GPU load: driver queries, so
+    // poll at ~2 Hz instead of every frame.
     if (app.vramPollCounter-- <= 0) {
         app.vramPollCounter = 30;
         size_t freeB = 0, totalB = 0;
@@ -804,6 +804,33 @@ void updateReadouts(App& app) {
                 1.0f - static_cast<float>(static_cast<double>(freeB)
                                           / static_cast<double>(totalB));
         }
+        app.readouts.gpuUtilPercent = platform::gpuUtilizationPercent();
+    }
+
+    // Physical time simulated since the last cold start: steps * dt. dt is
+    // tiny (microseconds at default scaling), so milliseconds is the natural
+    // display unit.
+    app.readouts.simElapsedMs = static_cast<double>(app.solver.stepCount())
+                              * static_cast<double>(app.readouts.scaling.dt)
+                              * 1000.0;
+
+    // ETA until the force gate opens (the moment Cl/Cd readouts go live):
+    // remaining flow-through steps over the measured per-step wall time. An
+    // estimate of GPU time, so it reads slightly optimistic — fine for a
+    // progress hint. Hidden while paused or before the first timing sample.
+    if (app.readouts.forces.valid) {
+        app.readouts.etaSeconds = 0.0;
+    } else if (app.params.running && app.readouts.perf.lastStepMs > 0.0) {
+        const float ftSteps =
+            app.readouts.scaling.flowThroughSteps(app.readouts.dims.nx);
+        const double remainingSteps = std::max(
+            0.0, static_cast<double>(kForceGateFlowThroughs
+                                     - app.readouts.forces.flowThroughs)
+                     * static_cast<double>(ftSteps));
+        app.readouts.etaSeconds =
+            remainingSteps * app.readouts.perf.lastStepMs / 1000.0;
+    } else {
+        app.readouts.etaSeconds = -1.0;
     }
 }
 
@@ -1160,11 +1187,6 @@ int runSelftest(App& app) {
         return 1;
     }
 
-    // TEMP TUNING: develop the flow well past the startup perturbation so the
-    // screenshot shows a representative freestream (revert to 100 after).
-    for (int b = 0; b < 99; ++b) {
-        if (app.solver.stepN(100) != cudaSuccess) break;
-    }
     // Timed half: wall-clock MLUPS over 100 fused steps, sync-bracketed so the
     // measurement covers exactly the lattice work (perf sanity, plan 4.6/11).
     const double t0 = platform::timerSeconds();
@@ -1201,18 +1223,30 @@ int runSelftest(App& app) {
     glfwGetFramebufferSize(app.window, &fbw, &fbh);
     app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
 
-    // TEMP REPRO: exercise the grid-rebuild re-init path (volume interop must
-    // survive a Visualizer::init() cycle), then render + step again.
+    std::string err;
+    const auto shotPath = std::filesystem::path("screenshots") / "selftest.png";
+    if (!app.viz.screenshotPNG(shotPath, &err)) {
+        std::fprintf(stderr, "selftest: screenshot failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("selftest: %lld steps total, screenshot at %s\n",
+                app.solver.stepCount(),
+                platform::pathToUtf8(shotPath).c_str());
+
+    // Re-init survival check: a resolution/HiFi/airspeed change rebuilds the
+    // solver AND the renderer in place, and a latent stale-latch class of bug
+    // (pending async readbacks surviving event destruction) once poisoned the
+    // first post-rebuild launch with cudaErrorInvalidResourceHandle. Exercise
+    // the heaviest interop combination through a full re-init — velocity
+    // volume and Q isosurface both live, so their 3D textures are released
+    // and lazily recreated — then render and step again. Runs AFTER the
+    // screenshot so the PNG keeps the developed-flow content.
     {
         std::string rerr;
-        // Exercise the heaviest interop combination through the rebuild: the
-        // velocity volume AND the Q raycast both live (their 3D textures get
-        // released and lazily recreated across the init cycle).
         app.params.viz.showVelocityVolume = true;
         app.params.viz.showQRaycast = true;
-        std::fprintf(stderr, "[repro] re-init (volume+Q ON)...\n");
         if (!initSimulation(app, /*reinit=*/true, &rerr)) {
-            std::fprintf(stderr, "[repro] re-init failed: %s\n", rerr.c_str());
+            std::fprintf(stderr, "selftest: re-init failed: %s\n", rerr.c_str());
             return 1;
         }
         app.params.viz.freestreamLatticeSpeed = currentULat(app.params);
@@ -1220,29 +1254,20 @@ int runSelftest(App& app) {
                 app.solver.velocityField(), app.solver.deviceRho(),
                 app.solver.deviceFlags(), 1.0f, app.params.viz);
             e != cudaSuccess) {
-            std::fprintf(stderr, "[repro] post-reinit updateFields: %s\n",
+            std::fprintf(stderr, "selftest: post-reinit updateFields: %s\n",
                          cudaGetErrorString(e));
             return 1;
         }
         app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
         if (cudaError_t e = app.solver.stepN(20); e != cudaSuccess) {
-            std::fprintf(stderr, "[repro] post-reinit stepN: %s\n",
+            std::fprintf(stderr, "selftest: post-reinit stepN: %s\n",
                          cudaGetErrorString(e));
             return 1;
         }
         cudaStreamSynchronize(app.stream);
-        std::fprintf(stderr, "[repro] survived re-init cycle\n");
+        std::printf("selftest: re-init cycle OK\n");
     }
 
-    std::string err;
-    const auto shotPath = std::filesystem::path("screenshots") / "selftest.png";
-    if (!app.viz.screenshotPNG(shotPath, &err)) {
-        std::fprintf(stderr, "selftest: screenshot failed: %s\n", err.c_str());
-        return 1;
-    }
-    std::printf("selftest: 200 steps, %lld total, screenshot at %s\n",
-                app.solver.stepCount(),
-                platform::pathToUtf8(shotPath).c_str());
     std::printf("PASS\n");
     return 0;
 }

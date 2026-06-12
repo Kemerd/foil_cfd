@@ -83,7 +83,9 @@ struct UIParams {
                                            ///< root/tip selector); reset by
                                            ///< main.cpp on manifest reload.
     float aoaDeg = 4.0f;                   ///< AoA slider, -5..20 deg (plan 9.2).
-    float airspeedMs = 30.0f;              ///< Physical airspeed [m/s] (canonical).
+    float airspeedMs = 35.7632f;           ///< Physical airspeed [m/s] (canonical);
+                                           ///< default = 80 mph, a typical EAB
+                                           ///< approach/climb regime.
     SpeedUnit speedUnit = SpeedUnit::Knots;///< Display unit for the airspeed
                                            ///< field; m/s stays the stored value.
     float chordM = 1.2f;                   ///< Physical chord [m].
@@ -107,6 +109,10 @@ struct UIParams {
     // -- view panel --
     VizSettings viz;
     bool showVGGuidanceOverlay = true;     ///< Lin-2002 band overlay toggle.
+    bool showVelocityLegend = true;        ///< Speed colorbar overlay at the
+                                           ///< right edge of the render (on by
+                                           ///< default; collapses to a small
+                                           ///< re-show button when hidden).
 };
 
 /// @brief Read-only live numbers the panels DISPLAY each frame.
@@ -121,6 +127,15 @@ struct UIReadouts {
     long long stepCount = 0;
     float flowThroughs = 0.0f;
     float currentTau = 0.0f;
+    int    gpuUtilPercent = -1;            ///< Whole-GPU load [0..100]; -1 =
+                                           ///< driver library unavailable.
+    double simElapsedMs = 0.0;             ///< PHYSICAL time simulated since
+                                           ///< the last cold start [ms]
+                                           ///< (= steps * dt, not wall time).
+    double etaSeconds = -1.0;              ///< Estimated wall seconds until
+                                           ///< the force gate opens (readouts
+                                           ///< converged); 0 = open, <0 = no
+                                           ///< estimate yet (paused/cold).
     bool  nanTripped = false;
     std::string nanDiagnosis;              ///< Shown in the watchdog error popup.
     bool  cudaErrorTripped = false;        ///< Frame loop latched a CUDA failure

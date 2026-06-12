@@ -196,6 +196,12 @@ void buildDefaultDockLayout(ImGuiID dockspaceId) {
     ImGui::DockBuilderFinish(dockspaceId);
 }
 
+// Central (render passthrough) node rect, refreshed every frame by
+// beginDockspace. Overlay widgets (speed legend, etc.) anchor against this
+// instead of the full viewport so they never sit on top of docked panels.
+ImVec2 gRenderAreaPos(0.0f, 0.0f);
+ImVec2 gRenderAreaSize(0.0f, 0.0f);
+
 /// @brief Fullscreen invisible host window + dockspace with a passthrough
 /// central node so the GL scene stays visible behind the panels.
 void beginDockspace() {
@@ -220,6 +226,16 @@ void beginDockspace() {
     }
     ImGui::DockSpace(dockspaceId, ImVec2(0, 0),
                      ImGuiDockNodeFlags_PassthruCentralNode);
+    // Remember where the 3D scene actually shows through this frame (the
+    // passthrough central node), for edge-anchored overlays.
+    if (const ImGuiDockNode* central =
+            ImGui::DockBuilderGetCentralNode(dockspaceId)) {
+        gRenderAreaPos = central->Pos;
+        gRenderAreaSize = central->Size;
+    } else {
+        gRenderAreaPos = vp->WorkPos;
+        gRenderAreaSize = vp->WorkSize;
+    }
     ImGui::End();
 }
 
@@ -1267,6 +1283,164 @@ void drawStlImportModal(UIContext& ctx) {
 
 /// @brief Bottom-left status overlay: transient messages (load errors, cache
 /// notes) without dedicating a docked panel to one line of text.
+// ===========================================================================
+// Speed-scale legend: a vertical colorbar at the right edge of the render
+// area mapping the active speed palette to physical airspeed (in the user's
+// chosen unit). On by default; collapses to a small re-show chip when hidden.
+// The palette evaluators below mirror the GLSL/CUDA versions exactly so the
+// legend colors are the ones actually on screen.
+// ===========================================================================
+
+/// One palette sample as an ImGui color. Coefficients/structure match the
+/// shader-side viridis/inferno polynomial fits, the two-segment coolwarm,
+/// and the HSV-sweep rainbow (selector order 0/1/2/3 — Colormap enum).
+ImU32 legendPaletteColor(Colormap map, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    float r, g, b;
+    auto poly6 = [t](const float c[7][3], float* r, float* g, float* b) {
+        float acc[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            float v = c[6][ch];
+            for (int k = 5; k >= 0; --k) v = v * t + c[k][ch];
+            acc[ch] = std::clamp(v, 0.0f, 1.0f);
+        }
+        *r = acc[0]; *g = acc[1]; *b = acc[2];
+    };
+    switch (map) {
+        case Colormap::Rainbow: {
+            // HSV hue sweep blue -> green -> red, S = V = 1.
+            const float h = (1.0f - t) * 4.0f;
+            auto chan = [h](float off) {
+                const float k = std::fmod(off + h, 6.0f);
+                return 1.0f - std::max(0.0f, std::min({k, 4.0f - k, 1.0f}));
+            };
+            r = chan(5.0f); g = chan(3.0f); b = chan(1.0f);
+            break;
+        }
+        case Colormap::Inferno: {
+            static const float c[7][3] = {
+                {-0.00021f,  0.00016f, -0.01976f}, { 0.10677f,  0.56329f,  3.93245f},
+                {11.60249f, -3.97282f, -15.94254f}, {-41.70399f, 17.43639f, 44.35414f},
+                {77.16296f, -33.40235f, -81.80730f}, {-71.31899f, 32.62606f, 73.20951f},
+                {25.13112f, -12.24266f, -23.07032f}};
+            poly6(c, &r, &g, &b);
+            break;
+        }
+        case Colormap::Coolwarm: {
+            const float blue[3]  = {0.230f, 0.299f, 0.754f};
+            const float white[3] = {0.865f, 0.865f, 0.865f};
+            const float red[3]   = {0.706f, 0.016f, 0.150f};
+            const float s = (t < 0.5f) ? t * 2.0f : (t - 0.5f) * 2.0f;
+            const float e = s * s * (3.0f - 2.0f * s); // smoothstep
+            const float* a = (t < 0.5f) ? blue : white;
+            const float* c = (t < 0.5f) ? white : red;
+            r = a[0] + (c[0] - a[0]) * e;
+            g = a[1] + (c[1] - a[1]) * e;
+            b = a[2] + (c[2] - a[2]) * e;
+            break;
+        }
+        case Colormap::Viridis:
+        default: {
+            static const float c[7][3] = {
+                { 0.2777273f,  0.0054073f,  0.3340998f}, { 0.1050930f, 1.4046135f, 1.3845902f},
+                {-0.3308618f,  0.2148476f,  0.0950952f}, {-4.6342305f, -5.7991010f, -19.3324410f},
+                { 6.2282699f, 14.1799334f, 56.6905526f}, { 4.7763850f, -13.7451454f, -65.3530326f},
+                {-5.4354559f,  4.6458526f, 26.3124352f}};
+            poly6(c, &r, &g, &b);
+            break;
+        }
+    }
+    return IM_COL32(static_cast<int>(r * 255.0f + 0.5f),
+                    static_cast<int>(g * 255.0f + 0.5f),
+                    static_cast<int>(b * 255.0f + 0.5f), 255);
+}
+
+void drawVelocityLegend(UIContext& ctx) {
+    UIParams& p = *ctx.params;
+
+    // Only meaningful while something on screen is speed-colored. The Q
+    // isosurface takes palette precedence over the fog volume (it draws on
+    // top and is the default hero mode).
+    const bool qActive   = p.viz.showQRaycast && p.viz.qColorByVelocity;
+    const bool volActive = p.viz.showVelocityVolume;
+    if (!qActive && !volActive) return;
+
+    // Top-of-scale speed: the lattice normalization converted to physical
+    // units, then to the user's display unit. Guard the unscaled-startup
+    // frame (dt = 0 would NaN the labels).
+    const LatticeScaling& sc = ctx.readouts->scaling;
+    if (!(sc.dt > 0.0f) || !(sc.dx > 0.0f)) return;
+    const float unitPerMs = speedUnitPerMs(p.speedUnit);
+    const float topSpeed =
+        sc.velocityToPhysical(p.viz.velocitySpeedScale) * unitPerMs;
+
+    const ImGuiWindowFlags overlayFlags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings;
+
+    // Anchor: vertically centered on the render area's right edge.
+    const ImVec2 anchor(gRenderAreaPos.x + gRenderAreaSize.x - 12.0f,
+                        gRenderAreaPos.y + gRenderAreaSize.y * 0.5f);
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Always, ImVec2(1.0f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(p.showVelocityLegend ? 0.55f : 0.35f);
+
+    // ---- collapsed: a small chip that brings the legend back ----
+    if (!p.showVelocityLegend) {
+        ImGui::Begin("##speedLegendChip", nullptr, overlayFlags);
+        if (ImGui::SmallButton("<##showLegend")) p.showVelocityLegend = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show speed scale");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Begin("##speedLegend", nullptr, overlayFlags);
+
+    // Header: caption + the hide chip on the same row.
+    ImGui::TextDisabled("SPEED");
+    ImGui::SameLine();
+    if (ImGui::SmallButton(">##hideLegend")) p.showVelocityLegend = false;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide speed scale");
+
+    const Colormap map = qActive ? p.viz.qColormap : p.viz.volumeColormap;
+
+    // ---- gradient bar: stacked vertically-interpolated strips. Fast (the
+    // palette top) is at the TOP of the bar, zero at the bottom. ----
+    const float barW = 18.0f, barH = 200.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const int strips = 48;
+    for (int i = 0; i < strips; ++i) {
+        const float tTop = 1.0f - static_cast<float>(i) / strips;
+        const float tBot = 1.0f - static_cast<float>(i + 1) / strips;
+        const float y0 = p0.y + barH * static_cast<float>(i) / strips;
+        const float y1 = p0.y + barH * static_cast<float>(i + 1) / strips;
+        const ImU32 cTop = legendPaletteColor(map, tTop);
+        const ImU32 cBot = legendPaletteColor(map, tBot);
+        dl->AddRectFilledMultiColor(ImVec2(p0.x, y0), ImVec2(p0.x + barW, y1),
+                                    cTop, cTop, cBot, cBot);
+    }
+    dl->AddRect(p0, ImVec2(p0.x + barW, p0.y + barH), IM_COL32(255, 255, 255, 60));
+
+    // ---- tick labels: five even stops from top-of-scale down to zero ----
+    float labelMaxW = 0.0f;
+    for (int i = 0; i <= 4; ++i) {
+        const float frac = 1.0f - static_cast<float>(i) / 4.0f;
+        const float y = p0.y + barH * static_cast<float>(i) / 4.0f;
+        char label[32];
+        std::snprintf(label, sizeof label, "%.0f %s", topSpeed * frac,
+                      speedUnitLabel(p.speedUnit));
+        dl->AddText(ImVec2(p0.x + barW + 6.0f, y - 7.0f),
+                    IM_COL32(220, 225, 235, 255), label);
+        labelMaxW = std::max(labelMaxW, ImGui::CalcTextSize(label).x);
+    }
+
+    // Reserve the drawn region in the layout so auto-resize fits the bar.
+    ImGui::Dummy(ImVec2(barW + 6.0f + labelMaxW, barH));
+    ImGui::End();
+}
+
 void drawStatusOverlay(const UIContext& ctx) {
     if (ctx.statusMessage.empty()) return;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1328,6 +1502,7 @@ void drawUI(UIContext& ctx) {
     drawReadoutsPanel(ctx);
     drawViewPanel(ctx);
     drawStlImportModal(ctx);
+    drawVelocityLegend(ctx);
     drawStatusOverlay(ctx);
 }
 
