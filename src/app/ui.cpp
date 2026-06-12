@@ -577,20 +577,18 @@ void drawAirfoilPanel(UIContext& ctx) {
         ImGui::SameLine();
         unitButton("m/s", SpeedUnit::Ms);
     }
-    helpMarker("Changing airspeed rescales the units and restarts the startup "
-               "ramp, but the cached flow stays valid (plan: airspeed is not "
-               "part of the snapshot key). The kn/mph/m-s buttons only change "
-               "the display unit — the simulation always runs in SI.");
+    helpMarker("Changing airspeed rescales the units and restarts the "
+               "simulation. The kn/mph/m-s buttons only change the display "
+               "unit — the simulation always runs in SI.");
 
-    // Chord is a pure UNITS rescale, exactly like airspeed: grid dims, u_lat,
-    // and the flag field are untouched (only dx/dt/Re-target change), so it
-    // rides the cheap scaling-changed path — a full re-init would needlessly
-    // cold-start the flow and destroy the warm cache on every Re-sweep tick.
+    // Chord is a units rescale exactly like airspeed: grid dims, u_lat, and
+    // the flag field are untouched (only dx/dt/Re-target change); the flow
+    // restarts cleanly on release.
     ImGui::SliderFloat("Chord", &p.chordM, 0.2f, 4.0f, "%.2f m");
     if (ImGui::IsItemDeactivatedAfterEdit()) ev.airspeedChanged = true;
-    helpMarker("Physical chord length. Like airspeed, this only rescales the "
-               "unit conversion (target Reynolds number) — the cached flow "
-               "stays valid.");
+    helpMarker("Physical chord length. Like airspeed, this rescales the unit "
+               "conversion (target Reynolds number) and restarts the "
+               "simulation.");
 
     // ---- resolution presets + High Fidelity ----
     ImGui::Spacing();
@@ -718,7 +716,7 @@ void drawVGEditorPanel(UIContext& ctx) {
         return;
     }
 
-    ImGui::TextDisabled("Edits restart WARM from the cached clean-foil flow.");
+    ImGui::TextDisabled("Edits apply warm onto the live flow field.");
     if (ImGui::Button("+ Add VG")) {
         p.vgs.push_back(defaultVGParams());
         p.selectedVG = static_cast<int>(p.vgs.size()) - 1;
@@ -974,13 +972,6 @@ void drawSimPanel(UIContext& ctx) {
     ImGui::SameLine();
     if (ImGui::Button("Cold reset")) ev.resetCold = true;
 
-    if (ImGui::Button("Save clean state")) ev.saveCleanState = true;
-    ImGui::SameLine();
-    ImGui::Checkbox("Auto-cache", &p.autoCacheClean);
-    helpMarker("The converged clean-foil flow is the expensive part. Caching "
-               "it (VRAM + disk) lets VG edits warm-restart in seconds "
-               "instead of recomputing the wing. Auto-cache captures it as "
-               "soon as the clean flow converges.");
 
     // ---- the honesty line (plan 4.3: DISPLAY BOTH Re numbers) ----
     ImGui::Spacing();
@@ -1153,6 +1144,14 @@ void drawViewPanel(UIContext& ctx) {
         // Which speed maps to the top of the palette (contrast knob).
         ImGui::SliderFloat("Speed scale", &p.viz.velocitySpeedScale, 0.02f, 0.4f,
                            "%.3f");
+        // Depth-test escape hatch: ON culls every fog fragment the foil
+        // covers on screen (the body pops in front of the smoke); OFF lets
+        // the raymarch composite near-side fog over the body like the Q pass.
+        ImGui::Checkbox("Foil draws over fog", &p.viz.foilOverVolume);
+        helpMarker("When checked, the foil silhouette punches through the fog "
+                   "and always reads on top. Unchecked (default), fog between "
+                   "the camera and the foil drifts over the body the way the "
+                   "vortex skins do.");
         ImGui::Unindent();
     }
 
@@ -1192,6 +1191,12 @@ void drawViewPanel(UIContext& ctx) {
         helpMarker("Draw the airfoil/VG geometry as an edge cage instead of a "
                    "shaded solid — handy for seeing the flow field through the "
                    "body.");
+        // Fade applies to both the shaded solid and the wireframe cage. The
+        // mesh keeps writing depth at any opacity, so the fog/Q occlusion
+        // against the body never changes — only how bright the body reads.
+        ImGui::SliderFloat("Opacity", &p.viz.foilOpacity, 0.05f, 1.0f, "%.2f");
+        helpMarker("Dims the foil/VG mesh (solid or wireframe) so the flow "
+                   "around it stays the star. 1 = fully opaque.");
         ImGui::Unindent();
     }
     if (ImGui::Button("Focus foil  [F]")) ev.frameFoilView = true;

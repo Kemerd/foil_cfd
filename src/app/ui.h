@@ -26,7 +26,8 @@ enum class AirfoilSource { NacaDigits, DatFile, StlImport };
 
 /// @brief Display unit for the airspeed field. The solver always stores
 /// airspeed in m/s (UIParams::airspeedMs); this only changes how the number
-/// is shown and edited. Knots is the aviation default for an airfoil tool.
+/// is shown and edited. Mph is the default — it matches the EAB POH/ASI
+/// convention most homebuilders think in (knots stays one click away).
 enum class SpeedUnit { Knots, Mph, Ms };
 
 /// @brief Per-second conversion factor: multiply m/s by this to get the unit.
@@ -86,10 +87,12 @@ struct UIParams {
     float airspeedMs = 35.7632f;           ///< Physical airspeed [m/s] (canonical);
                                            ///< default = 80 mph, a typical EAB
                                            ///< approach/climb regime.
-    SpeedUnit speedUnit = SpeedUnit::Knots;///< Display unit for the airspeed
+    SpeedUnit speedUnit = SpeedUnit::Mph;  ///< Display unit for the airspeed
                                            ///< field; m/s stays the stored value.
     float chordM = 1.2f;                   ///< Physical chord [m].
-    ResolutionPreset resolution = ResolutionPreset::Default;
+    ResolutionPreset resolution = ResolutionPreset::Fast; ///< Interactive 192
+                                           ///< cells/chord out of the box; the
+                                           ///< finer grids are one click away.
 
     // -- High Fidelity mode (Mission statement) --
     HighFidelityPreset highFidelity;       ///< .enabled is the UI toggle; the
@@ -104,7 +107,6 @@ struct UIParams {
 
     // -- sim panel --
     bool running = true;                   ///< Run/pause.
-    bool autoCacheClean = true;            ///< Auto-capture clean snapshot toggle.
 
     // -- view panel --
     VizSettings viz;
@@ -167,7 +169,6 @@ struct UIEvents {
     bool vgEdited        = false; ///< VG list/params changed on release -> WARM restart (plan 6.2).
     bool resetCold       = false; ///< Explicit reset button.
     bool singleStep      = false; ///< Single-step button (pauses + steps once).
-    bool saveCleanState  = false; ///< "Save clean state" button -> capture snapshots.
     bool refreshAirfoils = false; ///< Re-scan airfoils/ directory.
     bool loadStlRequested = false;///< "Load STL..." button -> open file dialog.
     bool stlImportConfirmed = false; ///< Modal "Import": voxelize the pending STL.
@@ -212,8 +213,8 @@ void uiBeginFrame();
 /// with section 6.1 params, add/duplicate/delete, under-resolution warnings),
 /// VG Guidance (sim-derived delta99 at the selected station, the Lin-2002
 /// recommended h band, Strausak flight-proven preset button — Mission
-/// statement), Sim (run/pause/single-step/reset, save-clean-state, auto-
-/// cache, steps-per-frame, MLUPS, EFFECTIVE-VS-TARGET Re line "simulating at
+/// statement), Sim (run/pause/single-step/reset,
+/// steps-per-frame, MLUPS, EFFECTIVE-VS-TARGET Re line "simulating at
 /// Re %.1e (target %.1e)", tau/u_lat, NaN-watchdog error surface), Readouts
 /// (Cl/Cd/L-over-D EMA with the trust-deltas tooltip: trust VG-on/VG-off
 /// DELTAS on identical settings, verify with tuft testing before drilling —

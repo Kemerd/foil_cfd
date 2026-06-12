@@ -9,7 +9,10 @@ in vec3 vNormal;
 in vec3 vWorldPos;
 in vec3 vColor;
 
-uniform vec3 uEye; // camera position, lattice cell space
+uniform vec3 uEye;    // camera position, lattice cell space
+uniform float uAlpha; // mesh/wireframe opacity [0,1]; 1 = opaque (CPU side
+                      // enables blending only when below 1, so the common
+                      // opaque path keeps its blend-free fill rate)
 
 out vec4 fragColor;
 
@@ -29,5 +32,5 @@ void main() {
     float rim = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 3.0);
 
     vec3 rgb = vColor * (0.28 + 0.62 * diffuse) + vec3(0.35, 0.42, 0.50) * (0.30 * rim);
-    fragColor = vec4(rgb, 1.0);
+    fragColor = vec4(rgb, uAlpha);
 }

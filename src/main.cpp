@@ -1,9 +1,9 @@
 // Application entry point: owns the plan 9.3 frame loop
 // (poll input -> N sim steps -> particle update -> map interop -> draw ->
 // ImGui -> present), the UI-event application in its defined order
-// (voxelize -> snapshot -> solver), the plan-8 warm-start cache flow, the
-// GLFW drop routing (.dat -> airfoil loader, .stl -> import modal), and the
-// --selftest mode that proves the GL + CUDA + sim plumbing end-to-end.
+// (voxelize -> solver), the session log (logs/foilcfd.log), the GLFW drop
+// routing (.dat -> airfoil loader, .stl -> import modal), and the --selftest
+// mode that proves the GL + CUDA + sim plumbing end-to-end.
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 
 #include <glad/gl.h>
@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -32,7 +33,6 @@
 #include "platform/platform.h"
 #include "render/viz.h"
 #include "sim/lbm_solver.h"
-#include "sim/snapshot.h"
 #include "sim/units.h"
 
 namespace {
@@ -90,16 +90,18 @@ struct App {
     AircraftManifest aircraft;           ///< Plan 15.5 aircraft -> airfoil rows.
     std::filesystem::path airfoilsDir;   ///< Scanned recursively (incl. uiuc/).
 
-    // -- geometry/flag state the cache flow keys against (plan 8) --
+    // -- geometry/flag state --
     std::string geometryId;              ///< "naca:..", "dat:..", "stl:<hash>".
     std::vector<std::uint8_t> cleanFlags;  ///< Clean foil (no VGs) at current AoA.
     std::vector<std::uint8_t> activeFlags; ///< cleanFlags OR VG voxels = live flags.
 
-    // -- warm-start cache (plan 8) --
-    VramSnapshot cleanSnap;              ///< The ONE VRAM-resident clean slot.
-    std::unique_ptr<DiskSnapshotCache> diskCache; ///< Owns its store worker
-                                         ///< thread (storeAsync) — saves never
-                                         ///< block the frame loop.
+    // NOTE: the plan-8 snapshot warm-start cache (VRAM clean slot + disk LRU)
+    // was removed: its capture path could freeze the session right as the
+    // force gate opened ("clean flow cached" — then nothing). Every geometry/
+    // AoA/airspeed/VG edit now simply restarts the sim, which is predictable
+    // and plenty fast on this hardware.
+
+    bool nanLogged = false;              ///< One log line per watchdog trip.
 
     // -- STL import state (plan 7) --
     StlMesh stlMeshRaw;                  ///< As loaded, pre-normalization (kept
@@ -127,9 +129,60 @@ struct App {
 };
 
 /// Set the transient status line (load errors, cache notes) with its decay
+// ===========================================================================
+// Session log: every status message, error, and lifecycle event is appended
+// to logs/foilcfd.log next to the exe, timestamped — so "it froze and the
+// status bar already faded" is never an unreproducible mystery again. The
+// file is truncated per launch (one session per file keeps it shareable).
+// ===========================================================================
+
+std::FILE* gLogFile = nullptr;
+
+/// Open (truncate) the session log. Failure is non-fatal: logging falls back
+/// to stderr only.
+void logOpen() {
+    const auto dir = platform::executableDirectory() / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto path = dir / "foilcfd.log";
+#ifdef _WIN32
+    _wfopen_s(&gLogFile, path.wstring().c_str(), L"wb");
+#else
+    gLogFile = std::fopen(path.string().c_str(), "wb");
+#endif
+}
+
+/// Append one timestamped line to the session log (and mirror it to stderr,
+/// which keeps the console-watching workflow intact). Flushes immediately:
+/// the log's whole purpose is surviving a hang or crash.
+void logLine(const std::string& msg) {
+    const std::time_t t = std::time(nullptr);
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char stamp[16];
+    std::snprintf(stamp, sizeof stamp, "%02d:%02d:%02d", tmv.tm_hour,
+                  tmv.tm_min, tmv.tm_sec);
+    std::fprintf(stderr, "[foilcfd] %s\n", msg.c_str());
+    if (gLogFile) {
+        std::fprintf(gLogFile, "[%s] %s\n", stamp, msg.c_str());
+        std::fflush(gLogFile);
+    }
+}
+
+void logClose() {
+    if (gLogFile) {
+        std::fclose(gLogFile);
+        gLogFile = nullptr;
+    }
+}
+
 /// timestamp so the overlay clears itself.
 void setStatus(App& app, std::string msg) {
-    std::fprintf(stderr, "[foilcfd] %s\n", msg.c_str());
+    logLine(msg); // every status line is also a log line
     app.status  = std::move(msg);
     app.statusT = platform::timerSeconds();
 }
@@ -171,18 +224,6 @@ LatticeScaling currentScaling(const UIParams& p) {
     phys.chord_m     = p.chordM;
     phys.airspeed_ms = p.airspeedMs;
     return computeScaling(phys, currentChordCells(p), currentULat(p));
-}
-
-/// The exact plan-8 snapshot key for the current state: geometry id, 0.5-deg
-/// AoA bucket, u_lat, grid dims, solver version. Airspeed deliberately absent.
-SnapshotKey currentKey(const App& app) {
-    SnapshotKey key;
-    key.geometryId = app.geometryId;
-    key.aoaBucket  = SnapshotKey::bucketForAoA(
-        app.stlActive ? 0.0f : app.params.aoaDeg);
-    key.u_lat = currentULat(app.params);
-    key.dims  = app.layout.dims;
-    return key;
 }
 
 // ===========================================================================
@@ -365,32 +406,9 @@ void rebuildFlagFields(App& app) {
                             app.layout, app.cleanFlags);
 }
 
-/// Try to skip the cold-start transient by restoring a disk-cached compact
-/// snapshot for the current key (plan 8 disk cache). Only sound for the
-/// clean-foil state — the cache stores clean flow, so the flags must match.
-void tryDiskWarmRestore(App& app) {
-    if (!app.diskCache || !app.params.vgs.empty()) return;
-    const SnapshotKey key = currentKey(app);
-    const auto path = app.diskCache->find(key);
-    if (!path) return;
-    CompactSnapshot snap;
-    std::string err;
-    if (!snap.loadFromFile(*path, &err)) {
-        setStatus(app, "cache load failed: " + err);
-        return;
-    }
-    // Exact-match validation: key AND geometry hash, never fuzzy (plan 8).
-    if (!(snap.key() == key)) return;
-    if (snap.flagsHash() != hashFlags(app.activeFlags.data(),
-                                      app.activeFlags.size())) return;
-    if (snap.restore(app.solver, app.stream)) {
-        setStatus(app, "warm-started from disk cache (" + key.toString() + ")");
-    }
-}
-
 /// Geometry changed at fixed grid dims (airfoil swap or AoA edit): rebuild
-/// flags, cold-restart the solver (plan 13: AoA invalidates the warm cache),
-/// then try the disk cache to soften the cold start.
+/// flags and cold-restart the solver — geometry edits always restart the sim
+/// (the warm-start cache was removed; see the App-struct note).
 void applyGeometryCold(App& app) {
     rebuildFlagFields(app);
     app.solver.setFlags(app.activeFlags);
@@ -399,7 +417,6 @@ void applyGeometryCold(App& app) {
     // crossing mid-span would read as the surface (false separation pinned
     // at the VG station — the mission's core readout corrupted).
     app.solver.setSurfaceReference(app.cleanFlags);
-    tryDiskWarmRestore(app);
     app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
                            app.layout);
 }
@@ -482,7 +499,6 @@ void applyStlImport(App& app) {
     app.activeFlags = std::move(flags);
     app.solver.setFlags(app.activeFlags);
     app.solver.setSurfaceReference(app.cleanFlags); // STL: clean == active
-    tryDiskWarmRestore(app);
     // Hand the normalized triangle soup to the renderer: it replaces the
     // extruded-foil prism in the shared mesh VBO, so the drawn solid matches
     // the voxelized one exactly (both consumed the same normalized mesh).
@@ -537,62 +553,32 @@ void handleIncomingFile(App& app, const std::filesystem::path& path) {
     }
 }
 
-/// Locate the bundled default STL (the Glasair III) if it ships with this
-/// build. Mirrors findAirfoilsDirectory's search so it works in both the dev
-/// layout (exe two levels deep under build/) and an installed layout (assets
-/// next to the exe). Returns an empty path when no default STL is present —
-/// the program then simply boots on the NACA section instead.
-std::filesystem::path findDefaultStl() {
-    namespace fs = std::filesystem;
-    const fs::path exeDir = platform::executableDirectory();
-    // Accept a couple of conventional names so dropping a file in assets/stl/
-    // "just works" without a rebuild.
-    const char* names[] = {"glasair_iii.stl", "glasair3.stl", "default.stl"};
-    const fs::path roots[] = {
-        fs::current_path() / "assets" / "stl",
-        exeDir / "assets" / "stl",
-        exeDir / ".." / ".." / "assets" / "stl",
-    };
-    for (const fs::path& root : roots) {
-        for (const char* n : names) {
-            std::error_code ec;
-            const fs::path c = root / n;
-            if (fs::is_regular_file(c, ec)) return fs::weakly_canonical(c, ec);
+/// Load the program's default geometry: the Glasair III's airfoil, the
+/// NASA/LANGLEY LS(1)-0413MOD section from the bundled catalog. Must run
+/// BEFORE initSimulation so the first voxelization already uses it (the init
+/// path only generates the NACA fallback when no valid airfoil is loaded).
+/// A missing/rejected dat is not fatal — the app boots on the NACA section.
+void tryLoadDefaultAirfoil(App& app) {
+    const std::filesystem::path dat = app.airfoilsDir / "uiuc" / "ls413mod.dat";
+    AirfoilLoadResult res = loadAirfoilDat(dat);
+    if (!res.ok) {
+        setStatus(app, "default airfoil (ls413mod.dat) unavailable: "
+                           + res.rejectionReason + " — using NACA 2412");
+        return;
+    }
+    app.airfoil    = res.airfoil;
+    app.geometryId = datGeometryId(dat);
+    app.stlActive  = false;
+    app.params.source = AirfoilSource::DatFile;
+    app.readouts.loadedAirfoilName = res.airfoil.name;
+    // Highlight the entry in the catalog list so the UI reflects the choice.
+    for (std::size_t i = 0; i < app.catalog.size(); ++i) {
+        if (app.catalog[i].path == dat) {
+            app.params.selectedDatIndex = static_cast<int>(i);
+            break;
         }
     }
-    return {};
-}
-
-/// Load the bundled Glasair III STL as the program's default geometry, if it
-/// exists. Reuses the real import path (loadStl -> normalization defaults ->
-/// applyStlImport) so the boot geometry is identical to a manual import. A
-/// missing file is not an error: the app keeps the NACA default and notes it.
-void tryLoadDefaultStl(App& app) {
-    const std::filesystem::path stl = findDefaultStl();
-    if (stl.empty()) {
-        setStatus(app, "default Glasair III STL not bundled — starting on the "
-                       "NACA section (drop an .stl to import one)");
-        return;
-    }
-    StlLoadResult res = loadStl(stl);
-    if (!res.ok) {
-        setStatus(app, "default STL rejected: " + res.rejectionReason);
-        return;
-    }
-    app.stlMeshRaw = std::move(res.mesh);
-
-    // Seed the import modal's choices with sensible defaults (same as a manual
-    // import would start from), then voxelize straight away — no modal, this
-    // is the startup default.
-    StlImportUI& ui = app.params.stlImport;
-    ui.open          = false;
-    ui.fileName      = platform::pathToUtf8(stl.filename());
-    ui.solidName     = app.stlMeshRaw.name;
-    ui.triangleCount = static_cast<std::uint32_t>(app.stlMeshRaw.triangles.size());
-    ui.bounds        = app.stlMeshRaw.bounds;
-    ui.wasBinary     = app.stlMeshRaw.wasBinary;
-    ui.chordCells    = app.layout.chordCells;
-    applyStlImport(app);
+    setStatus(app, "loaded default airfoil: " + res.airfoil.name);
 }
 
 // ===========================================================================
@@ -600,65 +586,15 @@ void tryLoadDefaultStl(App& app) {
 // the compact disk variant persisted on a worker thread.
 // ===========================================================================
 
-/// Capture the current (clean!) flow into the VRAM slot, and optionally into
-/// the LRU disk cache. Refuses while VGs are stamped — the whole point of the
-/// clean slot is restoring the un-VG'd wing.
-void captureCleanState(App& app, bool toDisk) {
-    if (!app.params.vgs.empty()) {
-        setStatus(app, "clean-state capture skipped: VGs are present");
-        return;
-    }
-    const SnapshotKey key = currentKey(app);
-    std::string err;
-    if (!app.cleanSnap.capture(app.solver, key, app.stream, &err)) {
-        setStatus(app, "VRAM snapshot failed: " + err);
-        return;
-    }
-    if (toDisk && app.diskCache) {
-        auto compact = std::make_shared<CompactSnapshot>();
-        if (compact->capture(app.solver, key, app.stream, &err)) {
-            // The cache's own worker thread streams the (hundreds of MB)
-            // write to disk (plan 8: "saved on a worker thread"); the
-            // shared_ptr keeps the snapshot alive until then. Crucially this
-            // ENQUEUES and returns — a bespoke join-then-spawn here used to
-            // stall the render thread for seconds whenever a previous save
-            // was still in flight on a slow disk.
-            app.diskCache->storeAsync(std::move(compact));
-        } else {
-            setStatus(app, "compact snapshot failed: " + err);
-        }
-    }
-    setStatus(app, "clean flow cached (" + key.toString() + ")");
-}
-
-/// Auto-cache policy (plan 9.2 toggle): once the clean-foil flow converges
-/// (force gate open) and the VRAM slot doesn't already hold this key, capture
-/// it so the user's first VG edit is instant.
-void maybeAutoCache(App& app) {
-    if (!app.params.autoCacheClean || !app.params.vgs.empty()) return;
-    if (!app.readouts.forces.valid) return;
-    const SnapshotKey key = currentKey(app);
-    if (app.cleanSnap.hasData() && app.cleanSnap.key() == key) return;
-    captureCleanState(app, /*toDisk=*/true);
-}
-
-/// VG edit flow (plan 6.2/8): restore the clean snapshot when it matches the
-/// current clean-foil state, then applyEditedFlags — NEVER a cold restart.
-/// Without a matching snapshot the new flags still apply warm onto the live
-/// field (correct everywhere except near the edited vanes, which is exactly
-/// where the solver re-converges first).
+/// VG edit flow (plan 6.2): apply the edited flags warm onto the live field —
+/// correct everywhere except near the edited vanes, which is exactly where
+/// the solver re-converges first. (The snapshot-restore fast path went with
+/// the cache removal; warm flag application alone keeps VG edits cheap.)
 void applyVGEdit(App& app) {
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
                             app.layout, app.cleanFlags);
-    const bool snapUsable =
-        app.cleanSnap.hasData() && app.cleanSnap.key() == currentKey(app)
-        && app.cleanSnap.flagsHash() == hashFlags(app.cleanFlags.data(),
-                                                  app.cleanFlags.size());
-    if (snapUsable) {
-        app.cleanSnap.restore(app.solver, app.stream);
-    }
     app.solver.applyEditedFlags(app.activeFlags);
     app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
                            app.layout);
@@ -692,9 +628,8 @@ void resetSliceDefaults(App& app) {
 /// Build the default NACA 2412 domain and bring the solver + renderer up.
 /// Also the full-reinit path for resolution/HiFi changes when @p reinit.
 bool initSimulation(App& app, bool reinit, std::string* error) {
-    // Grid invalidates everything VRAM-resident, including the clean slot.
+    // Grid invalidates everything VRAM-resident.
     if (reinit) {
-        app.cleanSnap.release();
         app.solver.shutdown();
         app.viz.shutdown();
     }
@@ -774,7 +709,6 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
                            app.layout.dims.nz);
     focusCameraOnFoil(app, /*snap=*/true);
     resetSliceDefaults(app);
-    tryDiskWarmRestore(app);
     return true;
 }
 
@@ -790,6 +724,17 @@ void updateReadouts(App& app) {
     app.readouts.currentTau = app.solver.currentTau();
     app.readouts.nanTripped = app.solver.nanDetected();
     app.readouts.nanDiagnosis = app.solver.nanDiagnosis();
+    // A watchdog trip silently freezes stepping (stepN no-ops while latched),
+    // and the red diagnosis box lives in the Sim panel which may be hidden
+    // behind another tab — so the trip ALSO lands in the status line and the
+    // session log, exactly once per latch.
+    if (app.readouts.nanTripped && !app.nanLogged) {
+        app.nanLogged = true;
+        setStatus(app, "SIMULATION DIVERGED (NaN) — sim paused; see the Sim "
+                       "panel. Diagnosis: " + app.readouts.nanDiagnosis);
+    } else if (!app.readouts.nanTripped) {
+        app.nanLogged = false; // re-arm after a cold reset clears the latch
+    }
     app.readouts.cudaErrorTripped = app.cudaFailure;
     app.readouts.cudaErrorDiagnosis = app.cudaFailureMsg;
     app.readouts.forces = app.solver.forces();
@@ -932,17 +877,12 @@ void applyEvents(App& app) {
         applyGeometryCold(app);
     }
 
-    // ---- airspeed OR chord: pure units rescale, flow field stays valid
-    // (plan 13). Grid dims, u_lat, and the flag field are untouched — only
-    // dx/dt/tau/Re-target change — so this must NEVER cold-start or drop
-    // the warm cache (a chord sweep to study Re trends rides this path). ----
+    // ---- airspeed OR chord: units rescale (new dt/tau/Re-target at the same
+    // grid and u_lat) followed by a clean restart of the flow. Predictable
+    // by design — every edit restarts the sim (cache-removal note, App). ----
     if (ev.airspeedChanged) {
         const LatticeScaling scaling = currentScaling(app.params);
         app.readouts.scaling = scaling;
-        // Workaround for the proposed LBMSolver::updateScaling (see
-        // notes/integration_app.md): u_lat is unchanged, so the lattice state
-        // is exactly reusable — re-init with the new tau/dt, then restore the
-        // clean snapshot to skip the cold transient when we have one.
         app.solver.shutdown();
         if (!app.solver.init(app.layout.dims, scaling, app.activeFlags,
                              app.stream, &err)) {
@@ -957,13 +897,6 @@ void applyEvents(App& app) {
                 app.params.highFidelity.enabled
                     ? app.params.highFidelity.forceEmaFlowThroughs
                     : StandardPreset{}.forceEmaFlowThroughs);
-            if (app.cleanSnap.hasData()
-                && app.cleanSnap.key() == currentKey(app)) {
-                app.cleanSnap.restore(app.solver, app.stream);
-                // Re-apply the live flags: restores the VG'd state warm when
-                // VGs are stamped, and is a harmless no-op refresh when clean.
-                app.solver.applyEditedFlags(app.activeFlags);
-            }
         }
     }
 
@@ -998,10 +931,6 @@ void applyEvents(App& app) {
             }
         }
     }
-    if (ev.saveCleanState) {
-        captureCleanState(app, /*toDisk=*/true);
-    }
-
     // ---- view ----
     if (ev.particleCountChanged) {
         if (!app.viz.resizeParticlePool(app.params.viz.particleCount, &err)) {
@@ -1143,7 +1072,6 @@ int runInteractive(App& app) {
         // pointless (and noisy) once the context is broken.
         if (!app.cudaFailure) {
             refreshGuidance(app);
-            maybeAutoCache(app);
         }
 
         // Status messages decay so stale errors don't linger for the session.
@@ -1280,28 +1208,38 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
     }
 
+    // Session log first: everything from here on (statuses, errors, NaN
+    // trips) lands in logs/foilcfd.log so issues are diagnosable after the
+    // fact even when the on-screen status line has already decayed.
+    logOpen();
+    logLine(std::string("FoilCFD starting (")
+            + (selftest ? "selftest" : "interactive") + ")");
+
     App app;
     std::string error;
     // Init order matters: GL context first (interop registration needs it
     // current), then CUDA, then sim + renderer.
     if (!initWindowAndGL(app, /*visible=*/!selftest, &error) ||
         !initCuda(app, &error)) {
-        std::fprintf(stderr, "FoilCFD init failed: %s\n", error.c_str());
+        logLine("FATAL: init failed: " + error);
         glfwTerminate();
+        logClose();
         return 1;
     }
 
     // Data directories before sim init: the airfoil catalog (recursive,
-    // includes uiuc/) and the LRU snapshot disk cache next to the exe
-    // (plan 8) — created first so even the first cold start can warm-restore.
+    // includes uiuc/).
     app.airfoilsDir = findAirfoilsDirectory();
     app.catalog = scanAirfoilDirectory(app.airfoilsDir);
     reloadAircraftManifest(app); // plan 15.5: aircraft rows link into the catalog
-    app.diskCache = std::make_unique<DiskSnapshotCache>(
-        platform::executableDirectory() / "cache");
+
+    // Default geometry: the Glasair III's airfoil (NASA LS(1)-0413MOD) from
+    // the bundled catalog. Selftest keeps the deterministic NACA section so
+    // its golden screenshot/forces stay reproducible.
+    if (!selftest) tryLoadDefaultAirfoil(app);
 
     if (!initSimulation(app, /*reinit=*/false, &error)) {
-        std::fprintf(stderr, "FoilCFD init failed: %s\n", error.c_str());
+        logLine("FATAL: init failed: " + error);
         // initSimulation can fail PARTWAY with live GPU state (e.g. solver up,
         // viz failed at slice-texture registration after interop buffers were
         // already registered). Tear those down NOW, while the GL context and
@@ -1314,28 +1252,19 @@ int main(int argc, char** argv) {
         if (app.stream) cudaStreamDestroy(app.stream);
         glfwDestroyWindow(app.window);
         glfwTerminate();
+        logClose();
         return 1;
-    }
-
-    // Default geometry: load the bundled Glasair III STL for the interactive
-    // session (if present). Selftest keeps the deterministic NACA section so
-    // its golden screenshot/forces stay reproducible and don't depend on an
-    // optional asset.
-    if (!selftest) {
-        tryLoadDefaultStl(app);
-        focusCameraOnFoil(app, /*snap=*/true); // re-frame on the new solid
     }
 
     const int rc = selftest ? runSelftest(app) : runInteractive(app);
 
-    // Orderly teardown: drain the snapshot disk cache's writer queue first
-    // (host/disk state only — destroying the cache joins its worker), then
-    // GPU resources before the GL context dies.
-    app.diskCache.reset();
+    // Orderly teardown: GPU resources before the GL context dies.
     app.viz.shutdown();
     app.solver.shutdown();
     if (app.stream) cudaStreamDestroy(app.stream);
     glfwDestroyWindow(app.window);
     glfwTerminate();
+    logLine(rc == 0 ? "clean exit" : "exit with error code");
+    logClose();
     return rc;
 }

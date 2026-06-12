@@ -73,13 +73,26 @@ struct VizSettings {
     bool showFoilMesh  = true;    ///< Extruded foil + VG geometry.
     bool foilWireframe = false;   ///< Draw the foil/VG mesh as wireframe lines
                                   ///< instead of shaded solid (view option).
+    float foilOpacity  = 1.0f;    ///< Mesh/wireframe alpha [0,1]. Below 1 the
+                                  ///< foil draws alpha-blended (it still writes
+                                  ///< depth, so the fog/Q occlusion against the
+                                  ///< body stays correct); 1 = fully opaque.
 
     // -- velocity volume (mode 5, the translucent "smoke" option) --
-    bool  showVelocityVolume = false; ///< Off by default — the opaque Q
-                                      ///< isosurface below is the hero mode;
-                                      ///< this fog view layers on top when
-                                      ///< wanted.
-    Colormap volumeColormap  = Colormap::Inferno; ///< Hot map by default.
+    bool  showVelocityVolume = true; ///< ON by default — the fog speed field
+                                     ///< is the first thing a new user sees;
+                                     ///< the Q isosurface overlays inside it.
+    Colormap volumeColormap  = Colormap::Rainbow; ///< Classic wind-tunnel
+                                     ///< speed bands by default (blue slow ->
+                                     ///< green freestream -> red fast).
+    bool  foilOverVolume     = false; ///< Keep the hardware depth test on for
+                                      ///< the fog pass, so the foil silhouette
+                                      ///< culls ALL fog in front of it (the
+                                      ///< foil "pops over" the smoke). Off by
+                                      ///< default: the raymarch already stops
+                                      ///< at the foil via the scene-depth copy,
+                                      ///< so fog in FRONT of the body should
+                                      ///< composite over it like the Q pass.
     float velocitySpeedScale = 0.16f; ///< Speed (lattice units) mapped to the
                                       ///< palette top — ~2x freestream u_lat so
                                       ///< the wake/suction peak spans the ramp.

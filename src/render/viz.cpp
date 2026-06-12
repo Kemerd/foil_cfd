@@ -537,7 +537,7 @@ struct Visualizer::Impl {
     GLuint progParticles = 0, progSlice = 0, progMesh = 0, progQ = 0, progVol = 0;
     GLint uPViewProj = -1, uPPointSize = -1, uPColormap = -1, uPAlpha = -1;
     GLint uSViewProj = -1, uSTex = -1;
-    GLint uMViewProj = -1, uMEye = -1;
+    GLint uMViewProj = -1, uMEye = -1, uMAlpha = -1;
     // Q isosurface: opaque first-hit raycast — writes gl_FragDepth, so the
     // hardware z-buffer handles occlusion (no scene-depth texture needed).
     GLint uQViewProj = -1, uQDims = -1, uQEye = -1, uQThresh = -1, uQVol = -1;
@@ -845,6 +845,7 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
     impl_->uSTex       = glGetUniformLocation(impl_->progSlice, "uField");
     impl_->uMViewProj  = glGetUniformLocation(impl_->progMesh, "uViewProj");
     impl_->uMEye       = glGetUniformLocation(impl_->progMesh, "uEye");
+    impl_->uMAlpha     = glGetUniformLocation(impl_->progMesh, "uAlpha");
     if (impl_->qAvailable) {
         impl_->uQViewProj = glGetUniformLocation(impl_->progQ, "uViewProj");
         impl_->uQDims     = glGetUniformLocation(impl_->progQ, "uDims");
@@ -1326,11 +1327,22 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
     float invVP[16];
     invertMat4(viewProj.m, invVP);
 
-    // ---- 1. foil + VG mesh (opaque, depth-writing) --------------------------
+    // ---- 1. foil + VG mesh (depth-writing; optionally alpha-faded) ----------
     if (settings.showFoilMesh && im.meshVertexCount > 0) {
         glUseProgram(im.progMesh);
         glUniformMatrix4fv(im.uMViewProj, 1, GL_FALSE, viewProj.m);
         glUniform3f(im.uMEye, eye.x, eye.y, eye.z);
+        // Opacity slider: below 1 the mesh blends toward the (black)
+        // background — it draws FIRST, so this simply dims it. Depth writes
+        // stay ON either way: the fog raymarch and Q skins still terminate at
+        // the body, so a faded foil keeps casting a correct silhouette.
+        const float alpha = std::clamp(settings.foilOpacity, 0.0f, 1.0f);
+        const bool faded = alpha < 1.0f;
+        glUniform1f(im.uMAlpha, alpha);
+        if (faded) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
         glBindVertexArray(im.meshVAO);
         // Wireframe option: draw edges only. Wireframe still writes depth, so
         // it occludes the volume behind its near edges (a thin cage over the
@@ -1338,6 +1350,7 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         if (settings.foilWireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         glDrawArrays(GL_TRIANGLES, 0, im.meshVertexCount);
         if (settings.foilWireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        if (faded) glDisable(GL_BLEND);
     }
 
     // ---- 2. slice planes (opaque, depth-writing) -----------------------------
@@ -1466,6 +1479,16 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDepthMask(GL_FALSE);
+        // The fog rasterizes the domain cube's BACK faces, which sit behind
+        // the foil over most of the screen — with the hardware depth test on,
+        // those fragments are rejected outright and the entire fog column in
+        // FRONT of the body vanishes (the foil "pops over" the smoke; the Q
+        // pass dodges this by writing gl_FragDepth). The raymarch already
+        // clamps tFar to the scene-depth copy, so geometry occlusion is
+        // handled in-shader: switch the z-test off and let the march composite
+        // the near-side fog over the foil like any other translucent medium.
+        // foilOverVolume keeps the old cull as an opt-in look.
+        if (!settings.foilOverVolume) glDisable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
         glCullFace(GL_FRONT);
         glUseProgram(im.progVol);
@@ -1498,6 +1521,7 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_3D, 0);
         glDisable(GL_CULL_FACE);
+        if (!settings.foilOverVolume) glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
     }
