@@ -12,8 +12,8 @@ in real time. Bolt on vortex generators, drag a slider, and see the separation b
 
 FoilCFD is a CUDA lattice-Boltzmann solver (D3Q19, TRT, Smagorinsky LES) strapped to an
 interactive 3D visualizer. On an RTX 5090 it pushes **~8 billion lattice updates per second**
-on a 23.6M-cell grid — roughly 75 solver steps per rendered frame. That's not "fast for CFD."
-That's a wind tunnel with a framerate.
+on a 23.6M-cell grid — about 340 full solver steps every second, while rendering. That's not
+"fast for CFD." That's a wind tunnel with a framerate.
 
 ![Selftest render](screenshots/selftest.png)
 
@@ -46,8 +46,9 @@ Read this before you drill holes in your wing:
   the solver runs at the highest stable effective Re it can (typically 1e4–1e5 at default
   resolution) and tells you both numbers. Separation trends, vortex topology, and VG
   placement behavior carry over; boundary-layer-resolved drag counts do not.
-- **High Fidelity mode** trades interactivity for accuracy: finer grids, lower lattice Mach,
-  longer force averaging, dual-resolution trend extrapolation with an error bar.
+- **High Fidelity mode** trades interactivity for accuracy: finer grids (Fine/Ultra
+  presets), lower lattice Mach, force averaging over many flow-throughs. Dual-resolution
+  Richardson trend extrapolation with an error bar on deltas is on the v1.x roadmap.
 - **Walls are stair-stepped voxels** with half-way bounce-back. Good enough for trends;
   not a panel-method polish.
 - Forces are gated until the flow has actually developed (two flow-throughs minimum) —
