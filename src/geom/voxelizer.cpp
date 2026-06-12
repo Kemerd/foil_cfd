@@ -197,17 +197,18 @@ std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
 // shell replacing the domain boundary flags.
 // ===========================================================================
 
-DomainLayout makeFineLayout(const DomainLayout& coarse, const PatchBox& box) {
+DomainLayout makeFineLayout(const DomainLayout& coarse, const PatchBox& box,
+                            int factor) {
     DomainLayout fine;
-    fine.dims       = fineDimsFor(box, coarse.dims);
-    fine.chordCells = kRefineFactor * coarse.chordCells;
+    fine.dims       = fineDimsFor(box, coarse.dims, factor);
+    fine.chordCells = factor * coarse.chordCells;
     // Anchor in patch-local FINE cells: the coarse anchor shifted to the
     // patch origin, scaled up. Fractions are bypassed via the absolute
     // override so the foil lands at the exact same physical spot.
-    fine.anchorXCells =
-        kRefineFactor * (coarse.anchorX() - static_cast<float>(box.x0));
-    fine.anchorYCells =
-        kRefineFactor * (coarse.anchorY() - static_cast<float>(box.y0));
+    fine.anchorXCells = static_cast<float>(factor)
+                      * (coarse.anchorX() - static_cast<float>(box.x0));
+    fine.anchorYCells = static_cast<float>(factor)
+                      * (coarse.anchorY() - static_cast<float>(box.y0));
     return fine;
 }
 
@@ -238,8 +239,9 @@ void stampInterfaceShell(const GridDims& dims,
 std::vector<std::uint8_t> buildFinePatchFlags(const AirfoilGeometry& airfoil,
                                               float aoa_deg,
                                               const DomainLayout& coarse,
-                                              const PatchBox& box) {
-    const DomainLayout fine = makeFineLayout(coarse, box);
+                                              const PatchBox& box,
+                                              int factor) {
+    const DomainLayout fine = makeFineLayout(coarse, box, factor);
     // All-Fluid base: the fine level has no inlet/outlet/slip faces — every
     // outer boundary condition arrives through the Interface shell, and the
     // z faces stay periodic exactly like the coarse grid.

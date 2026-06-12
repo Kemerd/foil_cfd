@@ -94,7 +94,7 @@ int main() {
                 fineDims.nx, fineDims.ny, fineDims.nz);
 
     const bool refOk =
-        solver.initRefinement(box, solidFreeFineFlags(fineDims), &err);
+        solver.initRefinement(box, 2, solidFreeFineFlags(fineDims), &err);
     TCHECK_MSG(refOk, "initRefinement failed: %s", err.c_str());
     if (!refOk) return finish("m3_refine");
     TCHECK(solver.refinementInfo().active);

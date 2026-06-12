@@ -1015,9 +1015,12 @@ SolverPerfStats LBMSolver::perfStats() const {
     p.lastStepMs = s.lastStepMs;
     if (s.lastStepMs > 0.0) {
         // Cell updates per coarse step: every coarse cell once, every fine
-        // cell twice (two half-dt sub-steps per coarse step).
+        // cell m times (m sub-steps of dt/m per coarse step).
         const double updates = static_cast<double>(s.ncells)
-            + (s.fine.active ? 2.0 * static_cast<double>(s.fine.ncells) : 0.0);
+            + (s.fine.active
+                   ? static_cast<double>(s.fine.factor)
+                         * static_cast<double>(s.fine.ncells)
+                   : 0.0);
         p.mlups = updates / (s.lastStepMs * 1000.0);
     }
     return p;
@@ -1121,7 +1124,7 @@ const std::vector<std::uint8_t>& LBMSolver::hostFlags() const {
 // Two-level refinement patch (plan M-refine).
 // ===========================================================================
 
-bool LBMSolver::initRefinement(const PatchBox& box,
+bool LBMSolver::initRefinement(const PatchBox& box, int factor,
                                const std::vector<std::uint8_t>& fineFlags,
                                std::string* error) {
     Impl& s = *impl_;
@@ -1131,6 +1134,10 @@ bool LBMSolver::initRefinement(const PatchBox& box,
     }
     shutdownRefinement(); // replace any previous fine level
 
+    if (factor < 2 || factor > kMaxRefineFactor) {
+        if (error) *error = "refinement factor out of range (2..4)";
+        return false;
+    }
     if (!box.valid() || box.x0 < 1 || box.y0 < 1 || box.x1 > s.dims.nx - 1
         || box.y1 > s.dims.ny - 1) {
         if (error) *error = "refinement patch box out of range";
@@ -1138,12 +1145,13 @@ bool LBMSolver::initRefinement(const PatchBox& box,
     }
 
     Impl::FineLevel& fl = s.fine;
+    fl.factor = factor;
     fl.box  = box;
-    fl.dims = fineDimsFor(box, s.dims);
+    fl.dims = fineDimsFor(box, s.dims, factor);
     fl.ncells    = fl.dims.cellCount();
     fl.nxny      = static_cast<long long>(fl.dims.nx) * fl.dims.ny;
     fl.ncellsPad = fl.dims.paddedCellCount();
-    fl.scaling   = refinedScaling(s.scaling, kRefineFactor);
+    fl.scaling   = refinedScaling(s.scaling, factor);
     fl.src = 0;
 
     if (fineFlags.size() != static_cast<std::size_t>(fl.ncells)) {
@@ -1213,6 +1221,7 @@ RefinementInfo LBMSolver::refinementInfo() const {
     RefinementInfo info;
     if (!s.fine.active) return info;
     info.active         = true;
+    info.factor         = s.fine.factor;
     info.box            = s.fine.box;
     info.fineDims       = s.fine.dims;
     info.fineScaling    = s.fine.scaling;

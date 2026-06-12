@@ -108,20 +108,36 @@ struct UIParams {
     float vgXcMin = 0.01f;   ///< Lower bound, 0..1 (default 1 %).
     float vgXcMax = 0.70f;   ///< Upper bound, 0..1 (default 70 %).
 
+    /// Warm-restart policy for VG edits. When true, add/edit/delete keeps the
+    /// developed flow field and only patches the changed cells in place
+    /// (LBMSolver::applyEditedFlags) — the force gate reopens after a short
+    /// re-settle instead of a full from-scratch convergence. Off by default:
+    /// the cold restart keeps force histories clean, which is the trustworthy
+    /// baseline for VG-on/VG-off delta comparisons (the mission's readout).
+    bool vgWarmRestart = false;
+
     // -- STL import (plan 7.2/7.4) --
     StlImportUI stlImport;                 ///< Modal state; mesh lives in main.cpp.
 
     // -- mesh panel: refinement patch + startup pre-convergence --
     /// Two-level refinement patch settings (plan M-refine). Margins are in
     /// chord fractions around the solid bbox; the patch derivation clamps
-    /// them against the domain faces. Default ON — the VRAM guard in the
-    /// panel (and the init failure path) protects smaller cards.
+    /// them against the domain faces. Default 2x — the VRAM readout in the
+    /// panel (and the graceful init-failure path) protects smaller cards.
     struct RefinementUIParams {
-        bool  enabled   = true;  ///< Two-level patch active.
+        int   factor    = 2;     ///< Patch resolution: 1 = off (uniform grid),
+                                 ///< 2..4 = fine-level factor (cells shrink by
+                                 ///< 1/m, cost grows ~m^4 — see the panel's
+                                 ///< VRAM readout before going past 2x).
+        bool  showPatchBox = true; ///< Draw the patch bounding box in the 3D
+                                 ///< scene (projected line overlay).
         float upstreamC = 0.20f; ///< Margin ahead of the solid bbox [chords].
         float wakeC     = 0.50f; ///< Margin behind (near-wake coverage).
         float aboveC    = 0.20f; ///< Margin above (suction-surface BL + VGs).
         float belowC    = 0.10f; ///< Margin below (pressure side).
+
+        /// Patch active at all (factor 1 = pure uniform grid).
+        bool enabled() const { return factor >= 2; }
     };
     RefinementUIParams refine;
 
@@ -190,6 +206,7 @@ struct UIReadouts {
     // -- refinement patch status (plan M-refine) --
     struct RefinementReadout {
         bool     active = false;       ///< Fine level allocated and stepping.
+        int      factor = 0;           ///< Live refinement factor (0 = off).
         GridDims fineDims;             ///< Fine grid dimensions.
         double   fineVramGB = 0.0;     ///< Fine-level f-pair + flags estimate.
         float    fineReEffective = 0.0f; ///< Effective Re at the fine level.
@@ -241,6 +258,10 @@ struct UIContext {
                                     ///< Aircraft section rows (resolved +
                                     ///< catalog-linked); null/empty hides it.
     std::string statusMessage;      ///< Transient status line (load errors etc.).
+    const Mat4f* viewProj = nullptr; ///< Camera view-projection for world-space
+                                    ///< line overlays (the patch bounding box);
+                                    ///< null hides them. main.cpp refreshes it
+                                    ///< per frame from the orbit camera.
 };
 
 /// @brief Create the ImGui context (docking branch), install the GLFW +

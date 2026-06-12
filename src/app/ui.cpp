@@ -755,10 +755,11 @@ void drawVGEditorPanel(UIContext& ctx) {
     UIParams& p = *ctx.params;
     UIEvents& ev = *ctx.events;
     // Under-resolution checks judge against the grid the vanes are actually
-    // voxelized on: the 2x fine patch when it is active (plan M-refine —
-    // doubling vane resolution is the patch's headline win), else the base.
-    const int chordCells = (ctx.readouts->refine.active ? 2 : 1)
-                         * ctx.readouts->scaling.chordCells;
+    // voxelized on: the fine patch when it is active (plan M-refine —
+    // multiplying vane resolution is the patch's headline win), else the base.
+    const int chordCells =
+        std::max(1, ctx.readouts->refine.factor)
+        * ctx.readouts->scaling.chordCells;
     if (!ImGui::Begin("VG Editor")) { ImGui::End(); return; }
 
     if (p.source == AirfoilSource::StlImport) {
@@ -771,7 +772,22 @@ void drawVGEditorPanel(UIContext& ctx) {
         return;
     }
 
-    ImGui::TextDisabled("Each edit restarts the sim from cold.");
+    // Restart-policy toggle (off by default). Cold restarts keep the force
+    // history clean — the right baseline for VG-on/VG-off comparisons. The
+    // warm option continues from the developed field (the solver patches only
+    // the changed cells), so iterating on vane placement skips the
+    // from-scratch convergence wait at the cost of brief edit transients.
+    ImGui::Checkbox("Keep flow between edits", &p.vgWarmRestart);
+    ImGui::SameLine();
+    helpMarker("When checked, VG edits keep the current developed flow and "
+               "only patch the cells the edit changed — readouts re-converge "
+               "after a short re-settle instead of a full cold start. Much "
+               "faster while iterating on placement, but brief transients can "
+               "linger near the edit. Leave unchecked for clean VG-on/VG-off "
+               "force comparisons.");
+    ImGui::TextDisabled(p.vgWarmRestart
+                            ? "Each edit continues from the current flow."
+                            : "Each edit restarts the sim from cold.");
 
     // --- Station x/c placement range controls --------------------------------
     // Let the user restrict which chord region VGs can be placed in.  Editing
@@ -1469,7 +1485,8 @@ static void drawPatchDiagram(const UIReadouts& r, bool enabled,
                           IM_COL32(66, 140, 245, 28), 2.0f);
         dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
                     IM_COL32(66, 140, 245, 220), 2.0f, 0, 1.5f);
-        const char* lbl = "2x patch";
+        char lbl[16];
+        std::snprintf(lbl, sizeof lbl, "%dx patch", r.refine.factor);
         dl->AddText(ImVec2(bx0 + 4.0f, by0 + 2.0f),
                     IM_COL32(140, 185, 255, 230), lbl);
     }
@@ -1486,17 +1503,33 @@ void drawMeshPanel(UIContext& ctx) {
     // ---- refinement patch ----
     ImGui::TextDisabled("REFINEMENT PATCH");
     helpMarker(
-        "Two-level grid refinement: a 2x-finer nested lattice covering the "
+        "Two-level grid refinement: a 2-4x finer nested lattice covering the "
         "foil, VGs, and near wake, two-way coupled to the base grid every "
-        "step. Doubles the wall/VG/boundary-layer resolution exactly where "
-        "the guidance reads, at a fraction of the cost of doubling the whole "
+        "step. Multiplies the wall/VG/boundary-layer resolution exactly where "
+        "the guidance reads, at a fraction of the cost of refining the whole "
         "domain. Effective Re is shared across levels — the patch buys "
         "RESOLUTION at the same Re, not a higher Re.");
 
-    bool enabled = p.refine.enabled;
-    if (ImGui::Checkbox("Enable 2x refinement patch", &enabled)) {
-        p.refine.enabled = enabled;
-        ev.meshRefinementChanged = true;
+    // Patch resolution: 1x = uniform grid (off), 2x..4x = fine-level factor.
+    // Cost grows steeply (~m^4 in time, m^3 in VRAM) — the help text and the
+    // live VRAM readout below keep the bill visible.
+    {
+        static const char* kFactorNames[] = {
+            "Off  (1x, uniform grid)",
+            "2x  (recommended)",
+            "3x  (heavy)",
+            "4x  (extreme - check VRAM)"};
+        int idx = std::clamp(p.refine.factor, 1, 4) - 1;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##refinefactor", &idx, kFactorNames, 4)) {
+            p.refine.factor = idx + 1;
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("Resolution multiplier inside the patch. Each step up "
+                   "shrinks the fine cells by the factor and runs that many "
+                   "sub-steps per base step, so compute grows ~m^4 and VRAM "
+                   "~m^3. 2x is the engineering sweet spot; 4x is for final "
+                   "VG-comparison runs on big cards.");
     }
 
     // ---- live domain diagram ----
@@ -1505,11 +1538,17 @@ void drawMeshPanel(UIContext& ctx) {
         const ImVec2 cpos = ImGui::GetCursorScreenPos();
         const float W = ImGui::GetContentRegionAvail().x;
         constexpr float H = 64.0f;
-        drawPatchDiagram(r, p.refine.enabled, cpos, ImVec2(W, H));
+        drawPatchDiagram(r, p.refine.enabled(), cpos, ImVec2(W, H));
         ImGui::Dummy(ImVec2(W, H));
     }
 
-    if (p.refine.enabled) {
+    if (p.refine.enabled()) {
+        if (ImGui::Checkbox("Show patch box in 3D view", &p.refine.showPatchBox)) {
+            // Pure overlay toggle — no sim event needed.
+        }
+        helpMarker("Draws the patch's bounding box as a line overlay in the "
+                   "scene, so you can see exactly which region runs at the "
+                   "fine resolution.");
         // Margins around the solid bbox, in chord fractions. Release-commit:
         // every change re-derives the patch and re-allocates the fine level.
         ImGui::Spacing();
@@ -1543,10 +1582,11 @@ void drawMeshPanel(UIContext& ctx) {
                 r.refine.fineDims.nx, r.refine.fineDims.ny, r.refine.fineDims.nz,
                 r.refine.fineVramGB);
             if (r.refine.forcesFromFine) {
-                ImGui::TextColored(kColGood, "forces measured on the 2x grid");
+                ImGui::TextColored(kColGood, "forces measured on the %dx grid",
+                                   r.refine.factor);
                 helpMarker("The patch covers every solid cell, so the "
-                           "momentum-exchange force reduction runs at 2x wall "
-                           "resolution — the patch's whole purpose.");
+                           "momentum-exchange force reduction runs at the "
+                           "fine wall resolution — the patch's whole purpose.");
             } else {
                 ImGui::TextColored(kColWarn,
                                    "solids extend past the patch — forces on "
@@ -1587,6 +1627,78 @@ void drawMeshPanel(UIContext& ctx) {
     }
 
     ImGui::End();
+}
+
+// ===========================================================================
+// 3D patch-box overlay: the refinement patch's bounding box projected into
+// the scene as accent-blue lines, drawn on ImGui's background draw list (over
+// the GL scene, under every panel). Pure display — reads the camera matrix
+// main.cpp refreshes in UIContext each frame.
+// ===========================================================================
+
+/// @brief Project a world-space (lattice-cell) point through the column-major
+/// view-projection matrix into render-area screen coordinates.
+/// @return False when the point is behind the camera (line gets skipped).
+static bool projectPoint(const Mat4f& vp, const Vec3f& p,
+                         const ImVec2& areaPos, const ImVec2& areaSize,
+                         ImVec2& out) {
+    const float cx = vp.m[0] * p.x + vp.m[4] * p.y + vp.m[8] * p.z + vp.m[12];
+    const float cy = vp.m[1] * p.x + vp.m[5] * p.y + vp.m[9] * p.z + vp.m[13];
+    const float cw = vp.m[3] * p.x + vp.m[7] * p.y + vp.m[11] * p.z + vp.m[15];
+    if (cw <= 1e-6f) return false; // behind the near plane
+    const float ndcX = cx / cw, ndcY = cy / cw;
+    out.x = areaPos.x + (ndcX * 0.5f + 0.5f) * areaSize.x;
+    out.y = areaPos.y + (0.5f - ndcY * 0.5f) * areaSize.y; // GL y-up -> screen y-down
+    return true;
+}
+
+/// @brief Draw the refinement patch's bounding box as 12 projected edges.
+void drawPatchBoxOverlay(UIContext& ctx) {
+    const UIParams& p = *ctx.params;
+    const UIReadouts& r = *ctx.readouts;
+    if (!ctx.viewProj || !p.refine.showPatchBox || !r.refine.active) return;
+
+    // The eight corners in lattice space: the patch spans the full z extent.
+    const float x0 = static_cast<float>(r.refine.patchX0);
+    const float x1 = static_cast<float>(r.refine.patchX1);
+    const float y0 = static_cast<float>(r.refine.patchY0);
+    const float y1 = static_cast<float>(r.refine.patchY1);
+    const float z0 = 0.0f;
+    const float z1 = static_cast<float>(r.dims.nz);
+    const Vec3f corner[8] = {
+        {x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0},
+        {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1},
+    };
+    static const int kEdges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},   // z = 0 face
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},   // z = nz face
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},   // spanwise connectors
+    };
+
+    // The GL scene renders into the FULL framebuffer (panels float over it),
+    // so NDC maps onto the whole main viewport — not the central dock node.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 vpPos  = vp->Pos;
+    const ImVec2 vpSize = vp->Size;
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImU32 col = IM_COL32(66, 140, 245, 190);
+    for (const auto& e : kEdges) {
+        ImVec2 a, b;
+        if (projectPoint(*ctx.viewProj, corner[e[0]], vpPos, vpSize, a)
+            && projectPoint(*ctx.viewProj, corner[e[1]], vpPos, vpSize, b)) {
+            dl->AddLine(a, b, col, 1.5f);
+        }
+    }
+    // Tag the box at its upper-left-front corner so the lines read as "the
+    // refinement patch" and not a stray gizmo.
+    ImVec2 tag;
+    if (projectPoint(*ctx.viewProj, corner[3], vpPos, vpSize, tag)) {
+        char lbl[16];
+        std::snprintf(lbl, sizeof lbl, "%dx patch", r.refine.factor);
+        dl->AddText(ImVec2(tag.x + 4.0f, tag.y - 16.0f),
+                    IM_COL32(140, 185, 255, 220), lbl);
+    }
 }
 
 // ===========================================================================
@@ -1924,6 +2036,7 @@ void drawUI(UIContext& ctx) {
     drawReadoutsPanel(ctx);
     drawViewPanel(ctx);
     drawMeshPanel(ctx);
+    drawPatchBoxOverlay(ctx);
     drawStlImportModal(ctx);
     drawDivergenceModal(ctx);
     drawVelocityLegend(ctx);

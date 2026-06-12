@@ -138,23 +138,24 @@ ray-parity voxelization, and the same force readouts. Caveats (by design, v1):
 ## Mesh refinement (two-level grid)
 
 The LBM lattice is intrinsically uniform — you can't stretch it without changing the
-physics it solves. So FoilCFD refines the honest way: a **2×-finer nested lattice patch**
+physics it solves. So FoilCFD refines the honest way: a **2–4× finer nested lattice patch**
 covering the leading edge, suction-surface boundary layer, VG zone, and near wake, two-way
 coupled to the base grid every step (the multi-level scheme of the Filippova–Hänel /
 Dupuis–Chopard family).
 
-**How it works:** the fine level runs two half-`dt` steps per coarse step at half the cell
-size, with the same physical viscosity (`tau_f = 2·(tau_c − ½) + ½`). At the patch boundary
-a two-cell interface shell receives trilinearly-interpolated populations from the coarse
-grid (time-blended between coarse steps), with the non-equilibrium part rescaled to the
-fine level so the strain rate — and therefore the stress — carries across the interface
-correctly. After its two sub-steps the fine solution is restricted (averaged, inverse-
-rescaled) back onto the coarse grid. The fused collision kernel itself is untouched: it
-runs identically on both levels.
+**How it works:** at factor m the fine level runs m sub-steps of `dt/m` per coarse step at
+1/m the cell size, with the same physical viscosity (`tau_f = m·(tau_c − ½) + ½`). At the
+patch boundary a two-cell interface shell receives trilinearly-interpolated populations
+from the coarse grid (time-blended between coarse steps), with the non-equilibrium part
+rescaled to the fine level so the strain rate — and therefore the stress — carries across
+the interface correctly. After its sub-steps the fine solution is restricted (averaged,
+inverse-rescaled, and blended over a few-cell ramp at the patch edge so no spurious vortex
+sheet forms at the hand-off) back onto the coarse grid. The fused collision kernel itself
+is untouched: it runs identically on both levels.
 
 **What you get:**
-- **2× wall resolution** on the foil, the VG vanes, and the boundary layer the VG guidance
-  reads — a vane that voxelized at 8 cells now gets 16.
+- **m× wall resolution** on the foil, the VG vanes, and the boundary layer the VG guidance
+  reads — a vane that voxelized at 8 cells gets 16 at 2× or 32 at 4×.
 - **Forces measured on the fine grid** whenever the patch covers every solid cell (the Mesh
   panel shows which grid the momentum exchange ran on).
 - Honesty note: the effective Reynolds number is **shared across levels** — the patch buys
@@ -162,10 +163,16 @@ runs identically on both levels.
   technique that models, rather than resolves, the inner boundary layer) are possible future
   work.
 
-The **Mesh** panel (tabbed with Sim/View) has the enable toggle, four margin sliders
-(upstream/wake/above/below, in chords around the foil+VG bounding box), a live diagram of
-the patch box, and the VRAM bill. At the Default preset the patch adds roughly 6 GB; if the
-allocation fails the sim simply continues on the base grid and tells you.
+The **Mesh** panel (tabbed with Sim/View) has the resolution selector (Off/2×/3×/4×), four
+margin sliders (upstream/wake/above/below, in chords around the foil+VG bounding box), a
+live diagram plus an in-scene bounding-box overlay of the patch, and the VRAM bill. Compute
+grows ~m⁴ and VRAM ~m³ — 2× is the sweet spot; at the Default preset it adds roughly 6 GB.
+If the allocation fails the sim simply continues on the base grid and tells you.
+
+**Voxel view** (View panel, under Foil mesh): swaps the smooth outline for the solver's
+actual stair-step voxelization — coarse cubes outside the patch, 1/m-size cubes inside.
+The definitive way to judge whether a VG vane is adequately resolved before trusting its
+delta.
 
 ## Faster startups (mesh sequencing)
 

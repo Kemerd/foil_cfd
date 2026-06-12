@@ -108,28 +108,32 @@ std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
 // outer boundary information arrives through the interface shell.
 // ===========================================================================
 
-/// @brief Build the fine-level layout for a refinement patch: 2x dims,
-/// 2x chord cells, and the foil anchor translated into patch-local fine
-/// cells (anchor_f = 2 * (anchor_c - box.x0)).
+/// @brief Build the fine-level layout for a refinement patch: factor-scaled
+/// dims and chord cells, and the foil anchor translated into patch-local
+/// fine cells (anchor_f = m * (anchor_c - box.x0)).
 /// @param coarse Coarse domain layout (anchor source).
 /// @param box    Patch box in coarse cells.
+/// @param factor Refinement factor m (2..kMaxRefineFactor).
 /// @return Fine DomainLayout ready for voxelizeAirfoil / VG stamping.
-DomainLayout makeFineLayout(const DomainLayout& coarse, const PatchBox& box);
+DomainLayout makeFineLayout(const DomainLayout& coarse, const PatchBox& box,
+                            int factor = kRefineFactor);
 
 /// @brief Build the complete fine-level flag field for a refinement patch:
-/// all-Fluid base, foil voxelized at 2x resolution, TE closure, and the
-/// 2-fine-cell Interface shell stamped on the x/y faces (z stays periodic).
-/// VG stamping happens at the call site (vg.h buildFlagsWithVGs equivalent)
-/// between voxelize and shell stamping when VGs exist — see main.cpp.
+/// all-Fluid base, foil voxelized at factor-times resolution, TE closure, and
+/// the 2-fine-cell Interface shell stamped on the x/y faces (z stays
+/// periodic). VG stamping happens at the call site between voxelize and
+/// shell stamping when VGs exist — see main.cpp.
 /// @param airfoil Normalized section.
 /// @param aoa_deg Angle of attack in degrees.
 /// @param coarse  Coarse domain layout.
 /// @param box     Patch box in coarse cells.
+/// @param factor  Refinement factor m (2..kMaxRefineFactor).
 /// @return Fine flag field of makeFineLayout(...).dims.cellCount() bytes.
 std::vector<std::uint8_t> buildFinePatchFlags(const AirfoilGeometry& airfoil,
                                               float aoa_deg,
                                               const DomainLayout& coarse,
-                                              const PatchBox& box);
+                                              const PatchBox& box,
+                                              int factor = kRefineFactor);
 
 /// @brief Stamp the 2-fine-cell Interface shell onto a fine flag field's
 /// x/y faces (idempotent; overwrites whatever is there — the shell must win

@@ -103,8 +103,11 @@ struct App {
     // NOTE: the plan-8 snapshot warm-start cache (VRAM clean slot + disk LRU)
     // was removed: its capture path could freeze the session right as the
     // force gate opened ("clean flow cached" — then nothing). Every geometry/
-    // AoA/airspeed/VG edit now simply restarts the sim, which is predictable
-    // and plenty fast on this hardware.
+    // AoA/airspeed edit now simply restarts the sim, which is predictable
+    // and plenty fast on this hardware. VG edits restart cold too by default,
+    // with an opt-in warm continuation (UIParams::vgWarmRestart) that patches
+    // the flags in place — no capture/cache involved, so none of the snapshot
+    // path's failure modes apply.
 
     bool nanLogged = false;              ///< One log line per watchdog trip.
     double lastHeartbeatT = 0.0;         ///< Telemetry heartbeat pacing.
@@ -458,12 +461,13 @@ void rebuildFlagFields(App& app) {
 /// shell, and hand it to the solver. Disabled/STL/derivation-failure paths
 /// tear the fine level down — the coarse sim continues either way.
 void applyRefinement(App& app) {
-    if (!app.params.refine.enabled || app.stlActive) {
+    if (!app.params.refine.enabled() || app.stlActive) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
         return;
     }
+    const int factor = std::clamp(app.params.refine.factor, 2, kMaxRefineFactor);
 
     // Margins from chord fractions to coarse cells (>= 2 so the restriction
     // band never touches a solid).
@@ -483,11 +487,11 @@ void applyRefinement(App& app) {
         return;
     }
 
-    // Fine flag field: foil + every VG voxelized at 2x resolution, the same
-    // TE-closure pass, then the coupling shell. Same machinery as the coarse
-    // build — only the layout (doubled chord cells, patch-local anchor)
-    // differs, so the two levels always agree on where the geometry is.
-    const DomainLayout fineLayout = makeFineLayout(app.layout, box);
+    // Fine flag field: foil + every VG voxelized at the factor's resolution,
+    // the same TE-closure pass, then the coupling shell. Same machinery as
+    // the coarse build — only the layout (scaled chord cells, patch-local
+    // anchor) differs, so the two levels always agree on where geometry is.
+    const DomainLayout fineLayout = makeFineLayout(app.layout, box, factor);
     std::vector<std::uint8_t> fine(
         static_cast<std::size_t>(fineLayout.dims.cellCount()),
         static_cast<std::uint8_t>(CellFlag::Fluid));
@@ -498,7 +502,7 @@ void applyRefinement(App& app) {
     stampInterfaceShell(fineLayout.dims, fine);
 
     std::string err;
-    if (!app.solver.initRefinement(box, fine, &err)) {
+    if (!app.solver.initRefinement(box, factor, fine, &err)) {
         setStatus(app, "refinement patch unavailable: " + err
                            + " — running base grid only");
         app.patchBox = PatchBox{};
@@ -509,9 +513,9 @@ void applyRefinement(App& app) {
     app.fineFlags = std::move(fine);
     char msg[160];
     std::snprintf(msg, sizeof msg,
-                  "refinement patch: coarse box [%d,%d)x[%d,%d) -> fine "
+                  "refinement patch (%dx): coarse box [%d,%d)x[%d,%d) -> fine "
                   "%d x %d x %d",
-                  box.x0, box.x1, box.y0, box.y1, fineLayout.dims.nx,
+                  factor, box.x0, box.x1, box.y0, box.y1, fineLayout.dims.nx,
                   fineLayout.dims.ny, fineLayout.dims.nz);
     logLine(msg);
 }
@@ -668,13 +672,15 @@ void emitVoxelFaces(const GridDims& dims, const std::vector<std::uint8_t>& flags
 StlMesh buildVoxelMesh(const App& app) {
     StlMesh m;
     m.name = "voxel view";
-    const bool fineActive =
-        app.solver.refinementInfo().active && !app.fineFlags.empty();
+    const RefinementInfo ri = app.solver.refinementInfo();
+    const bool fineActive = ri.active && !app.fineFlags.empty();
     emitVoxelFaces(app.layout.dims, app.activeFlags, 1.0f, Vec3f(0, 0, 0),
                    fineActive ? &app.patchBox : nullptr, m.triangles);
     if (fineActive) {
-        const GridDims fineDims = fineDimsFor(app.patchBox, app.layout.dims);
-        emitVoxelFaces(fineDims, app.fineFlags, 0.5f,
+        const GridDims fineDims =
+            fineDimsFor(app.patchBox, app.layout.dims, ri.factor);
+        emitVoxelFaces(fineDims, app.fineFlags,
+                       1.0f / static_cast<float>(ri.factor),
                        Vec3f(static_cast<float>(app.patchBox.x0),
                              static_cast<float>(app.patchBox.y0), 0.0f),
                        nullptr, m.triangles);
@@ -891,24 +897,43 @@ void tryLoadDefaultAirfoil(App& app) {
 // VG geometry application.
 // ===========================================================================
 
-/// VG edit: rebuild the flag field and perform a full cold restart so the
-/// force history is clean and not contaminated by the pre-edit flow state.
-void applyVGEdit(App& app) {
+/// VG edit: rebuild the flag field and restart the sim. The default is a
+/// full cold restart so the force history is clean and not contaminated by
+/// the pre-edit flow state. When the user opts into warm restarts (the VG
+/// editor's "Keep flow between edits" checkbox), the developed field is kept
+/// instead: the solver diffs old vs new flags in place (newly solid cells
+/// zeroed, newly fluid cells equilibrium-filled from neighbors) and the force
+/// gate reopens after a short re-settle rather than a from-scratch run.
+/// @return True when the warm path was taken (for the status log line).
+bool applyVGEdit(App& app) {
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
                             app.layout, app.cleanFlags);
-    // Cold restart — VG geometry changes the flow field enough that continuing
-    // from the old state produces misleading force transients.
-    app.solver.setFlags(app.activeFlags);
+    // Warm continuation only makes sense from a healthy field — after a NaN
+    // trip there is nothing worth keeping, so fall back to the cold path.
+    const bool warm = app.params.vgWarmRestart && !app.solver.nanDetected();
+    if (warm) {
+        // In-place flag swap: keeps the developed flow, skips the viscosity
+        // ramp, reopens the force gate after the warm re-settle window.
+        app.solver.applyEditedFlags(app.activeFlags);
+    } else {
+        // Cold restart — VG geometry changes the flow field enough that
+        // continuing from the old state produces misleading force transients.
+        app.solver.setFlags(app.activeFlags);
+    }
     app.solver.setSurfaceReference(app.cleanFlags);
     // The patch box tracks the VG bbox (a vane near the placement limit can
     // move it), so the fine level rebuilds with the new vanes BEFORE the
-    // render mesh (the voxel view composites the fine flags); the presolve
-    // then refills the developed flow the cold restart just discarded.
+    // render mesh (the voxel view composites the fine flags). initRefinement
+    // seeds the fine state from the LIVE coarse field, so the rebuild is
+    // equally valid after the warm in-place swap.
     applyRefinement(app);
     uploadRenderGeometry(app);
-    runPreconverge(app);
+    // The presolve refills the developed flow a cold restart just discarded;
+    // the warm path already HAS that flow — re-seeding would throw it away.
+    if (!warm) runPreconverge(app);
+    return warm;
 }
 
 // ===========================================================================
@@ -1076,6 +1101,7 @@ void updateReadouts(App& app) {
         const RefinementInfo ri = app.solver.refinementInfo();
         auto& rr = app.readouts.refine;
         rr.active          = ri.active;
+        rr.factor          = ri.factor;
         rr.fineDims        = ri.fineDims;
         rr.fineVramGB      = ri.vramBytes / (1024.0 * 1024.0 * 1024.0);
         rr.fineReEffective = ri.fineScaling.reEffective;
@@ -1261,11 +1287,13 @@ void applyEvents(App& app) {
         }
     }
 
-    // ---- VG edits: cold restart (VG geometry changes invalidate the field) ----
+    // ---- VG edits: cold restart by default; warm in-place continuation when
+    // the VG editor's "Keep flow between edits" option is checked ----
     if (ev.vgEdited && !app.stlActive) {
-        applyVGEdit(app);
+        const bool warm = applyVGEdit(app);
         char msg[64];
-        std::snprintf(msg, sizeof msg, "VG edit — cold restart (%d VG entries)",
+        std::snprintf(msg, sizeof msg, "VG edit — %s (%d VG entries)",
+                      warm ? "warm continue" : "cold restart",
                       static_cast<int>(app.params.vgs.size()));
         logLine(msg);
     }
@@ -1278,7 +1306,7 @@ void applyEvents(App& app) {
         applyRefinement(app);
         // A changed patch changes the composite voxel geometry on screen.
         if (app.params.voxelView) uploadRenderGeometry(app);
-        logLine(app.params.refine.enabled
+        logLine(app.params.refine.enabled()
                     ? "refinement patch rebuilt (live)"
                     : "refinement patch disabled");
     }
@@ -1472,6 +1500,14 @@ int runInteractive(App& app) {
         ctx.airfoilCatalog = &app.catalog;
         ctx.aircraftManifest = &app.aircraft.entries;
         ctx.statusMessage = app.status;
+        // Camera matrix for world-space line overlays (the patch box): same
+        // aspect as drawFrame so the projected lines land exactly on the GL
+        // scene underneath.
+        const Mat4f viewProj =
+            app.camera.projMatrix(fbh > 0 ? static_cast<float>(fbw) / fbh
+                                          : 1.0f)
+            * app.camera.viewMatrix();
+        ctx.viewProj = &viewProj;
         drawUI(ctx);
         uiEndFrame();
 
