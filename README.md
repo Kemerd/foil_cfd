@@ -1,6 +1,6 @@
 # FoilCFD
 
-**A real-time GPU wind tunnel for people who actually build airplanes.**
+**A real-time GPU wind tunnel for people who build airplanes — or are just fascinated by what makes them fly.**
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA-green.svg)](#requirements)
@@ -14,6 +14,24 @@ FoilCFD is a CUDA lattice-Boltzmann solver (D3Q19, TRT, Smagorinsky LES) strappe
 interactive 3D visualizer. On an RTX 5090 it pushes **~8 billion lattice updates per second**
 on a 23.6M-cell grid — about 340 full solver steps every second, while rendering. That's not
 "fast for CFD." That's a wind tunnel with a framerate.
+
+### Sim time vs. wall time
+
+One lattice step advances physical time by `dt = u_lat × dx / airspeed` (derived in
+`src/sim/units.h`, the single unit-conversion authority). At the default setup — 1.2 m
+chord, 30 m/s airspeed, 256 cells/chord, lattice speed 0.08 — that's dt ≈ 12.5 µs, so
+**~80,000 solver steps equal one real-world second of flow**. The general formula:
+
+```
+steps per real second = airspeed [m/s] × cells_per_chord / (u_lat × chord [m])
+```
+
+At ~340 steps/s on an RTX 5090, the tunnel runs at roughly **1/235 of real time** — one
+second of physical flow takes about four minutes of wall clock at the default grid. The
+app itself doesn't slow down to match: per-frame solver work is capped at 10 ms (TDR
+safety), so the visualizer stays at interactive framerates (typically **60+ FPS**,
+render-bound), advancing ~5–6 solver steps per rendered frame. Faster airspeeds and
+finer grids both shrink dt, so the steps-per-real-second count grows linearly with each.
 
 ![Selftest render](screenshots/selftest.png)
 
@@ -35,6 +53,10 @@ the product.
 
 Then go tuft-test it. Cotton tape is cheap. Trust, but verify — this tool exists to make
 your first guess a *good* guess, not to replace the roll of tape.
+
+Not drilling holes in anything yet? It's still mostly about airplanes — but the tunnel
+doesn't check your pilot's license. Any watertight STL flies here (see
+[Custom STL import](#custom-stl-import)): drones, fairings, whatever you're curious about.
 
 ## The honesty section
 
