@@ -721,14 +721,16 @@ struct Visualizer::Impl {
     }
 
     /// Lazy velocity-volume creation: a full-grid single-channel float 3D
-    /// texture (R16F: 2 bytes/cell) plus its one-time CUDA registration. Runs
+    /// texture (R32F: 4 bytes/cell) plus its one-time CUDA registration. Runs
     /// when the velocity-volume mode (or Q velocity coloring) first needs it.
-    /// R16F gives smooth speed gradients without the banding an R8 would show
-    /// in the faint slow-air haze.
+    /// R32F (not R16F) so the CUDA-side surf3Dwrite of a 4-byte float matches
+    /// the texel stride exactly — a 16-bit texel would make every write a
+    /// 2-byte overflow and corrupt neighbouring memory. The smooth float ramp
+    /// also avoids the banding an R8 would show in the faint slow-air haze.
     bool createVelVolume() {
         glGenTextures(1, &velTex);
         glBindTexture(GL_TEXTURE_3D, velTex);
-        glTexImage3D(GL_TEXTURE_3D, 0, GL_R16F, dims.nx, dims.ny, dims.nz, 0,
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, dims.nx, dims.ny, dims.nz, 0,
                      GL_RED, GL_FLOAT, nullptr);
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
