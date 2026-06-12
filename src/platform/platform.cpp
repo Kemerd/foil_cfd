@@ -20,6 +20,21 @@
 
 namespace foilcfd::platform {
 
+std::filesystem::path pathFromUtf8(std::string_view utf8) {
+    // Reinterpreting the bytes as char8_t makes the standard library decode
+    // them as UTF-8 on every platform; a narrow std::string would round-trip
+    // through the ANSI code page on MSVC and mangle non-ASCII characters.
+    return std::filesystem::path(std::u8string(
+        reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()));
+}
+
+std::string pathToUtf8(const std::filesystem::path& path) {
+    // u8string() always succeeds (UTF-16 -> UTF-8 on Windows is lossless),
+    // unlike string() which targets the lossy/throwing ANSI code page.
+    const std::u8string u8 = path.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
 #ifdef _WIN32
 namespace {
 

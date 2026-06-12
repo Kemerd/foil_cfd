@@ -7,9 +7,28 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace foilcfd::platform {
+
+/// @brief Construct a std::filesystem::path from UTF-8 bytes.
+///
+/// GLFW hands drop-callback paths to the app as UTF-8, but on MSVC the
+/// std::filesystem::path(std::string) constructor decodes narrow strings via
+/// the ACTIVE ANSI CODE PAGE — any dropped file under a non-ASCII profile or
+/// folder name ("José", CJK/Cyrillic directories) would be mangled and fail
+/// to open. This helper forces UTF-8 decoding on every platform.
+/// @param utf8 UTF-8 encoded path bytes (e.g. from a GLFW drop callback).
+std::filesystem::path pathFromUtf8(std::string_view utf8);
+
+/// @brief Convert a path to UTF-8 for display strings, status messages, and
+/// geometry/cache IDs. The inverse hazard of pathFromUtf8: path::string() on
+/// MSVC converts to the ANSI code page and THROWS std::system_error for
+/// characters that page cannot represent — this conversion can neither throw
+/// nor mojibake.
+/// @param path Any filesystem path.
+std::string pathToUtf8(const std::filesystem::path& path);
 
 /// @brief One file-type filter for the dialogs, e.g. {"Airfoil data", "*.dat"}.
 struct FileFilter {

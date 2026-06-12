@@ -7,6 +7,10 @@
 
 #include "stl.h"
 
+// UTF-8 path conversion: path::string() decodes via the ANSI code page on
+// MSVC and can throw for the non-ASCII paths drag-and-drop now delivers.
+#include "../platform/platform.h"
+
 #include <algorithm>
 #include <bit>
 #include <charconv>
@@ -43,10 +47,19 @@ std::uint64_t fnv1a64(const char* data, std::size_t n) {
     return h;
 }
 
+/// Hard ceiling on the raw STL file size we are willing to slurp. Any valid
+/// mesh under the 2M-triangle cap fits easily: binary is 84 + 50 B/facet
+/// (~100 MB), ASCII runs ~250-350 B/facet (~700 MB worst case). Anything
+/// larger is either over the triangle cap anyway or not an STL at all (e.g.
+/// a multi-GB file renamed .stl) — refuse with a readable reason instead of
+/// letting a multi-GB host allocation throw std::bad_alloc through the
+/// frame loop (plan 7.1 refusal requirement).
+constexpr std::uint64_t kMaxStlFileBytes = 1ull << 30; // 1 GiB
+
 /// Slurp the whole file into memory. STL files are read in full anyway for
-/// hashing, and the 2M-triangle cap bounds binary files to ~100 MB — fine to
-/// hold while parsing, and it lets the ASCII parser run over a flat buffer
-/// with proper line tracking instead of fragile line-by-line stream reads.
+/// hashing, and the size cap above bounds the allocation — fine to hold
+/// while parsing, and it lets the ASCII parser run over a flat buffer with
+/// proper line tracking instead of fragile line-by-line stream reads.
 bool readWholeFile(const std::filesystem::path& path, std::vector<char>& out,
                    std::string& err) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
@@ -57,6 +70,17 @@ bool readWholeFile(const std::filesystem::path& path, std::vector<char>& out,
     const std::streamsize size = in.tellg();
     if (size < 0) {
         err = "cannot determine file size";
+        return false;
+    }
+    // Size cap BEFORE any allocation: every valid <= 2M-triangle STL (binary
+    // or ASCII) is far under this; only pathological/garbage files exceed it.
+    if (static_cast<std::uint64_t>(size) > kMaxStlFileBytes) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+                      "file is %.1f GB — too large for any %s-triangle STL",
+                      static_cast<double>(size) / (1024.0 * 1024.0 * 1024.0),
+                      humanCount(kMaxStlTriangles).c_str());
+        err = buf;
         return false;
     }
     in.seekg(0, std::ios::beg);
@@ -350,7 +374,9 @@ StlLoadResult loadStl(const std::filesystem::path& path) {
     // anything — this is the "stl:<hash>" warm-cache identity (plan 7.4) and
     // must depend only on file content.
     mesh.contentHash = fnv1a64(bytes.data(), bytes.size());
-    const std::string stem = path.stem().string();
+    // UTF-8 stem: drag-and-drop now delivers correctly-decoded non-ASCII
+    // paths, for which stem().string() (ANSI code page on MSVC) would throw.
+    const std::string stem = platform::pathToUtf8(path.stem());
     mesh.name = stem;
 
     // Binary detection (plan 7.1): trust the 84-byte header + exact size

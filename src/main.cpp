@@ -19,7 +19,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "app/camera.h"
@@ -96,8 +95,9 @@ struct App {
 
     // -- warm-start cache (plan 8) --
     VramSnapshot cleanSnap;              ///< The ONE VRAM-resident clean slot.
-    std::unique_ptr<DiskSnapshotCache> diskCache;
-    std::thread diskWriter;              ///< Worker for compact-snapshot saves.
+    std::unique_ptr<DiskSnapshotCache> diskCache; ///< Owns its store worker
+                                         ///< thread (storeAsync) — saves never
+                                         ///< block the frame loop.
 
     // -- STL import state (plan 7) --
     StlMesh stlMeshRaw;                  ///< As loaded, pre-normalization (kept
@@ -114,6 +114,14 @@ struct App {
     int    vramPollCounter = 0;
     bool   uiActive = false;             ///< ImGui context exists (interactive).
     std::string status;
+
+    // -- latched CUDA failure (plan 4.5 TDR robustness) --
+    // After a TDR/device-removed/sticky context error every subsequent launch
+    // fails too; retrying each frame would silently spin on a frozen field.
+    // The first failure stops the sim for the session and surfaces its
+    // diagnosis through the Sim panel (mirrors the NaN-watchdog pattern).
+    bool        cudaFailure = false;
+    std::string cudaFailureMsg;
 };
 
 /// Set the transient status line (load errors, cache notes) with its decay
@@ -124,10 +132,18 @@ void setStatus(App& app, std::string msg) {
     app.statusT = platform::timerSeconds();
 }
 
-/// Join the compact-snapshot disk writer if one is in flight. Called before
-/// starting a new save and at shutdown so the thread never outlives the cache.
-void joinDiskWriter(App& app) {
-    if (app.diskWriter.joinable()) app.diskWriter.join();
+/// Latch a fatal CUDA failure: stop stepping for the session and surface the
+/// first error's diagnosis in the Sim panel. Without this, the cudaError_t
+/// chain (kernel wrapper -> stepN/updateFields -> here) would terminate in a
+/// silently discarded return value at the only call sites that matter.
+void latchCudaFailure(App& app, const char* stage, cudaError_t err) {
+    if (app.cudaFailure) return; // keep the FIRST failure's diagnosis
+    app.cudaFailure = true;
+    app.cudaFailureMsg = std::string(stage) + " failed: "
+                       + cudaGetErrorString(err)
+                       + " (" + cudaGetErrorName(err) + ")";
+    app.params.running = false;
+    setStatus(app, "GPU error — " + app.cudaFailureMsg);
 }
 
 // ===========================================================================
@@ -271,6 +287,20 @@ std::filesystem::path findAirfoilsDirectory() {
     return exeDir / "airfoils"; // scan will just return empty
 }
 
+/// Geometry/cache id for a .dat file: "dat:" + the canonicalized FULL path
+/// as UTF-8. Keying on the filename alone would collide for identically
+/// named files in different directories (airfoils/e423.dat vs
+/// airfoils/uiuc/e423.dat) — the flagsHash check keeps such collisions
+/// CORRECT, but they silently evict each other's warm-cache entries. UTF-8
+/// via the platform helper (never path::string(), which converts through
+/// the ANSI code page on MSVC: lossy at best, throwing at worst).
+std::string datGeometryId(const std::filesystem::path& path) {
+    std::error_code ec;
+    const std::filesystem::path canon =
+        std::filesystem::weakly_canonical(path, ec);
+    return "dat:" + platform::pathToUtf8(ec ? path : canon);
+}
+
 /// Resolve the airfoil section from the UI source selection (NACA digits or
 /// catalog .dat entry). Fills airfoil, geometryId, and the display name; on
 /// failure the previous geometry stays active and the reason is reported.
@@ -290,7 +320,7 @@ bool resolveAirfoil(App& app, std::string* error) {
             }
             const auto& path = app.catalog[static_cast<size_t>(idx)].path;
             res = loadAirfoilDat(path);
-            id  = "dat:" + path.filename().string();
+            id  = datGeometryId(path);
             break;
         }
         case AirfoilSource::StlImport:
@@ -350,6 +380,11 @@ void tryDiskWarmRestore(App& app) {
 void applyGeometryCold(App& app) {
     rebuildFlagFields(app);
     app.solver.setFlags(app.activeFlags);
+    // The live flags may include VG voxels; the delta99/separation-onset
+    // extraction must always measure from the CLEAN foil surface, or a vane
+    // crossing mid-span would read as the surface (false separation pinned
+    // at the VG station — the mission's core readout corrupted).
+    app.solver.setSurfaceReference(app.cleanFlags);
     tryDiskWarmRestore(app);
     app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
                            app.layout);
@@ -412,11 +447,18 @@ void applyStlImport(App& app) {
 
     // Commit: STL becomes the active geometry. VGs clear (no parametric
     // surface to seat them on, plan 7.4) and the snapshot key switches to the
-    // content hash so the cache survives reimports of the same file.
-    char hashHex[24];
-    std::snprintf(hashHex, sizeof(hashHex), "stl:%016llx",
-                  static_cast<unsigned long long>(app.stlMeshRaw.contentHash));
-    app.geometryId = hashHex;
+    // content hash so the cache survives reimports of the same file. The
+    // normalization choices are PART of the identity: the same bytes with a
+    // different axis remap / chord scale / z-boundary mode produce a
+    // different solid, and keying on the hash alone would make those
+    // variants evict each other's warm-cache entries (the flagsHash check
+    // keeps that correct, but every toggle would silently cache-miss).
+    char idBuf[64];
+    std::snprintf(idBuf, sizeof(idBuf), "stl:%016llx:a%d:c%d:%s",
+                  static_cast<unsigned long long>(app.stlMeshRaw.contentHash),
+                  static_cast<int>(ui.axisPreset), ui.chordCells,
+                  ui.zFreeSlipWalls ? "w" : "p");
+    app.geometryId = idBuf;
     app.stlActive  = true;
     app.params.source = AirfoilSource::StlImport;
     app.params.vgs.clear();
@@ -425,6 +467,7 @@ void applyStlImport(App& app) {
     app.cleanFlags  = flags;
     app.activeFlags = std::move(flags);
     app.solver.setFlags(app.activeFlags);
+    app.solver.setSurfaceReference(app.cleanFlags); // STL: clean == active
     tryDiskWarmRestore(app);
     // Hand the normalized triangle soup to the renderer: it replaces the
     // extruded-foil prism in the shared mesh VBO, so the drawn solid matches
@@ -436,18 +479,22 @@ void applyStlImport(App& app) {
 /// Route a dropped/dialog-selected file by extension: .dat -> airfoil loader,
 /// .stl -> import modal (plan 7.1 + the section-9 drop contract).
 void handleIncomingFile(App& app, const std::filesystem::path& path) {
-    std::string ext = path.extension().string();
+    // All display/ID conversions go through pathToUtf8 — path::string() on
+    // MSVC converts via the ANSI code page and can THROW std::system_error
+    // for unrepresentable characters (CJK filename on a Western locale),
+    // which would propagate straight out of the frame loop.
+    const std::string fileNameUtf8 = platform::pathToUtf8(path.filename());
+    std::string ext = platform::pathToUtf8(path.extension());
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (ext == ".dat") {
         AirfoilLoadResult res = loadAirfoilDat(path);
         if (!res.ok) {
-            setStatus(app, path.filename().string() + " rejected: "
-                               + res.rejectionReason);
+            setStatus(app, fileNameUtf8 + " rejected: " + res.rejectionReason);
             return;
         }
         app.airfoil    = res.airfoil;
-        app.geometryId = "dat:" + path.filename().string();
+        app.geometryId = datGeometryId(path);
         app.stlActive  = false;
         app.params.source = AirfoilSource::DatFile;
         app.params.selectedDatIndex = -1; // external file, not in the catalog
@@ -457,8 +504,7 @@ void handleIncomingFile(App& app, const std::filesystem::path& path) {
     } else if (ext == ".stl") {
         StlLoadResult res = loadStl(path);
         if (!res.ok) {
-            setStatus(app, path.filename().string() + " rejected: "
-                               + res.rejectionReason);
+            setStatus(app, fileNameUtf8 + " rejected: " + res.rejectionReason);
             return;
         }
         // Stash the mesh; the modal collects normalization choices before
@@ -466,7 +512,7 @@ void handleIncomingFile(App& app, const std::filesystem::path& path) {
         app.stlMeshRaw = std::move(res.mesh);
         StlImportUI& ui = app.params.stlImport;
         ui.open          = true;
-        ui.fileName      = path.filename().string();
+        ui.fileName      = fileNameUtf8;
         ui.solidName     = app.stlMeshRaw.name;
         ui.triangleCount = static_cast<std::uint32_t>(app.stlMeshRaw.triangles.size());
         ui.bounds        = app.stlMeshRaw.bounds;
@@ -499,19 +545,13 @@ void captureCleanState(App& app, bool toDisk) {
     if (toDisk && app.diskCache) {
         auto compact = std::make_shared<CompactSnapshot>();
         if (compact->capture(app.solver, key, app.stream, &err)) {
-            // saveToFile/store touch only host state, so they belong on a
-            // worker (plan 8: "saved on a worker thread"). One writer at a
-            // time keeps the cache's internal serialization trivial to reason
-            // about; join is instant unless a save is genuinely in flight.
-            joinDiskWriter(app);
-            DiskSnapshotCache* cache = app.diskCache.get();
-            app.diskWriter = std::thread([compact, cache] {
-                std::string werr;
-                if (!cache->store(*compact, &werr)) {
-                    std::fprintf(stderr, "[cache] store failed: %s\n",
-                                 werr.c_str());
-                }
-            });
+            // The cache's own worker thread streams the (hundreds of MB)
+            // write to disk (plan 8: "saved on a worker thread"); the
+            // shared_ptr keeps the snapshot alive until then. Crucially this
+            // ENQUEUES and returns — a bespoke join-then-spawn here used to
+            // stall the render thread for seconds whenever a previous save
+            // was still in flight on a slow disk.
+            app.diskCache->storeAsync(std::move(compact));
         } else {
             setStatus(app, "compact snapshot failed: " + err);
         }
@@ -637,6 +677,10 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
                          error)) {
         return false;
     }
+    // The solver received the MERGED flags (VG voxels included when VGs
+    // exist); the suction-surface extraction must measure from the clean
+    // foil, never from a vane crest (Lin-2002 guidance contract).
+    app.solver.setSurfaceReference(app.cleanFlags);
     // High Fidelity widens the force EMA to many flow-throughs (plan Mission /
     // 4.4); set right after init since a fresh solver resets to the standard
     // 1.0 window. Sim-module contract: notes/integration_sim.md.
@@ -674,6 +718,8 @@ void updateReadouts(App& app) {
     app.readouts.currentTau = app.solver.currentTau();
     app.readouts.nanTripped = app.solver.nanDetected();
     app.readouts.nanDiagnosis = app.solver.nanDiagnosis();
+    app.readouts.cudaErrorTripped = app.cudaFailure;
+    app.readouts.cudaErrorDiagnosis = app.cudaFailureMsg;
     app.readouts.forces = app.solver.forces();
 
     // VRAM fraction (plan 4.6 warn-above-80%): a driver query, so poll it at
@@ -784,7 +830,10 @@ void applyEvents(App& app) {
         applyGeometryCold(app);
     }
 
-    // ---- airspeed: units rescale, flow field stays valid (plan 13) ----
+    // ---- airspeed OR chord: pure units rescale, flow field stays valid
+    // (plan 13). Grid dims, u_lat, and the flag field are untouched — only
+    // dx/dt/tau/Re-target change — so this must NEVER cold-start or drop
+    // the warm cache (a chord sweep to study Re trends rides this path). ----
     if (ev.airspeedChanged) {
         const LatticeScaling scaling = currentScaling(app.params);
         app.readouts.scaling = scaling;
@@ -795,8 +844,11 @@ void applyEvents(App& app) {
         app.solver.shutdown();
         if (!app.solver.init(app.layout.dims, scaling, app.activeFlags,
                              app.stream, &err)) {
-            setStatus(app, "airspeed re-init failed: " + err);
+            setStatus(app, "units-rescale re-init failed: " + err);
         } else {
+            // Fresh solver: restore the clean-foil surface reference so the
+            // guidance extraction never measures from VG voxels.
+            app.solver.setSurfaceReference(app.cleanFlags);
             // A fresh solver resets the force EMA window to the standard 1.0;
             // re-apply the High Fidelity widening (sim-module contract).
             app.solver.setForceEmaWindow(
@@ -837,7 +889,12 @@ void applyEvents(App& app) {
     }
     if (ev.singleStep) {
         app.params.running = false;
-        app.solver.stepN(1);
+        if (!app.cudaFailure) {
+            if (const cudaError_t serr = app.solver.stepN(1);
+                serr != cudaSuccess) {
+                latchCudaFailure(app, "single step", serr);
+            }
+        }
     }
     if (ev.saveCleanState) {
         captureCleanState(app, /*toDisk=*/true);
@@ -861,7 +918,9 @@ void applyEvents(App& app) {
         if (!app.viz.screenshotPNG(path, &err)) {
             setStatus(app, "screenshot failed: " + err);
         } else {
-            setStatus(app, "saved " + path.string());
+            // UTF-8 conversion: the exe may live under a non-ASCII profile
+            // path, where path::string() would throw or mojibake.
+            setStatus(app, "saved " + platform::pathToUtf8(path));
         }
     }
 
@@ -927,36 +986,59 @@ int runInteractive(App& app) {
         const float dt = static_cast<float>(now - app.lastFrameT);
         app.lastFrameT = now;
 
-        // -- dropped files queued by the GLFW callback --
+        // -- dropped files queued by the GLFW callback. GLFW documents drop
+        // paths as UTF-8; constructing filesystem::path from the narrow
+        // string directly would decode them via the ANSI code page on MSVC
+        // and mangle any non-ASCII path (plan 7.1 drag-and-drop). --
         for (const std::string& f : app.droppedFiles) {
-            handleIncomingFile(app, std::filesystem::path(f));
+            handleIncomingFile(app, platform::pathFromUtf8(f));
         }
         app.droppedFiles.clear();
 
         // -- camera: input mapping + spring smoothing --
         updateCameraInput(app, dt);
 
-        // -- sim: adaptive N steps under the TDR-safe budget --
+        // -- sim: adaptive N steps under the TDR-safe budget. The returned
+        // cudaError_t is the END of the whole launch-wrapper error chain —
+        // dropping it here would leave a TDR'd session spinning silently on
+        // a frozen field, so any failure latches and stops the sim. --
         int stepsThisFrame = 0;
-        if (app.params.running && !app.solver.nanDetected()) {
+        if (app.params.running && !app.solver.nanDetected() && !app.cudaFailure) {
             stepsThisFrame = app.solver.adaptiveStepsForBudget();
-            if (stepsThisFrame > 0) app.solver.stepN(stepsThisFrame);
+            if (stepsThisFrame > 0) {
+                if (const cudaError_t err = app.solver.stepN(stepsThisFrame);
+                    err != cudaSuccess) {
+                    latchCudaFailure(app, "sim step", err);
+                }
+            }
         }
 
-        // -- particles + slices: interop map/unmap inside updateFields --
-        app.viz.updateFields(app.solver.velocityField(), app.solver.deviceRho(),
-                             app.solver.deviceFlags(),
-                             static_cast<float>(stepsThisFrame),
-                             app.params.viz);
+        // -- particles + slices: interop map/unmap inside updateFields.
+        // Skipped entirely once a CUDA failure is latched: the interop
+        // map/unmap calls would fail the same way every frame. --
+        if (!app.cudaFailure) {
+            if (const cudaError_t err = app.viz.updateFields(
+                    app.solver.velocityField(), app.solver.deviceRho(),
+                    app.solver.deviceFlags(),
+                    static_cast<float>(stepsThisFrame), app.params.viz);
+                err != cudaSuccess) {
+                latchCudaFailure(app, "render field update", err);
+            }
+        }
 
-        // -- draw scene, then UI on top --
+        // -- draw scene, then UI on top (pure GL — still fine after a CUDA
+        // failure; the UI must keep rendering to show the diagnosis) --
         int fbw = 0, fbh = 0;
         glfwGetFramebufferSize(app.window, &fbw, &fbh);
         app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
 
         updateReadouts(app);
-        refreshGuidance(app);
-        maybeAutoCache(app);
+        // Guidance extraction and snapshot capture both issue device work —
+        // pointless (and noisy) once the context is broken.
+        if (!app.cudaFailure) {
+            refreshGuidance(app);
+            maybeAutoCache(app);
+        }
 
         // Status messages decay so stale errors don't linger for the session.
         if (!app.status.empty() && now - app.statusT > kStatusLifetime) {
@@ -1018,9 +1100,17 @@ int runSelftest(App& app) {
                 mlups, elapsed, app.layout.dims.nx, app.layout.dims.ny,
                 app.layout.dims.nz);
 
-    // One full render pass so the screenshot has defined contents.
-    app.viz.updateFields(app.solver.velocityField(), app.solver.deviceRho(),
-                         app.solver.deviceFlags(), 200.0f, app.params.viz);
+    // One full render pass so the screenshot has defined contents. The
+    // selftest exists to prove the GL + CUDA + interop plumbing — a dropped
+    // updateFields failure here would defeat its whole purpose.
+    if (cudaError_t err = app.viz.updateFields(
+            app.solver.velocityField(), app.solver.deviceRho(),
+            app.solver.deviceFlags(), 200.0f, app.params.viz);
+        err != cudaSuccess) {
+        std::fprintf(stderr, "selftest: updateFields failed: %s\n",
+                     cudaGetErrorString(err));
+        return 1;
+    }
     int fbw = 0, fbh = 0;
     glfwGetFramebufferSize(app.window, &fbw, &fbh);
     app.viz.drawFrame(app.camera, app.params.viz, fbw, fbh);
@@ -1032,7 +1122,8 @@ int runSelftest(App& app) {
         return 1;
     }
     std::printf("selftest: 200 steps, %lld total, screenshot at %s\n",
-                app.solver.stepCount(), shotPath.string().c_str());
+                app.solver.stepCount(),
+                platform::pathToUtf8(shotPath).c_str());
     std::printf("PASS\n");
     return 0;
 }
@@ -1066,15 +1157,27 @@ int main(int argc, char** argv) {
 
     if (!initSimulation(app, /*reinit=*/false, &error)) {
         std::fprintf(stderr, "FoilCFD init failed: %s\n", error.c_str());
+        // initSimulation can fail PARTWAY with live GPU state (e.g. solver up,
+        // viz failed at slice-texture registration after interop buffers were
+        // already registered). Tear those down NOW, while the GL context and
+        // window still exist — App's destructor runs after glfwTerminate, and
+        // unregistering interop resources whose GL objects are gone is
+        // driver-dependent at best, a crash at worst. Mirrors the success-
+        // path teardown order below.
+        app.viz.shutdown();
+        app.solver.shutdown();
+        if (app.stream) cudaStreamDestroy(app.stream);
+        glfwDestroyWindow(app.window);
         glfwTerminate();
         return 1;
     }
 
     const int rc = selftest ? runSelftest(app) : runInteractive(app);
 
-    // Orderly teardown: the disk-writer thread first (it touches the cache),
-    // then GPU resources before the GL context dies.
-    joinDiskWriter(app);
+    // Orderly teardown: drain the snapshot disk cache's writer queue first
+    // (host/disk state only — destroying the cache joins its worker), then
+    // GPU resources before the GL context dies.
+    app.diskCache.reset();
     app.viz.shutdown();
     app.solver.shutdown();
     if (app.stream) cudaStreamDestroy(app.stream);

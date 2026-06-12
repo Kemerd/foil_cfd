@@ -59,28 +59,45 @@ __device__ __forceinline__ float rand01(unsigned int& state) {
     return static_cast<float>(state & 0x00FFFFFFu) * (1.0f / 16777216.0f);
 }
 
-/// Velocity at a cell (no interpolation) with clamped indices — the building
-/// block for both the trilinear sample corners and the finite-difference
-/// stencils below.
+/// Periodic wrap for an integer z index (plan 4.2: the span is periodic, and
+/// advection already wraps particle POSITIONS across z — sampling must blend
+/// against the periodic image too, or streaks crossing the seam would see an
+/// edge-clamped duplicate of the boundary plane and a velocity discontinuity
+/// right where VG-pair vortices wrap). One period of overshoot each side is
+/// all the trilinear corners and +/-1 stencils below can produce.
+__device__ __forceinline__ int wrapZ(int z, int nz) {
+    if (z < 0) z += nz;
+    else if (z >= nz) z -= nz;
+    return z;
+}
+
+/// Velocity at a cell (no interpolation) — the building block for both the
+/// trilinear sample corners and the finite-difference stencils below. x/y
+/// clamp (walls/inlet/outlet: freezing the boundary gradient is fine for
+/// tracers that respawn there anyway); z wraps the periodic image.
 __device__ __forceinline__ float3 velocityAtCell(const DeviceVelocityField& vel,
                                                  int x, int y, int z) {
     const long long c = cellIndex(clampi(x, 0, vel.dims.nx - 1),
                                   clampi(y, 0, vel.dims.ny - 1),
-                                  clampi(z, 0, vel.dims.nz - 1), vel.dims);
+                                  wrapZ(z, vel.dims.nz), vel.dims);
     return make_float3(vel.u[c], vel.v[c], vel.w[c]);
 }
 
 /// Trilinear velocity sample at a continuous lattice-space position. Cell
 /// centers sit at integer+0.5 (cell i spans [i, i+1)), so the interpolation
-/// coordinate is p - 0.5; edges clamp, which freezes the gradient at the
-/// boundary — fine for tracers that respawn there anyway.
+/// coordinate is p - 0.5; x/y edges clamp, z blends periodically (the half-
+/// cell band next to each span face interpolates against the opposite face's
+/// real data, matching the solver's periodic ghost planes).
 __device__ float3 sampleVelocity(const DeviceVelocityField& vel, float3 p) {
     const float gx = fminf(fmaxf(p.x - 0.5f, 0.0f),
                            static_cast<float>(vel.dims.nx) - 1.0001f);
     const float gy = fminf(fmaxf(p.y - 0.5f, 0.0f),
                            static_cast<float>(vel.dims.ny) - 1.0001f);
-    const float gz = fminf(fmaxf(p.z - 0.5f, 0.0f),
-                           static_cast<float>(vel.dims.nz) - 1.0001f);
+    // z: shift the sub-half-cell band below the first cell center up by one
+    // period so gz lands in [0, nz); the z0+1 corner then wraps inside
+    // velocityAtCell. Positions are pre-wrapped to [0, nz) by the advector.
+    float gz = p.z - 0.5f;
+    if (gz < 0.0f) gz += static_cast<float>(vel.dims.nz);
     const int x0 = static_cast<int>(gx);
     const int y0 = static_cast<int>(gy);
     const int z0 = static_cast<int>(gz);
@@ -109,7 +126,8 @@ __device__ float3 sampleVelocity(const DeviceVelocityField& vel, float3 p) {
     return lerp3(y0v, y1v, fz);
 }
 
-/// Full vorticity vector at a cell via clamped central differences:
+/// Full vorticity vector at a cell via central differences (x/y clamped,
+/// z periodic — velocityAtCell's index policy):
 /// omega = curl(u) = (dw/dy - dv/dz, du/dz - dw/dx, dv/dx - du/dy).
 /// Lattice spacing is 1, so the central difference is just 0.5 * delta.
 __device__ float3 vorticityAtCell(const DeviceVelocityField& vel,

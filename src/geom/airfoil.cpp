@@ -7,6 +7,10 @@
 
 #include "airfoil.h"
 
+// UTF-8 path conversions: path::string() decodes via the ANSI code page on
+// MSVC and can throw for non-ASCII filenames the UIUC zoo / users provide.
+#include "../platform/platform.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -301,8 +305,9 @@ AirfoilLoadResult loadAirfoilDat(const std::filesystem::path& path) {
         result.airfoil.name = lines[0].text;
         idx = 1;
     } else {
-        // Headerless coordinate file: fall back to the filename as the name.
-        result.airfoil.name = path.stem().string();
+        // Headerless coordinate file: fall back to the filename as the name
+        // (UTF-8 — stem().string() would throw for non-ASCII filenames).
+        result.airfoil.name = platform::pathToUtf8(path.stem());
     }
 
     // ---- Format detection (plan 5.2): Lednicer iff the first post-name ----
@@ -412,7 +417,7 @@ std::vector<AirfoilCatalogEntry> scanAirfoilDirectory(
         if (ec) break; // iteration error: return what we gathered so far
         if (!it->is_regular_file(ec)) continue;
         // Case-insensitive .dat extension match (the zoo has .DAT files too).
-        std::string ext = it->path().extension().string();
+        std::string ext = platform::pathToUtf8(it->path().extension());
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (ext != ".dat") continue;
@@ -423,7 +428,10 @@ std::vector<AirfoilCatalogEntry> scanAirfoilDirectory(
         // and '#' comment lines are skipped just like the loader does.
         AirfoilCatalogEntry entry;
         entry.path = it->path();
-        entry.displayName = it->path().filename().string();
+        // UTF-8 display name: one non-ASCII filename anywhere under
+        // airfoils/ must not abort the whole startup scan with a throwing
+        // ANSI conversion.
+        entry.displayName = platform::pathToUtf8(it->path().filename());
         std::ifstream f(it->path(), std::ios::binary);
         std::string raw;
         while (f && std::getline(f, raw)) {
@@ -443,8 +451,8 @@ std::vector<AirfoilCatalogEntry> scanAirfoilDirectory(
     // Stable, case-insensitive alphabetical order for the UI dropdown.
     std::sort(entries.begin(), entries.end(),
               [](const AirfoilCatalogEntry& l, const AirfoilCatalogEntry& r) {
-                  const std::string lf = l.path.filename().string();
-                  const std::string rf = r.path.filename().string();
+                  const std::string lf = platform::pathToUtf8(l.path.filename());
+                  const std::string rf = platform::pathToUtf8(r.path.filename());
                   return std::lexicographical_compare(
                       lf.begin(), lf.end(), rf.begin(), rf.end(),
                       [](unsigned char c1, unsigned char c2) {
