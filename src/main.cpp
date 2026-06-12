@@ -102,6 +102,7 @@ struct App {
     // and plenty fast on this hardware.
 
     bool nanLogged = false;              ///< One log line per watchdog trip.
+    double lastHeartbeatT = 0.0;         ///< Telemetry heartbeat pacing.
 
     // -- STL import state (plan 7) --
     StlMesh stlMeshRaw;                  ///< As loaded, pre-normalization (kept
@@ -152,10 +153,11 @@ void logOpen() {
 #endif
 }
 
-/// Append one timestamped line to the session log (and mirror it to stderr,
-/// which keeps the console-watching workflow intact). Flushes immediately:
-/// the log's whole purpose is surviving a hang or crash.
-void logLine(const std::string& msg) {
+/// Timestamped write to the log file only (no console mirror) — used by the
+/// periodic telemetry heartbeat so the console stays readable. Flushes
+/// immediately: the log's whole purpose is surviving a hang or crash.
+void logLineToFileOnly(const std::string& msg) {
+    if (!gLogFile) return;
     const std::time_t t = std::time(nullptr);
     std::tm tmv{};
 #ifdef _WIN32
@@ -166,11 +168,15 @@ void logLine(const std::string& msg) {
     char stamp[16];
     std::snprintf(stamp, sizeof stamp, "%02d:%02d:%02d", tmv.tm_hour,
                   tmv.tm_min, tmv.tm_sec);
+    std::fprintf(gLogFile, "[%s] %s\n", stamp, msg.c_str());
+    std::fflush(gLogFile);
+}
+
+/// Append one timestamped line to the session log and mirror it to stderr
+/// (keeps the console-watching workflow intact).
+void logLine(const std::string& msg) {
     std::fprintf(stderr, "[foilcfd] %s\n", msg.c_str());
-    if (gLogFile) {
-        std::fprintf(gLogFile, "[%s] %s\n", stamp, msg.c_str());
-        std::fflush(gLogFile);
-    }
+    logLineToFileOnly(msg);
 }
 
 void logClose() {
@@ -206,6 +212,29 @@ void latchCudaFailure(App& app, const char* stage, cudaError_t err) {
 // snapshot key (plan 8) all flow from UIParams through these so every call
 // site agrees.
 // ===========================================================================
+
+/// One-line configuration summary for the session log: everything needed to
+/// reproduce a reported incident (geometry, AoA, airspeed, grid, scaling)
+/// without asking the user follow-up questions.
+std::string configSummary(const App& app) {
+    char buf[384];
+    std::snprintf(buf, sizeof buf,
+                  "config: %s | AoA %.1f deg | airspeed %.2f m/s | chord %.2f m"
+                  " | grid %dx%dx%d (%d cells/chord) | u_lat %.3f | tau %.5f%s"
+                  " | Re_eff %.2e (target %.2e) | VGs %d | HiFi %s",
+                  app.readouts.loadedAirfoilName.empty()
+                      ? app.geometryId.c_str()
+                      : app.readouts.loadedAirfoilName.c_str(),
+                  app.params.aoaDeg, app.params.airspeedMs, app.params.chordM,
+                  app.layout.dims.nx, app.layout.dims.ny, app.layout.dims.nz,
+                  app.layout.chordCells, app.readouts.scaling.u_lat,
+                  app.readouts.scaling.tau,
+                  app.readouts.scaling.tauClamped ? " (clamped)" : "",
+                  app.readouts.scaling.reEffective, app.readouts.scaling.reTarget,
+                  static_cast<int>(app.params.vgs.size()),
+                  app.params.highFidelity.enabled ? "on" : "off");
+    return buf;
+}
 
 /// Active chord resolution: the HiFi bundle overrides the standard preset.
 int currentChordCells(const UIParams& p) {
@@ -730,10 +759,30 @@ void updateReadouts(App& app) {
     // session log, exactly once per latch.
     if (app.readouts.nanTripped && !app.nanLogged) {
         app.nanLogged = true;
-        setStatus(app, "SIMULATION DIVERGED (NaN) — sim paused; see the Sim "
-                       "panel. Diagnosis: " + app.readouts.nanDiagnosis);
+        setStatus(app, "SIMULATION DIVERGED — sim paused. "
+                       + app.readouts.nanDiagnosis);
+        // Full reproduction context for the log: the diagnosis alone says
+        // WHAT tripped; this says what the user was simulating at the time.
+        logLine(configSummary(app));
     } else if (!app.readouts.nanTripped) {
         app.nanLogged = false; // re-arm after a cold reset clears the latch
+    }
+
+    // Telemetry heartbeat: one log line every ~10 s while running, so an
+    // incident report shows the performance/progress trajectory leading up
+    // to it (and a frozen heartbeat is itself a diagnostic).
+    const double nowT = platform::timerSeconds();
+    if (app.params.running && nowT - app.lastHeartbeatT > 10.0) {
+        app.lastHeartbeatT = nowT;
+        char hb[192];
+        std::snprintf(hb, sizeof hb,
+                      "telemetry: step %lld | %.2f flow-throughs | %.2f ms sim"
+                      " | %.0f MLUPS | GPU %d%% | VRAM %.0f%%",
+                      app.readouts.stepCount, app.readouts.flowThroughs,
+                      app.readouts.simElapsedMs, app.readouts.perf.mlups,
+                      app.readouts.gpuUtilPercent,
+                      app.readouts.vramUsedFraction * 100.0f);
+        logLineToFileOnly(hb); // log only — no status-line noise every 10 s
     }
     app.readouts.cudaErrorTripped = app.cudaFailure;
     app.readouts.cudaErrorDiagnosis = app.cudaFailureMsg;
@@ -872,9 +921,12 @@ void applyEvents(App& app) {
         }
     }
     if (ev.aoaChanged && !app.stlActive) {
-        // Plan 13: AoA rotates the geometry -> warm cache key changes ->
-        // cold restart (softened by the per-AoA-bucket disk cache).
+        // AoA rotates the geometry: re-voxelize + clean restart.
         applyGeometryCold(app);
+        char msg[64];
+        std::snprintf(msg, sizeof msg, "AoA -> %.1f deg (sim restarted)",
+                      app.params.aoaDeg);
+        logLine(msg);
     }
 
     // ---- airspeed OR chord: units rescale (new dt/tau/Re-target at the same
@@ -897,12 +949,21 @@ void applyEvents(App& app) {
                 app.params.highFidelity.enabled
                     ? app.params.highFidelity.forceEmaFlowThroughs
                     : StandardPreset{}.forceEmaFlowThroughs);
+            char msg[96];
+            std::snprintf(msg, sizeof msg,
+                          "airspeed/chord -> %.2f m/s / %.2f m (sim restarted)",
+                          app.params.airspeedMs, app.params.chordM);
+            logLine(msg);
         }
     }
 
     // ---- VG edits: ALWAYS warm (plan 6.2) ----
     if (ev.vgEdited && !app.stlActive) {
         applyVGEdit(app);
+        char msg[64];
+        std::snprintf(msg, sizeof msg, "VG edit applied (%d VG entries)",
+                      static_cast<int>(app.params.vgs.size()));
+        logLine(msg);
     }
 
     // ---- STL import flow ----
@@ -1255,6 +1316,9 @@ int main(int argc, char** argv) {
         logClose();
         return 1;
     }
+
+    // Baseline configuration line: incident reports begin with a known state.
+    logLine(configSummary(app));
 
     const int rc = selftest ? runSelftest(app) : runInteractive(app);
 

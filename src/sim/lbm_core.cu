@@ -466,11 +466,30 @@ __global__ void nanWatchdogKernel(const FPop* __restrict__ f,
     const long long cell = t * kWatchdogStride + offset;
     if (cell >= ncells) return;
     const long long pcell = cell + nxny;
-    float s = 0.0f;
+    float s = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
 #pragma unroll
-    for (int q = 0; q < kQ; ++q)
-        s += load_f(f, static_cast<long long>(q) * ncellsPad + pcell);
-    if (!isfinite(s)) *d_flag = 1; // benign race: any writer settles it to 1
+    for (int q = 0; q < kQ; ++q) {
+        const float fq = load_f(f, static_cast<long long>(q) * ncellsPad + pcell);
+        s += fq;
+        jx += d_cx[q] * fq;
+        jy += d_cy[q] * fq;
+        jz += d_cz[q] * fq;
+    }
+    // Two failure modes, two flag values (benign races: any writer wins):
+    //   1 = non-finite populations (classic NaN/Inf divergence);
+    //   2 = velocity runaway — the cell sits at (or beyond) the collision
+    //       limiter's cap, meaning the limiter is the only thing standing
+    //       between this state and NaN. A healthy flow never reaches the cap,
+    //       so a sampled cell pinned there is a diverged field even though
+    //       every number in it is still finite (the "whole domain turns red"
+    //       state). 0.95x: catch cells the limiter clamped EXACTLY to the cap.
+    if (!isfinite(s)) {
+        *d_flag = 1;
+    } else {
+        const float speed2 = (jx * jx + jy * jy + jz * jz) / fmaxf(s * s, 1e-12f);
+        const float cap = 0.95f * kMaxSimSpeed;
+        if (speed2 > cap * cap) *d_flag = 2;
+    }
 }
 
 // ===========================================================================

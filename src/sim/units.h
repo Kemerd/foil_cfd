@@ -37,7 +37,13 @@ inline constexpr float kNuAir = 1.48e-5f;
 inline constexpr float kTRTMagicLambda = 3.0f / 16.0f;
 
 /// Smagorinsky constant for the LES subgrid model (plan section 4.1).
-inline constexpr float kSmagorinskyCs = 0.12f;
+/// 0.1733 is the Smagorinsky-Lilly derivation C = (1/pi)*(2/(3*C_K))^(3/4)
+/// with Kolmogorov constant C_K = 3/2 — the value proven out by GPU-LBM aero
+/// runs at effectively unbounded Reynolds number. The previous 0.12 gave
+/// less than HALF the eddy damping (the prefactor goes with Cs^2) and let
+/// separated shear layers at high AoA run away at the tau stability clamp
+/// (deep-stall divergence around 2 flow-throughs).
+inline constexpr float kSmagorinskyCs = 0.1733f;
 
 // ---------------------------------------------------------------------------
 // User-facing physical inputs.

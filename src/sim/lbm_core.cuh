@@ -193,7 +193,9 @@ struct DeviceLatticeView {
 struct StepParams {
     float tau         = 0.6f;   ///< Relaxation time this step (startup ramp varies it).
     float magicLambda = 3.0f / 16.0f; ///< TRT magic parameter (units.h kTRTMagicLambda).
-    float smagorinskyCs = 0.12f; ///< LES constant; 0 disables the eddy-viscosity term.
+    float smagorinskyCs = 0.1733f; ///< LES constant (Smagorinsky-Lilly value;
+                                   ///< see units.h kSmagorinskyCs); 0 disables
+                                   ///< the eddy-viscosity term.
     float uInlet      = 0.08f;  ///< Inlet x-velocity in lattice units (u_lat).
     bool  writeMacro  = true;   ///< Store rho/u/v/w this step (only when rendering needs it).
 };

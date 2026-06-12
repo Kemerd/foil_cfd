@@ -110,6 +110,7 @@ struct LBMSolver::Impl {
     long long stepsSinceWatchdog = 0;
     bool      nanPending = false;
     bool      nanLatched = false;
+    int       nanTripKind = 0;   ///< 1 = NaN/Inf, 2 = velocity runaway.
     float     tauAtTrip  = 0.0f;
 
     // Host flag copy (snapshot hashing, surface extraction).
@@ -200,10 +201,13 @@ struct LBMSolver::Impl {
             stepsAtLastForceFold = stepsAtForceLaunch;
             forcePending = false;
         }
-        // Watchdog verdict.
+        // Watchdog verdict. Flag 1 = non-finite populations, flag 2 = a cell
+        // pinned at the collision limiter's velocity cap (diverged-but-finite
+        // runaway) — both latch the pause; the diagnosis text distinguishes.
         if (nanPending && eventDone(evNan)) {
             if (*hNan != 0) {
                 nanLatched = true;
+                nanTripKind = *hNan;
                 tauAtTrip = effectiveTau();
             }
             nanPending = false;
@@ -446,6 +450,7 @@ void LBMSolver::reset() {
     s.stepsAtForceLaunch = s.stepsAtLastForceFold = 0;
     s.nanLatched = false;
     s.nanPending = false;
+    s.nanTripKind = 0;
     s.stepsSinceWatchdog = 0;
     s.midStamp = -1;
     cudaMemsetAsync(s.nanDev, 0, sizeof(int), s.stream);
@@ -758,9 +763,12 @@ std::string LBMSolver::nanDiagnosis() const {
     // The two usual suspects (plan 4.5): lattice Mach too high, or the run
     // is pinned at the tau stability clamp (target Re unreachable).
     std::snprintf(buf, sizeof buf,
-        "NaN detected at step %lld. u_lat = %.4f (cap %.2f)%s; tau at trip = "
+        "%s at step %lld. u_lat = %.4f (cap %.2f)%s; tau at trip = "
         "%.5f (clamp %.4f)%s. Likely cause: %s. Try a lower airspeed, a finer "
         "chord resolution, or the Fast preset.",
+        s.nanTripKind == 2 ? "Velocity runaway (field saturated at the "
+                             "stability limiter)"
+                           : "NaN detected",
         s.steps, s.scaling.u_lat, kMaxULat,
         (s.scaling.u_lat > 0.1f ? " — HIGH" : ""),
         s.tauAtTrip, kMinTau,
