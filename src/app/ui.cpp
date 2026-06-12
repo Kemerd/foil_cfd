@@ -1494,6 +1494,44 @@ void drawVelocityLegend(UIContext& ctx) {
     ImGui::End();
 }
 
+// ===========================================================================
+// Divergence modal: a centered, unmissable popup when the NaN watchdog trips.
+// The in-panel red box still exists, but it lives in the Sim panel which can
+// be hidden behind another tab — a silently frozen sim looked like a bug.
+// ===========================================================================
+
+void drawDivergenceModal(UIContext& ctx) {
+    UIReadouts& r = *ctx.readouts;
+    UIEvents& ev = *ctx.events;
+
+    // Rising edge -> open exactly once per latch (a cold reset clears the
+    // watchdog latch, re-arming this for any future trip).
+    static bool wasTripped = false;
+    if (r.nanTripped && !wasTripped) ImGui::OpenPopup("Simulation diverged");
+    wasTripped = r.nanTripped;
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(480.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Simulation diverged", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(kColBad, "The flow field hit a numeric blow-up (NaN).");
+        ImGui::TextWrapped("%s", r.nanDiagnosis.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Restart simulation", ImVec2(160, 0))) {
+            ev.resetCold = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep paused", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void drawStatusOverlay(const UIContext& ctx) {
     if (ctx.statusMessage.empty()) return;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1555,6 +1593,7 @@ void drawUI(UIContext& ctx) {
     drawReadoutsPanel(ctx);
     drawViewPanel(ctx);
     drawStlImportModal(ctx);
+    drawDivergenceModal(ctx);
     drawVelocityLegend(ctx);
     drawStatusOverlay(ctx);
 }
