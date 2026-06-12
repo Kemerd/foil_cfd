@@ -17,6 +17,13 @@ interactive 3D visualizer. On an RTX 5090 it pushes **~8 billion lattice updates
 on a 23.6M-cell grid — about 340 full solver steps every second, while rendering. That's not
 "fast for CFD." That's a wind tunnel with a framerate.
 
+And it's a wind tunnel with a **wall-modeled boundary layer**. To our knowledge, FoilCFD is
+the only publicly available solver that runs wall-modeled LBM-LES in real time on a consumer
+GPU — the technique that lets the simulation carry flight-Reynolds wall physics instead of
+separating a quarter-chord too early. The wall-modeled heavyweights run on clusters,
+overnight. The real-time GPU codes skip the wall model. This one does both at once —
+[details below](#the-wall-model-why-this-one-is-different).
+
 ### Sim time vs. wall time
 
 One lattice step advances physical time by `dt = u_lat × dx / airspeed` (derived in
@@ -58,6 +65,40 @@ Not drilling holes in anything yet? It's still mostly about airplanes — but th
 doesn't check your pilot's license. Any watertight STL flies here (see
 [Custom STL import](#custom-stl-import)): drones, fairings, whatever you're curious about.
 
+## The wall model (why this one is different)
+
+Here's the dirty secret of fast CFD: at flight Reynolds numbers the viscous sublayer of a
+boundary layer is a fraction of a millimeter thick. No interactive grid on Earth resolves
+it — so fast solvers historically just... didn't. Under-resolved walls under-predict skin
+friction, the boundary layer runs out of momentum too soon, and the flow **separates too
+early**. For a tool whose entire job is "where does the flow separate and what do VGs do
+about it," that's not a rounding error. That's lying about the headline.
+
+FoilCFD closes that gap with an **iMEM slip-velocity wall function** (Asmuth et al. 2021;
+see [docs/CITATIONS.md](docs/CITATIONS.md)): every surface cell continuously solves the
+Reichardt law of the wall for its local friction velocity and prescribes exactly the wall
+shear stress a real turbulent boundary layer would exert — on the stair-step voxel surface,
+on both grid levels of the refinement patch, with the modeled stress carried into the Cl/Cd
+readouts. The 45° stair facets get true 45° normals. VG vanes keep exact no-slip walls (a
+vortex generator's job is to BE an obstacle). The Sim panel shows the live y+ telemetry so
+you always know what the model is doing.
+
+**As far as we can tell, nothing else publicly available does this in real time** — wall-
+modeled LBM-LES exists in cluster-class commercial codes (overnight turnaround, five-figure
+seats) and in research papers; real-time GPU LBM codes run plain bounce-back walls. FoilCFD
+runs the wall model live, on one consumer GPU, in a tool that's free for noncommercial use.
+First polar check on the LS(1)-0413 (Glasair III section): wall-modeled CL_max landed
+between the NASA wind-tunnel curves bracketing the target Reynolds number — exactly where
+an honest simulation should sit — with no premature separation. The validation polar tool
+(`polar_ls413`) reproduces this; full numbers in [validation/](validation/).
+
+The model knows its limits, and enforces them: below y+ ≈ 3 (sublayer genuinely resolved)
+it fades itself out and hands the wall back to plain bounce-back; at stagnation and inside
+separated zones (no meaningful tangential flow) it steps aside automatically; and a safety
+clamp plus live "clamped cells" telemetry tells you if it's ever fighting the resolved flow
+instead of helping it. Auto mode turns it on only when the grid actually can't resolve the
+sublayer.
+
 ## The honesty section
 
 Read this before you drill holes in your wing:
@@ -65,14 +106,19 @@ Read this before you drill holes in your wing:
 - **Trust deltas, not absolutes.** VG-on vs. VG-off on the identical grid is meaningful.
   An absolute Cl at flight Reynolds number is not a certification value.
 - **Effective Reynolds number is displayed, always.** Your wing flies at Re ~2-6 million;
-  the solver runs at the highest stable effective Re it can (typically 1e4–1e5 at default
-  resolution) and tells you both numbers. Separation trends, vortex topology, and VG
-  placement behavior carry over; boundary-layer-resolved drag counts do not.
+  the outer flow runs at the highest stable effective Re it can (typically 1e4–1e5 at
+  default resolution) and tells you both numbers. The wall model closes the wall-physics
+  half of that gap — the surface now exerts flight-Re turbulent stress — but transition
+  and outer-flow turbulence content still belong to the effective Re.
+- **The wall function is an equilibrium model.** It assumes an attached, mildly-loaded
+  turbulent profile — which makes it slightly attachment-happy right at incipient stall
+  (a known property of every equilibrium wall function ever shipped). Absolute CL_max
+  reads a touch optimistic; VG-on/VG-off deltas share the bias and cancel it.
 - **High Fidelity mode** trades interactivity for accuracy: finer grids (Fine/Ultra
   presets), lower lattice Mach, force averaging over many flow-throughs. Dual-resolution
   Richardson trend extrapolation with an error bar on deltas is on the v1.x roadmap.
-- **Walls are stair-stepped voxels** with half-way bounce-back. Good enough for trends;
-  not a panel-method polish.
+- **Walls are stair-stepped voxels** with half-way bounce-back — now wall-modeled (see
+  above), so the stress on them is honest even when the geometry is chunky.
 - Forces are gated until the flow has actually developed (two flow-throughs minimum) —
   the readout refuses to lie to you while the tunnel is still spinning up.
 
@@ -120,7 +166,17 @@ The **guidance panel** shows the simulated boundary-layer thickness (δ99) at yo
 station and the published recommended ranges: VG height 0.1–1.0 δ99 (low-profile sweet spot
 0.2–0.5), placement 5–10 vane-heights upstream of separation onset (Lin 2002), with a
 one-click flight-proven preset (x/c ≈ 0.07, ±15° counter-rotating, l = 3h — Strausak 2021).
-If your VG is under-resolved on the current grid, the UI says so instead of rendering noise.
+If your VG is under-resolved on the current grid, the UI says so instead of rendering noise —
+and the Mesh panel can **auto-raise the patch factor** until every vane clears its minimum
+resolved height.
+
+Then the **vortex strength audit** checks the result like a skeptical wind-tunnel tech: it
+integrates the streamwise circulation actually shed by your vanes from a crossflow plane
+behind the row, subtracts the ambient-vorticity floor, and compares it against the Wendt
+correlation (NASA/CR-2001-211144) evaluated at your *live* local edge velocity and
+boundary-layer thickness. Green means the voxelized vane sheds what real hardware sheds and
+the placement deltas are worth believing; red means buy more resolution before trusting the
+number. No other VG tool tells you when it's guessing. This one does.
 
 ## Custom STL import
 
@@ -159,9 +215,9 @@ is untouched: it runs identically on both levels.
 - **Forces measured on the fine grid** whenever the patch covers every solid cell (the Mesh
   panel shows which grid the momentum exchange ran on).
 - Honesty note: the effective Reynolds number is **shared across levels** — the patch buys
-  resolution at the same Re, not a higher Re. Wall-function boundary conditions (a separate
-  technique that models, rather than resolves, the inner boundary layer) are possible future
-  work.
+  resolution at the same Re, not a higher Re. The inner boundary layer is handled by the
+  [wall model](#the-wall-model-why-this-one-is-different), which runs on both levels and
+  rebuilds itself automatically whenever the patch or the geometry changes.
 
 The **Mesh** panel (tabbed with Sim/View) has the resolution selector (Off/2×/3×/4×), four
 margin sliders (upstream/wake/above/below, in chords around the foil+VG bounding box), a
@@ -209,11 +265,22 @@ follow Lehmann's work on GPU-LBM (Esoteric Pull, mixed-precision storage — see
 ## Validation
 
 The solver isn't taken on faith: the CTest suite runs Taylor–Green decay (M0), lid-driven
-cavity vs. Ghia et al. reference profiles (M1), and cylinder vortex shedding vs. the
-canonical Strouhal band (M2) on the GPU, plus parser/units/voxelizer unit tests. Measured
-results live in [notes/VALIDATION.md](notes/VALIDATION.md). Solver-QA anchors (digitized
-NASA lift curves for the LS(1)-0413 family, XFOIL polars) live in
-[validation/](validation/README.md).
+cavity vs. Ghia et al. reference profiles (M1), cylinder vortex shedding vs. the canonical
+Strouhal band (M2), and two-level refinement coupling (M3) on the GPU, plus
+parser/units/voxelizer/wall-list/audit-math unit tests.
+
+The wall model gets its own gauntlet: **M4** plants a synthetic Reichardt boundary layer
+with a known friction velocity and demands the model read it back (recovered within 8%),
+hold it in equilibrium without ringing, and step aside completely at resolved-sublayer
+Reynolds numbers (ON vs. OFF force delta: 0.10%). **M5** runs the full pipeline on a real
+airfoil: VG rows measurably re-attach the aft suction surface, shed circulation rises with
+patch resolution, and the audit's measurement infrastructure holds under every toggle.
+
+Measured results live in [notes/VALIDATION.md](notes/VALIDATION.md). Solver-QA anchors
+(digitized NASA lift curves for the LS(1)-0413 family, XFOIL polars) live in
+[validation/](validation/README.md), alongside the wall-modeled lift polar from the
+`polar_ls413` tool — whose CL_max lands between the bracketing NASA wind-tunnel curves at
+the target Reynolds number.
 
 ## License
 

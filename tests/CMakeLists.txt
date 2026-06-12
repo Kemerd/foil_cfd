@@ -121,6 +121,18 @@ add_executable(m5_integration
 target_link_libraries(m5_integration PRIVATE foilcfd_test_sim)
 add_test(NAME m5_integration COMMAND m5_integration)
 
+# Manual validation tool (deliberately NOT registered with CTest): the
+# LS(1)-0413 lift-polar sweep against the digitized NASA TM X-72843 curves,
+# wall model on/off. ~15 minutes of GPU time; run from the repo root so the
+# CSV lands in validation/.
+add_executable(polar_ls413
+    polar_ls413.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp)
+target_link_libraries(polar_ls413 PRIVATE foilcfd_test_sim)
+target_compile_definitions(polar_ls413 PRIVATE
+    FOILCFD_AIRFOIL_DIR="${CMAKE_SOURCE_DIR}/airfoils")
+
 # The "gpu" label lets machines without an NVIDIA card (or CI) skip every
 # device-touching test in one flag: ctest -LE gpu.
 set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder m3_refine
