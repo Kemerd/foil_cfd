@@ -401,6 +401,19 @@ Single CUDA stream; interop map/unmap brackets only the GL-touching kernels.
   idempotent/resumable (skip existing). The database is small enough to commit to the repo once
   fetched. App scans `airfoils/` recursively.
 
+## 15.5 Aircraft → airfoil manifest (fun + practical feature)
+- `airfoils/aircraft_manifest.csv` maps popular aircraft (Glasair, Lancair, Van's RV, Cirrus,
+  Cessna, etc — homebuilts first) to their airfoil sections. Columns:
+  `manufacturer,model,category,airfoil_root,airfoil_tip,dat_root,dat_tip,notes`.
+  Primary source: Lednicer's *Incomplete Guide to Airfoil Usage* (m-selig.ae.illinois.edu/ads/aircraft.html).
+- **UI:** an "Aircraft" submenu in the Airfoil panel with a search bar (filter on
+  manufacturer+model); selecting an aircraft loads `dat_root` from `airfoils/` (uiuc/
+  included); rows with no on-disk `.dat` show greyed with a "coordinates not in database"
+  hint. Show root/tip toggle when both are known, and the notes line.
+- User-editable: plain CSV, documented in `airfoils/MANIFEST_README.md`; app re-reads on the
+  airfoils refresh button. Disclaimer in UI tooltip: manufacturers modify sections — verify
+  before trusting (same trust-deltas spirit as the Mission statement).
+
 ## 16. README requirements
 Screenshots (M4 pair), 60-second quickstart, the fidelity-honesty section (§1 non-goals),
 UIUC database link + note that users drop `.dat` files into `airfoils/`, STL caveats (§7.4),
