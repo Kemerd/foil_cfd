@@ -119,8 +119,10 @@ Read this before you drill holes in your wing:
 - **High Fidelity mode** trades interactivity for accuracy: finer grids (Fine/Ultra
   presets), lower lattice Mach, force averaging over many flow-throughs. Dual-resolution
   Richardson trend extrapolation with an error bar on deltas is on the v1.x roadmap.
-- **Walls are stair-stepped voxels** with half-way bounce-back — now wall-modeled (see
-  above), so the stress on them is honest even when the geometry is chunky.
+- **The foil is stair-stepped voxels** with half-way bounce-back — now wall-modeled (see
+  above), so the stress on it is honest even when the geometry is chunky. The VG vanes go
+  further and get sub-cell-accurate surfaces (q-LIBB), so the one place a sharp slanted edge
+  matters most isn't a staircase.
 - Forces are gated until the flow has actually developed (two flow-throughs minimum) —
   the readout refuses to lie to you while the tunnel is still spinning up.
 
@@ -236,7 +238,24 @@ rescaled to the fine level so the strain rate — and therefore the stress — c
 the interface correctly. After its sub-steps the fine solution is restricted (averaged,
 inverse-rescaled, and blended over a few-cell ramp at the patch edge so no spurious vortex
 sheet forms at the hand-off) back onto the coarse grid. The fused collision kernel itself
-is untouched: it runs identically on both levels.
+is untouched: it runs identically on every level.
+
+**The interface, kept clean:** a resolution jump is an aliasing trap — under-resolved
+high-wavenumber content dumps energy into the lattice's non-hydrodynamic "ghost" modes and
+radiates a grid-aligned haze of spurious vortices off the patch faces (Astoul et al. 2020).
+FoilCFD suppresses it at the source: the populations crossing the interface are
+**regularized** — projected onto the physical stress tensor (Latt–Chopard) so only the
+hydrodynamic part carries across — and the restriction **filters** the non-equilibrium part
+over its lattice neighbours (Lagrava et al. 2012). Together they keep the hand-off seamless
+enough that a third level can stand on top of it.
+
+**A third level, just for the VGs:** because the kernels are level-agnostic, the fine patch
+itself hosts an even finer **nested box hugging only the vortex generators**, running at 2×
+the fine factor (so 4× the coarse grid with the default 2× patch). The vanes shed their
+vortices at the finest resolution in the solver while the rest of the foil stays at 2× — far
+cheaper than refining the whole wing to 4×, since the box is tiny. It builds automatically
+when VGs are present and tears itself down gracefully (and silently falls back to 2×-only) if
+it can't fit. Toggle it with **"Finer VG patch (4×)"** in the Mesh panel.
 
 **What you get:**
 - **m× wall resolution** on the foil, the VG vanes, and the boundary layer the VG guidance
@@ -259,15 +278,17 @@ actual stair-step voxelization — coarse cubes outside the patch, 1/m-size cube
 The definitive way to judge whether a VG vane is adequately resolved before trusting its
 delta.
 
-## Faster startups (mesh sequencing)
+## Clean startups (no impulsive shock)
 
-Every cold start (geometry, AoA, airspeed, VG edits) first converges a **4×-coarser
-companion sim** — 1/64th the cells, a second or two of wall time — then trilinearly
-upsamples that developed flow onto the full grid and continues. The wake and circulation
-are already in place instead of convecting in from an impulsive start, so the Cl/Cd gate
-opens far sooner. The readouts stay gated through a settle window while the full-resolution
-grid re-adjusts the upsampled field; the usual trust-deltas rule applies unchanged. Toggle
-it in the Mesh panel (on by default; sections only — STL imports start cold).
+A fresh run can't just teleport the air to full speed past a stationary wing — that leaves a
+moving fluid against a flat pressure field, which isn't a valid flow state, so the first
+collisions fire off an acoustic pressure shock that rings off the leading and trailing edges
+(and, on a tau-clamped grid, can take the patch with it). Real wind tunnels spin up; so does
+this one. Every cold start (geometry, AoA, airspeed, VG edits) **initializes the field at
+rest and ramps the inlet velocity up to speed** with a smooth easing, alongside the existing
+startup viscosity ramp. The pressure field develops around the body instead of slamming into
+it — no shock, no startup artifacts, and in the velocity view the flow visibly fades in as it
+accelerates. The force readouts stay gated until the flow has developed regardless.
 
 ## How it works (one paragraph)
 
@@ -295,8 +316,9 @@ follow Lehmann's work on GPU-LBM (Esoteric Pull, mixed-precision storage — see
 
 The solver isn't taken on faith: the CTest suite runs Taylor–Green decay (M0), lid-driven
 cavity vs. Ghia et al. reference profiles (M1), cylinder vortex shedding vs. the canonical
-Strouhal band (M2), and two-level refinement coupling (M3) on the GPU, plus
-parser/units/voxelizer/wall-list/audit-math unit tests.
+Strouhal band (M2), two-level refinement coupling (M3), and the nested three-level coupling
+(a solid-free freestream stays uniform to round-off through both interfaces) on the GPU, plus
+parser/units/voxelizer/wall-list/audit-math and q-LIBB cut-fraction geometry unit tests.
 
 The wall model gets its own gauntlet: **M4** plants a synthetic Reichardt boundary layer
 with a known friction velocity and demands the model read it back (recovered within 8%),
