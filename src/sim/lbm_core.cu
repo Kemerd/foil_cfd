@@ -325,8 +325,28 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
         jy += d_cy[q] * fpop[q];
         jz += d_cz[q] * fpop[q];
     }
+    // Density floor: a pathological transient can drag a cell's mass toward
+    // (or below) zero, and 1/rho would then catapult the velocity to infinity
+    // in one step. fmaxf also scrubs a NaN rho to the floor value (IEEE: the
+    // non-NaN operand wins), cutting that propagation path too.
+    rho = fmaxf(rho, 0.05f);
     const float invRho = 1.0f / rho;
-    const float ux = jx * invRho, uy = jy * invRho, uz = jz * invRho;
+    float ux = jx * invRho, uy = jy * invRho, uz = jz * invRho;
+
+    // Local stability limiter: the second-order equilibrium below is only
+    // valid for |u| well under cs (~0.577); once a cell overshoots ~0.3 at
+    // the tau clamp, the feq error feeds back through the collision and the
+    // cell runs away to NaN within a few steps (seen as the deterministic
+    // ~step-3600 divergence on aggressive sections at coarse grids). Rescale
+    // the velocity VECTOR (direction preserved) onto the validity bound; the
+    // collision then relaxes the populations toward this bounded equilibrium,
+    // dissipating the spike instead of amplifying it. Normal flow (|u| ~ 0.1)
+    // never engages this branch, so resolved physics is untouched.
+    const float u2 = ux * ux + uy * uy + uz * uz;
+    if (u2 > kMaxSimSpeed * kMaxSimSpeed) {
+        const float s = kMaxSimSpeed * rsqrtf(u2);
+        ux *= s; uy *= s; uz *= s;
+    }
 
     float feq[kQ];
     equilibrium19(rho, ux, uy, uz, feq);

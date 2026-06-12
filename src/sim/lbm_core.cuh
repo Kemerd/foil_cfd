@@ -70,6 +70,15 @@ inline constexpr float kW[kQ] = {
 /// Lattice speed of sound squared: cs^2 = 1/3 for D3Q19.
 inline constexpr float kCs2 = 1.0f / 3.0f;
 
+/// Hard validity bound on the LOCAL lattice velocity inside the collision
+/// (distinct from units.h kMaxULat, which caps the INLET speed): the
+/// second-order equilibrium expansion degrades rapidly past ~0.3 and a cell
+/// that overshoots it at the tau clamp runs away to NaN within a few steps.
+/// The fused kernel rescales any over-speed cell's velocity onto this bound
+/// before forming the equilibrium — a standard LBM stabilization that never
+/// engages in healthy flow (|u| ~ 0.1).
+inline constexpr float kMaxSimSpeed = 0.30f;
+
 // ===========================================================================
 // Population storage type + accessors (plan section 11, Lehmann PRE 106
 // 015308): the solver is memory-bandwidth bound, so FP16 *storage* with FP32
