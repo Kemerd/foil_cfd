@@ -538,10 +538,9 @@ struct Visualizer::Impl {
     GLint uPViewProj = -1, uPPointSize = -1, uPColormap = -1, uPAlpha = -1;
     GLint uSViewProj = -1, uSTex = -1;
     GLint uMViewProj = -1, uMEye = -1;
-    // Q raycast: + scene-depth occlusion (uQDepth/uQViewport/uQClip) and the
-    // optional velocity coloring (uQSpeedVol/uQColorByVel/uQColormap).
+    // Q isosurface: opaque first-hit raycast — writes gl_FragDepth, so the
+    // hardware z-buffer handles occlusion (no scene-depth texture needed).
     GLint uQViewProj = -1, uQDims = -1, uQEye = -1, uQThresh = -1, uQVol = -1;
-    GLint uQDepth = -1, uQViewport = -1, uQInvVP = -1;
     GLint uQSpeedVol = -1, uQColorByVel = -1, uQColormap = -1;
     // Velocity volume (the hero wind-tunnel smoke mode).
     GLint uVViewProj = -1, uVDims = -1, uVEye = -1, uVVol = -1, uVDepth = -1;
@@ -852,9 +851,6 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
         impl_->uQEye      = glGetUniformLocation(impl_->progQ, "uEye");
         impl_->uQThresh   = glGetUniformLocation(impl_->progQ, "uThreshold");
         impl_->uQVol      = glGetUniformLocation(impl_->progQ, "uVolume");
-        impl_->uQDepth     = glGetUniformLocation(impl_->progQ, "uSceneDepth");
-        impl_->uQViewport  = glGetUniformLocation(impl_->progQ, "uViewport");
-        impl_->uQInvVP     = glGetUniformLocation(impl_->progQ, "uInvViewProj");
         impl_->uQSpeedVol  = glGetUniformLocation(impl_->progQ, "uSpeedVolume");
         impl_->uQColorByVel = glGetUniformLocation(impl_->progQ, "uColorByVel");
         impl_->uQColormap  = glGetUniformLocation(impl_->progQ, "uColormap");
@@ -1188,14 +1184,17 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
     }
 
     const bool doParticles = settings.showParticles && im.posRes && im.particleCount > 0;
+    // Cadences are anchored at frame 1 (frame counter pre-increments above)
+    // so a freshly enabled mode fills its texture THIS frame instead of
+    // showing an empty volume for up to N frames.
     const int qEvery = std::max(settings.qUpdateEveryNFrames, 1);
     const bool doQ = settings.showQRaycast && im.qTex
-                  && (im.frame % static_cast<unsigned long long>(qEvery) == 0);
+                  && ((im.frame - 1) % static_cast<unsigned long long>(qEvery) == 0);
     // Velocity volume fill: on its update cadence, whenever the mode OR the Q
     // velocity coloring needs fresh speed data in the texture.
     const int volEvery = std::max(settings.volumeUpdateEveryNFrames, 1);
     const bool doVel = wantVel && im.velTex
-                    && (im.frame % static_cast<unsigned long long>(volEvery) == 0);
+                    && ((im.frame - 1) % static_cast<unsigned long long>(volEvery) == 0);
 
     // ---- gather the resources this frame actually touches -------------------
     cudaGraphicsResource* resources[7];
@@ -1301,7 +1300,9 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
                            int viewportWidth, int viewportHeight) {
     Impl& im = *impl_;
     glViewport(0, 0, viewportWidth, viewportHeight);
-    glClearColor(0.043f, 0.051f, 0.070f, 1.0f); // deep slate; additive-friendly
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // pure black: the hero isosurface
+                                          // and additive particles both read
+                                          // best against zero background
     glClearDepth(1.0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!im.initialized || viewportWidth <= 0 || viewportHeight <= 0) return;
@@ -1385,19 +1386,53 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    // ---- 2.5 capture the opaque scene depth (mesh + slices have written it)
-    // into a texture so the raymarch passes below can terminate at the foil
-    // surface. Particles draw next but don't write depth (additive glow), so
-    // capturing here gives the volume the correct occluder silhouette. Only
-    // needed when a raymarch pass will actually run this frame. --
+    // ---- 3. Q-criterion isosurface (opaque, depth-writing) ------------------
+    // First-hit raycast drawn like solid geometry: the fragment stage writes
+    // the hit's true depth, so the z-buffer resolves foil-vs-filament
+    // occlusion both ways and later passes are occluded by the vortex skins.
+    // Back faces rasterize (front culled) so the march still covers the
+    // volume with the camera inside the domain box.
     const bool willVol = settings.showVelocityVolume && im.volAvailable
                       && im.velTex;
     const bool willQ = settings.showQRaycast && im.qAvailable && im.qTex;
-    if (willVol || willQ) {
+    if (willQ) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);
+        glUseProgram(im.progQ);
+        glUniformMatrix4fv(im.uQViewProj, 1, GL_FALSE, viewProj.m);
+        glUniform3f(im.uQDims, static_cast<float>(im.dims.nx),
+                    static_cast<float>(im.dims.ny), static_cast<float>(im.dims.nz));
+        glUniform3f(im.uQEye, eye.x, eye.y, eye.z);
+        glUniform1f(im.uQThresh, std::clamp(settings.qThreshold, 0.005f, 0.99f));
+        // Velocity coloring only when the speed volume actually exists.
+        const bool qColorVel = settings.qColorByVelocity && im.velTex != 0;
+        glUniform1i(im.uQColorByVel, qColorVel ? 1 : 0);
+        glUniform1i(im.uQColormap, static_cast<int>(settings.qColormap));
+        // Unit 0: Q volume, unit 1: speed volume.
+        glUniform1i(im.uQVol, 0);
+        glUniform1i(im.uQSpeedVol, 1);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_3D, im.qTex);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_3D, qColorVel ? im.velTex : im.qTex);
+        glBindVertexArray(im.cubeVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_3D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_3D, 0);
+        glDisable(GL_CULL_FACE);
+    }
+
+    // ---- 3.5 capture the opaque scene depth (mesh + slices + Q skins have
+    // all written it) into a texture so the translucent fog below terminates
+    // at solid surfaces. Particles draw later but don't write depth (additive
+    // glow). Only needed when the fog pass actually runs this frame. --
+    if (willVol) {
         im.captureSceneDepth(viewportWidth, viewportHeight);
     }
 
-    // ---- 3. particles: additive, depth-TESTED against the mesh but not
+    // ---- 4. particles: additive, depth-TESTED against the mesh but not
     // depth-written (a million points writing depth would occlude each other
     // and flicker) — plan 9.1.
     if (settings.showParticles && im.particleCount > 0) {
@@ -1459,51 +1494,6 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glBindTexture(GL_TEXTURE_2D, im.depthTex);
         glBindVertexArray(im.cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_3D, 0);
-        glDisable(GL_CULL_FACE);
-        glDepthMask(GL_TRUE);
-        glDisable(GL_BLEND);
-    }
-
-    // ---- 5. Q-criterion raycast (translucent, last) ---------------------------
-    if (willQ) {
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDepthMask(GL_FALSE);
-        // Rasterize BACK faces so the march still covers the volume when the
-        // camera moves inside the domain box.
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_FRONT);
-        glUseProgram(im.progQ);
-        glUniformMatrix4fv(im.uQViewProj, 1, GL_FALSE, viewProj.m);
-        glUniform3f(im.uQDims, static_cast<float>(im.dims.nx),
-                    static_cast<float>(im.dims.ny), static_cast<float>(im.dims.nz));
-        glUniform3f(im.uQEye, eye.x, eye.y, eye.z);
-        glUniform1f(im.uQThresh, std::clamp(settings.qThreshold, 0.005f, 0.99f));
-        glUniform2f(im.uQViewport, static_cast<float>(viewportWidth),
-                    static_cast<float>(viewportHeight));
-        glUniformMatrix4fv(im.uQInvVP, 1, GL_FALSE, invVP);
-        // Velocity coloring only when the speed volume actually exists.
-        const bool qColorVel = settings.qColorByVelocity && im.velTex != 0;
-        glUniform1i(im.uQColorByVel, qColorVel ? 1 : 0);
-        glUniform1i(im.uQColormap, static_cast<int>(settings.volumeColormap));
-        // Unit 0: Q volume, unit 1: scene depth, unit 2: speed volume.
-        glUniform1i(im.uQVol, 0);
-        glUniform1i(im.uQDepth, 1);
-        glUniform1i(im.uQSpeedVol, 2);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_3D, im.qTex);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, im.depthTex);
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_3D, qColorVel ? im.velTex : im.qTex);
-        glBindVertexArray(im.cubeVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 36);
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_3D, 0);
-        glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_3D, 0);

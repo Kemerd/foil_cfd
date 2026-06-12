@@ -1063,7 +1063,7 @@ void drawViewPanel(UIContext& ctx) {
     UIEvents& ev = *ctx.events;
     if (!ImGui::Begin("View")) { ImGui::End(); return; }
 
-    static const char* kMaps3[] = {"Viridis", "Coolwarm", "Inferno"};
+    static const char* kMaps4[] = {"Viridis", "Coolwarm", "Inferno", "Rainbow"};
 
     ImGui::TextDisabled("MODES");
 
@@ -1075,7 +1075,7 @@ void drawViewPanel(UIContext& ctx) {
     if (p.viz.showVelocityVolume) {
         ImGui::Indent();
         int vm = static_cast<int>(p.viz.volumeColormap);
-        if (ImGui::Combo("Palette", &vm, kMaps3, 3))
+        if (ImGui::Combo("Palette", &vm, kMaps4, 4))
             p.viz.volumeColormap = static_cast<Colormap>(vm);
         // Slow-air haze: floor opacity for undisturbed air. NOT a hard cull —
         // low but non-zero by default so the body stays faintly visible.
@@ -1112,6 +1112,11 @@ void drawViewPanel(UIContext& ctx) {
         // Color the cores by local speed (shares the velocity volume) instead
         // of the flat cyan tint.
         ImGui::Checkbox("Color by velocity", &p.viz.qColorByVelocity);
+        if (p.viz.qColorByVelocity) {
+            int qm = static_cast<int>(p.viz.qColormap);
+            if (ImGui::Combo("Palette##q", &qm, kMaps4, 4))
+                p.viz.qColormap = static_cast<Colormap>(qm);
+        }
         ImGui::Unindent();
     }
 
@@ -1145,7 +1150,7 @@ void drawViewPanel(UIContext& ctx) {
         if (ImGui::Combo("Color by", &cb, kColorBy, 2))
             p.viz.particleColorBy = static_cast<ParticleColorBy>(cb);
         int cm = static_cast<int>(p.viz.particleColormap);
-        if (ImGui::Combo("Colormap", &cm, kMaps3, 3))
+        if (ImGui::Combo("Colormap", &cm, kMaps4, 4))
             p.viz.particleColormap = static_cast<Colormap>(cm);
         ImGui::SliderFloat("Point size", &p.viz.particlePointSize, 0.5f, 4.0f,
                            "%.1f px");

@@ -118,15 +118,21 @@ struct VizSettings {
         {true,  SliceAxis::Z, -1, SliceField::VorticityZ, Colormap::Coolwarm, 1.0f},
     };
 
-    // -- Q-criterion raycast (mode 3, stretch — plan 9.1) --
-    bool  showQRaycast = false;   ///< Volume-raycast toggle (hotkey 3).
-    float qThreshold   = 0.15f;   ///< Iso threshold on the NORMALIZED Q in [0,1].
+    // -- Q-criterion isosurface (mode 3 — the default hero view) --
+    bool  showQRaycast = true;    ///< Default ON: opaque first-hit raycast of
+                                  ///< the Q-criterion vortex skins (hotkey 3).
+    float qThreshold   = 0.70f;   ///< Iso threshold on the NORMALIZED Q in [0,1].
+                                  ///< High enough that startup-perturbation
+                                  ///< noise in the freestream stays invisible;
+                                  ///< real shear/wake structures sit well above.
     float qScale       = 5e-5f;   ///< Q value mapped to 1.0 in the volume
                                   ///< texture (lattice 1/step^2 units).
     int   qUpdateEveryNFrames = 4;///< Recompute cadence (plan 9.1: every N frames).
-    bool  qColorByVelocity = true;///< Color the isosurface by local speed
-                                  ///< (shares the velocity volume) vs the
-                                  ///< fixed pale-cyan vortex-core tint.
+    bool  qColorByVelocity = true;///< Paint the isosurface with the local air
+                                  ///< speed (shares the velocity volume) vs
+                                  ///< the fixed pale-cyan vortex-core tint.
+    Colormap qColormap = Colormap::Rainbow; ///< Speed palette for the skins:
+                                  ///< blue slow -> green freestream -> red fast.
 };
 
 /// @brief Renderer + interop owner. Construction order contract: a current
