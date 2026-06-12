@@ -1160,6 +1160,11 @@ int runSelftest(App& app) {
         return 1;
     }
 
+    // TEMP TUNING: develop the flow well past the startup perturbation so the
+    // screenshot shows a representative freestream (revert to 100 after).
+    for (int b = 0; b < 99; ++b) {
+        if (app.solver.stepN(100) != cudaSuccess) break;
+    }
     // Timed half: wall-clock MLUPS over 100 fused steps, sync-bracketed so the
     // measurement covers exactly the lattice work (perf sanity, plan 4.6/11).
     const double t0 = platform::timerSeconds();
