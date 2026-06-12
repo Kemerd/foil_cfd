@@ -1,0 +1,76 @@
+manufacturer,model,category,airfoil_root,airfoil_tip,dat_root,dat_tip,notes
+Stoddard-Hamilton,Glasair I,homebuilt,NASA GA(W)-2,NASA GA(W)-2,ls413.dat,ls413.dat,GA(W)-2 = LS(1)-0413
+Stoddard-Hamilton,Glasair II,homebuilt,NASA GA(W)-2,NASA GA(W)-2,ls413.dat,ls413.dat,GA(W)-2 = LS(1)-0413
+Stoddard-Hamilton,Glasair III,homebuilt,NASA GA(W)-2 mod,NASA GA(W)-2 mod,ls413mod.dat,ls413mod.dat,factory-modified GA(W)-2
+Stoddard-Hamilton,GlaStar / Sportsman 2+2,homebuilt,NASA GA(W)-2,NASA GA(W)-2 mod,ls413.dat,ls413mod.dat,guide lists as Glastar; Sportsman uses same wing
+Lancair,320,homebuilt,NASA NLF(1)-0215F,NASA NLF(1)-0215F,nlf0215f.dat,nlf0215f.dat,laminar-flow section; sensitive to surface finish
+Lancair,360,homebuilt,NASA NLF(1)-0215F,NASA NLF(1)-0215F,nlf0215f.dat,nlf0215f.dat,laminar-flow section; sensitive to surface finish
+Lancair,Legacy,homebuilt,Cole GC10,Cole GC11,,,proprietary Cole sections; no public coordinates
+Lancair,IV / IV-P,homebuilt,McWilliams RXM5-217,NACA 64-212,,n64212.dat,root section proprietary; high-speed retract
+Lancair,ES / Super ES,homebuilt,McWilliams RXM5-217,NACA 64-212,,n64212.dat,root section proprietary; fixed-gear IV derivative
+Van's,RV-4,homebuilt,NACA 23013.5,NACA 23013.5,,,no 23013.5 file on disk; 23012/23015 are nearest
+Van's,RV-6 / RV-6A,homebuilt,NACA 23013.5,NACA 23013.5,,,no 23013.5 file on disk; 23012/23015 are nearest
+Van's,RV-7 / RV-7A,homebuilt,NACA 23013.5,NACA 23013.5,,,no 23013.5 file on disk; 23012/23015 are nearest
+Van's,RV-8 / RV-8A,homebuilt,NACA 23013.5,NACA 23013.5,,,no 23013.5 file on disk; 23012/23015 are nearest
+Van's,RV-9 / RV-9A,homebuilt,Roncz RV6T,Roncz RV6T,,,John Roncz section designed for the RV-9
+Van's,RV-10,homebuilt,16% custom airfoil,16% custom airfoil,,,Van's proprietary section per guide
+Van's,RV-12,LSA,NACA 23014.1,NACA 23014.1,,,no 23014.1 file on disk
+Van's,RV-14 / RV-14A,homebuilt,16% custom airfoil,16% custom airfoil,,,Van's proprietary section per guide
+Rutan,VariEze,homebuilt,GU25-5(11)8,NASA GA(W)-1 mod,gu255118.dat,ls417mod.dat,canard aircraft - main wing listed
+Rutan,Long-EZ,homebuilt,Roncz R1145MS,Eppler 1230 mod,r1145ms.dat,e1230.dat,later config; early used GU25-5(11)8; canard a/c
+Co-Z,Cozy Mark IV,homebuilt,Roncz R1145MS,Eppler 1230 mod,r1145ms.dat,e1230.dat,canard aircraft - main wing listed
+Velocity,Velocity,homebuilt,Roncz R1145MS,Eppler 1230 mod,r1145ms.dat,e1230.dat,canard aircraft - main wing listed
+Sonex,Sonex / Waiex,LSA,NACA 64-415,NACA 64-415,naca642415.dat,naca642415.dat,disk file is 64(2)-415 variant of 64-415
+Zenith,CH 601 XL,LSA,Riblett GA 35-A-415,Riblett GA 35-A-415,,,no Riblett coordinates on disk
+Zenith,CH 650,LSA,Riblett GA 35-A-415,Riblett GA 35-A-415,,,no Riblett coordinates on disk
+Zenith,CH 701,homebuilt,NACA 6515 mod,NACA 6515 mod,,,STOL; fixed LE slats; no 6515 file on disk
+Zenith,CH 750,homebuilt,NACA 6515 mod,NACA 6515 mod,,,not in guide; CH 701/801 family section - unverified
+Kitfox,Model I-III,homebuilt,Avid airfoil,Avid airfoil,,,proprietary Dean Wilson undercambered section
+Kitfox,Speedster / Lite,homebuilt,Riblett GA30U-612,Riblett GA30U-612,,,Model IV and later also moved to Riblett sections
+RANS,S-6 Coyote II,LSA,RANS airfoil,RANS airfoil,,,proprietary section per guide
+RANS,S-7 Courier,homebuilt,NACA 2412,NACA 2412,naca2412.dat,naca2412.dat,
+RANS,S-21 Outbound,homebuilt,Riblett 30A615,Riblett 30A615,,,not in guide; per RANS/Kitplanes specs
+Murphy,Rebel,homebuilt,NACA 4415 mod,NACA 4415 mod,naca4415.dat,naca4415.dat,disk file is unmodified 4415
+Thorp,T-18,homebuilt,NACA 63-412,NACA 63-412,n63412.dat,n63412.dat,
+Wittman,W-8/W-9/W-10 Tailwind,homebuilt,NACA 4309/0006,NACA 4309/0006,,,blended 4309/0006 section per guide; early W-8 pure 4309
+Rand Robinson,KR-2,homebuilt,RAF-48,RAF-48,raf48.dat,raf48.dat,
+Rand Robinson,KR-2S,homebuilt,AS5048,AS5045,as5048.dat,as5045.dat,Gopalarathnam/Selig sections
+Pitts,S-1C / S-1D,aerobatic,NACA M-6,NACA M-6,nacam6.dat,nacam6.dat,flat-wing Pitts
+Pitts,S-1S,aerobatic,NACA 63A015 (upper),NACA 0012 (lower),,n0012.dat,biplane: root col = upper wing; tip col = lower wing
+Pitts,S-2A / S-2B / S-2C,aerobatic,NACA 63A015 (upper),NACA 0012 (lower),,n0012.dat,biplane: root col = upper wing; tip col = lower wing
+Christen,Eagle II,aerobatic,Symmetrical 15%,Symmetrical 15%,,,guide gives no specific designation
+Barrows,Bearhawk,homebuilt,NACA 4412 mod,NACA 4412 mod,naca4412.dat,naca4412.dat,disk file is unmodified 4412
+Sling (TAF),Sling 2 / Sling LSA,LSA,NACA 4415,NACA 4415,naca4415.dat,naca4415.dat,not in guide; per Sling LSA POH
+Sling (TAF),Sling TSi,homebuilt,NACA 4415 mod,NACA 4415 mod,,,unverified; TSi wing is lower-profile rev of 4415 wing
+Sequoia,F.8L Falco,homebuilt,NACA 64-212.5,NACA 64-210,,naca64210.dat,Frati design; guide lists under Aviamilano/Sequoia
+Cessna,150,trainer,NACA 2412,NACA 0012,naca2412.dat,n0012.dat,
+Cessna,152,trainer,NACA 2412,NACA 0012,naca2412.dat,n0012.dat,
+Cessna,172 Skyhawk,GA-single,NACA 2412,NACA 2412 mod,naca2412.dat,naca2412.dat,1973+; early models 0012 tip; tip file unmodified
+Cessna,177 Cardinal,GA-single,NACA 2415/64A215,NACA 2412/64A212,,,1968+ blend; 1967 model was 64A215/64A212
+Cessna,182 Skylane,GA-single,NACA 2412,NACA 2412 mod,naca2412.dat,naca2412.dat,1972+; early models 0012 tip; tip file unmodified
+Cessna,210 Centurion,GA-single,NACA 64A215,NACA 64A412,,,1967+ cantilever wing; early strut models 2412/0012
+Piper,J-3 Cub,trainer,USA 35B,USA 35B,usa35b.dat,usa35b.dat,
+Piper,PA-18 Super Cub,GA-single,USA 35B,USA 35B,usa35b.dat,usa35b.dat,
+Piper,PA-28 Cherokee/Warrior/Archer,GA-single,NACA 65-415,NACA 65-415,naca652415.dat,naca652415.dat,full designation 65(2)-415; tapered wing same section
+Piper,PA-24 Comanche,GA-single,NACA 64A215,NACA 64A215,,,no 64A215 file on disk
+Cirrus,SR20,GA-single,Roncz airfoil,Roncz airfoil,,,proprietary Roncz design; no public coordinates
+Cirrus,SR22,GA-single,Roncz airfoil,Roncz airfoil,,,proprietary Roncz design; no public coordinates
+Beechcraft,35 Bonanza (V-tail),GA-single,NACA 23016.5,NACA 23012,,naca23012.dat,no 23016.5 file on disk
+Beechcraft,33 / 36 Bonanza,GA-single,NACA 23016.5,NACA 23012,,naca23012.dat,no 23016.5 file on disk
+Beechcraft,55 / 58 Baron,GA-twin,NACA 23016.5,NACA 23010.5,,,no matching files on disk
+Mooney,M20 (all variants),GA-single,NACA 63-215,NACA 64-412,n63215.dat,,no 64-412 file on disk
+Diamond,DA20 Katana,trainer,Wortmann FX 63-137/20 HOAC,Wortmann FX 63-137/20 HOAC,fx63137.dat,fx63137.dat,disk file is base FX 63-137
+Diamond,DA40 Star,GA-single,Wortmann FX 63-137/20-W4,Wortmann FX 63-137/20-W4,fx63137.dat,fx63137.dat,disk file is base FX 63-137
+Grumman American,AA-5 Traveler/Cheetah/Tiger,GA-single,NACA 64-415 mod,NACA 64-415 mod,naca642415.dat,naca642415.dat,disk file is unmodified 64(2)-415
+Maule,M-7,GA-single,USA 35B mod,USA 35B mod,usa35b.dat,usa35b.dat,disk file is unmodified USA 35B; all M-4..MX-7 same
+Aviat,A-1 Husky,GA-single,Clark Y/USA 35B,Clark Y/USA 35B,,,guide lists blended Clark Y/USA 35B section
+American Champion,7ECA/7GCAA Citabria,aerobatic,NACA 4412,NACA 4412,naca4412.dat,naca4412.dat,guide lists under Bellanca
+American Champion,8KCAB Decathlon,aerobatic,NACA 1412,NACA 1412,naca1412.dat,naca1412.dat,semi-symmetric for inverted flight
+Luscombe,8 Silvaire,GA-single,NACA 4412,NACA 4412,naca4412.dat,naca4412.dat,
+Aeronca,7AC Champ,trainer,NACA 4412,NACA 4412,naca4412.dat,naca4412.dat,
+Extra,300,aerobatic,MA 15S,MA 12S,,,proprietary symmetrical sections; no coordinates
+Boeing-Stearman,Model 75 PT-13/PT-17 Kaydet,warbird,NACA 2213,NACA 2213,,,no 2213 file on disk
+North American,P-51D Mustang,warbird,NAA/NACA 45-100,NAA/NACA 45-100,p51droot.dat,p51dtip.dat,UIUC files digitized from P-51D
+Supermarine,Spitfire Mk I-IX,warbird,NACA 2213,NACA 2209.4,,,no matching files on disk
+Schleicher,ASW 27,glider,Delft DU89-134/14,Delft DU92-131/14 mod,,,no Delft DU89/DU92 files on disk
+Schleicher,ASK 21,glider,Wortmann FX S-02-196,Wortmann FX 60-126,fxs02196.dat,fx60126.dat,common club trainer glider
