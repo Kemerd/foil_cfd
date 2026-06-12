@@ -546,7 +546,7 @@ struct Visualizer::Impl {
     // Velocity volume (the hero wind-tunnel smoke mode).
     GLint uVViewProj = -1, uVDims = -1, uVEye = -1, uVVol = -1, uVDepth = -1;
     GLint uVViewport = -1, uVInvVP = -1, uVColormap = -1, uVSlowOpacity = -1,
-          uVDensity = -1;
+          uVDensity = -1, uVFreestream = -1;
 
     // -- particle pool (hero mode) --
     GLuint particleVAO = 0, posVBO = 0, keyVBO = 0;
@@ -868,6 +868,7 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
         impl_->uVColormap   = glGetUniformLocation(impl_->progVol, "uColormap");
         impl_->uVSlowOpacity = glGetUniformLocation(impl_->progVol, "uSlowOpacity");
         impl_->uVDensity    = glGetUniformLocation(impl_->progVol, "uDensity");
+        impl_->uVFreestream = glGetUniformLocation(impl_->progVol, "uFreestream");
     }
 
     // ---- particle pool (the two interop buffer registrations) -------------

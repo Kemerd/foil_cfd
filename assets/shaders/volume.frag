@@ -26,6 +26,10 @@ uniform vec2  uViewport;         // framebuffer size (pixels), for depth fetch
 uniform int   uColormap;         // palette selector (2 = inferno default)
 uniform float uSlowOpacity;      // floor alpha for quiet/freestream air [0,1]
 uniform float uDensity;          // overall opacity gain for fast air
+uniform float uFreestream;       // normalized freestream speed (u_inf/scale):
+                                 // the "calm air" baseline disturbance is
+                                 // measured FROM, so it reads as haze even
+                                 // though it is not literally zero speed.
 
 out vec4 fragColor;
 
@@ -117,13 +121,17 @@ void main() {
         // the foil shell and domain walls never tint the haze.
         if (s <= 0.0) continue;
 
-        // Opacity curve: quiet air (s near the freestream baseline) keeps only
-        // the user's floor alpha (uSlowOpacity) so it reads as faint haze;
-        // faster-or-slower-than-stream air ramps up smoothly toward uDensity.
-        // "Disturbance" is distance from the freestream baseline (~the speed
-        // the volume normalizes to 1.0), so both the suction-peak speedup and
-        // the wake slowdown light up.
-        float disturb = clamp(abs(s - 1.0) * 1.4 + max(s - 1.0, 0.0), 0.0, 1.0);
+        // Opacity curve: quiet air (speed near the freestream baseline) keeps
+        // only the user's floor alpha (uSlowOpacity) so it reads as faint
+        // haze; air that departs from freestream — the wake slowdown and the
+        // suction-peak speedup alike — ramps up toward uDensity. Disturbance
+        // is the fractional deviation from the freestream level, normalized so
+        // a full stop (s -> 0) or a doubling both saturate.
+        float base = max(uFreestream, 1e-3);
+        float dev = (s - base) / base;            // signed fractional deviation
+        // Speed-ups read a touch stronger than slow-downs (acceleration over
+        // the suction surface is the headline feature), but both light up.
+        float disturb = clamp(abs(dev) * 1.1 + max(dev, 0.0) * 0.4, 0.0, 1.0);
         float a = mix(uSlowOpacity, uDensity, disturb);
 
         // Per-step alpha scaled by step length so the look is resolution

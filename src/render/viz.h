@@ -79,6 +79,11 @@ struct VizSettings {
     float velocitySpeedScale = 0.16f; ///< Speed (lattice units) mapped to the
                                       ///< palette top — ~2x freestream u_lat so
                                       ///< the wake/suction peak spans the ramp.
+    float freestreamLatticeSpeed = 0.08f; ///< Inlet speed u_lat in lattice
+                                      ///< units. Main.cpp keeps this in sync
+                                      ///< with the active scaling (HiFi lowers
+                                      ///< it); the volume shader measures "calm
+                                      ///< air" disturbance from this baseline.
     float slowAirOpacity     = 0.05f; ///< Floor alpha for quiet/freestream air
                                       ///< (NOT a hard cull: slow air stays a
                                       ///< faint haze so structure underneath
