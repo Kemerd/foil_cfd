@@ -537,6 +537,64 @@ void handleIncomingFile(App& app, const std::filesystem::path& path) {
     }
 }
 
+/// Locate the bundled default STL (the Glasair III) if it ships with this
+/// build. Mirrors findAirfoilsDirectory's search so it works in both the dev
+/// layout (exe two levels deep under build/) and an installed layout (assets
+/// next to the exe). Returns an empty path when no default STL is present —
+/// the program then simply boots on the NACA section instead.
+std::filesystem::path findDefaultStl() {
+    namespace fs = std::filesystem;
+    const fs::path exeDir = platform::executableDirectory();
+    // Accept a couple of conventional names so dropping a file in assets/stl/
+    // "just works" without a rebuild.
+    const char* names[] = {"glasair_iii.stl", "glasair3.stl", "default.stl"};
+    const fs::path roots[] = {
+        fs::current_path() / "assets" / "stl",
+        exeDir / "assets" / "stl",
+        exeDir / ".." / ".." / "assets" / "stl",
+    };
+    for (const fs::path& root : roots) {
+        for (const char* n : names) {
+            std::error_code ec;
+            const fs::path c = root / n;
+            if (fs::is_regular_file(c, ec)) return fs::weakly_canonical(c, ec);
+        }
+    }
+    return {};
+}
+
+/// Load the bundled Glasair III STL as the program's default geometry, if it
+/// exists. Reuses the real import path (loadStl -> normalization defaults ->
+/// applyStlImport) so the boot geometry is identical to a manual import. A
+/// missing file is not an error: the app keeps the NACA default and notes it.
+void tryLoadDefaultStl(App& app) {
+    const std::filesystem::path stl = findDefaultStl();
+    if (stl.empty()) {
+        setStatus(app, "default Glasair III STL not bundled — starting on the "
+                       "NACA section (drop an .stl to import one)");
+        return;
+    }
+    StlLoadResult res = loadStl(stl);
+    if (!res.ok) {
+        setStatus(app, "default STL rejected: " + res.rejectionReason);
+        return;
+    }
+    app.stlMeshRaw = std::move(res.mesh);
+
+    // Seed the import modal's choices with sensible defaults (same as a manual
+    // import would start from), then voxelize straight away — no modal, this
+    // is the startup default.
+    StlImportUI& ui = app.params.stlImport;
+    ui.open          = false;
+    ui.fileName      = platform::pathToUtf8(stl.filename());
+    ui.solidName     = app.stlMeshRaw.name;
+    ui.triangleCount = static_cast<std::uint32_t>(app.stlMeshRaw.triangles.size());
+    ui.bounds        = app.stlMeshRaw.bounds;
+    ui.wasBinary     = app.stlMeshRaw.wasBinary;
+    ui.chordCells    = app.layout.chordCells;
+    applyStlImport(app);
+}
+
 // ===========================================================================
 // Snapshot capture (plan 8): the VRAM clean slot for instant VG restarts and
 // the compact disk variant persisted on a worker thread.
@@ -1189,6 +1247,15 @@ int main(int argc, char** argv) {
         glfwDestroyWindow(app.window);
         glfwTerminate();
         return 1;
+    }
+
+    // Default geometry: load the bundled Glasair III STL for the interactive
+    // session (if present). Selftest keeps the deterministic NACA section so
+    // its golden screenshot/forces stay reproducible and don't depend on an
+    // optional asset.
+    if (!selftest) {
+        tryLoadDefaultStl(app);
+        focusCameraOnFoil(app, /*snap=*/true); // re-frame on the new solid
     }
 
     const int rc = selftest ? runSelftest(app) : runInteractive(app);

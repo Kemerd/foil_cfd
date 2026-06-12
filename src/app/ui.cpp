@@ -529,11 +529,42 @@ void drawAirfoilPanel(UIContext& ctx) {
                             "orient STL solids in CAD before export.");
     }
 
-    ImGui::SliderFloat("Airspeed", &p.airspeedMs, 5.0f, 120.0f, "%.1f m/s");
-    if (ImGui::IsItemDeactivatedAfterEdit()) ev.airspeedChanged = true;
+    // Airspeed: stored canonically in m/s, but shown/edited in the user's
+    // chosen unit (knots by default — the aviation convention). We convert the
+    // m/s value and the 5..120 m/s range into the display unit, let the slider
+    // edit in that unit, then convert the result straight back to m/s so the
+    // physics path never sees anything but m/s.
+    {
+        const float k = speedUnitPerMs(p.speedUnit);
+        float shown   = p.airspeedMs * k;
+        char fmt[24];
+        std::snprintf(fmt, sizeof fmt, "%%.1f %s", speedUnitLabel(p.speedUnit));
+        if (ImGui::SliderFloat("Airspeed", &shown, 5.0f * k, 120.0f * k, fmt)) {
+            p.airspeedMs = shown / k; // commit back in canonical m/s
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) ev.airspeedChanged = true;
+
+        // Unit toggle buttons: knots / mph / m/s. Selected unit is highlighted;
+        // switching only changes the display (airspeedMs is unchanged, so no
+        // re-sim event fires).
+        auto unitButton = [&](const char* label, SpeedUnit u) {
+            const bool active = (p.speedUnit == u);
+            if (active)
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            if (ImGui::SmallButton(label)) p.speedUnit = u;
+            if (active) ImGui::PopStyleColor();
+        };
+        unitButton("kn", SpeedUnit::Knots);
+        ImGui::SameLine();
+        unitButton("mph", SpeedUnit::Mph);
+        ImGui::SameLine();
+        unitButton("m/s", SpeedUnit::Ms);
+    }
     helpMarker("Changing airspeed rescales the units and restarts the startup "
                "ramp, but the cached flow stays valid (plan: airspeed is not "
-               "part of the snapshot key).");
+               "part of the snapshot key). The kn/mph/m-s buttons only change "
+               "the display unit — the simulation always runs in SI.");
 
     // Chord is a pure UNITS rescale, exactly like airspeed: grid dims, u_lat,
     // and the flag field are untouched (only dx/dt/Re-target change), so it

@@ -24,6 +24,31 @@ namespace foilcfd {
 /// @brief Which airfoil source the user has selected.
 enum class AirfoilSource { NacaDigits, DatFile, StlImport };
 
+/// @brief Display unit for the airspeed field. The solver always stores
+/// airspeed in m/s (UIParams::airspeedMs); this only changes how the number
+/// is shown and edited. Knots is the aviation default for an airfoil tool.
+enum class SpeedUnit { Knots, Mph, Ms };
+
+/// @brief Per-second conversion factor: multiply m/s by this to get the unit.
+inline float speedUnitPerMs(SpeedUnit u) {
+    switch (u) {
+        case SpeedUnit::Knots: return 1.943844f; // 1 m/s = 1.943844 kn
+        case SpeedUnit::Mph:   return 2.236936f; // 1 m/s = 2.236936 mph
+        case SpeedUnit::Ms:    return 1.0f;
+    }
+    return 1.0f;
+}
+
+/// @brief Short label for the airspeed unit (slider suffix + button text).
+inline const char* speedUnitLabel(SpeedUnit u) {
+    switch (u) {
+        case SpeedUnit::Knots: return "kn";
+        case SpeedUnit::Mph:   return "mph";
+        case SpeedUnit::Ms:    return "m/s";
+    }
+    return "m/s";
+}
+
 /// @brief State of the STL import modal (plan 7.2). main.cpp owns the heavy
 /// StlMesh itself (triangle soups can be ~100 MB — they never pass through
 /// the UI structs); the modal only displays metadata and edits the import
@@ -58,7 +83,9 @@ struct UIParams {
                                            ///< root/tip selector); reset by
                                            ///< main.cpp on manifest reload.
     float aoaDeg = 4.0f;                   ///< AoA slider, -5..20 deg (plan 9.2).
-    float airspeedMs = 30.0f;              ///< Physical airspeed [m/s].
+    float airspeedMs = 30.0f;              ///< Physical airspeed [m/s] (canonical).
+    SpeedUnit speedUnit = SpeedUnit::Knots;///< Display unit for the airspeed
+                                           ///< field; m/s stays the stored value.
     float chordM = 1.2f;                   ///< Physical chord [m].
     ResolutionPreset resolution = ResolutionPreset::Default;
 
