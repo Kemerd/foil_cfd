@@ -101,6 +101,10 @@ struct App {
     PatchBox patchBox;                   ///< Active patch in coarse cells.
     std::vector<std::uint8_t> fineFlags; ///< Fine-level flag field (2x, shell stamped).
 
+    // -- nested VG patch state (third level) --
+    PatchBox finerBox;                   ///< Active nested box, in FINE cells.
+    std::vector<std::uint8_t> finerFlags;///< Finer-level flag field (shell stamped).
+
     // NOTE: the plan-8 snapshot warm-start cache (VRAM clean slot + disk LRU)
     // was removed: its capture path could freeze the session right as the
     // force gate opened ("clean flow cached" — then nothing). Every geometry/
@@ -469,8 +473,13 @@ void applyWallModelPolicy(App& app) {
         enable = true;
     } else if (app.params.wallModel == 0) {
         const RefinementInfo ri = app.solver.refinementInfo();
+        // Use the FINEST active level's scaling: the nested VG patch when it is
+        // present, else the fine patch, else the coarse grid. The finest cells
+        // give the smallest y+, which is what decides if the sublayer resolves.
         const LatticeScaling& sc =
-            ri.active ? ri.fineScaling : app.solver.scaling();
+            ri.finerActive ? ri.finerScaling
+          : ri.active      ? ri.fineScaling
+                           : app.solver.scaling();
         if (sc.u_lat > 0.0f && sc.nu_lat > 0.0f) {
             const float re = std::max(sc.reEffective, 1.0e3f);
             const float cf = 0.0576f * std::pow(re, -0.2f);
@@ -500,10 +509,20 @@ void applyRefinement(App& app) {
                                       app.params.vgs, app.layout.chordCells));
     }
 
+    // Tearing down the fine level always tears down the nested VG level too
+    // (the solver enforces the same invariant; this keeps the App-side mirror
+    // and the shutdown call in lock-step on every early-return path).
+    auto clearFiner = [&app]() {
+        app.solver.shutdownFinerRefinement();
+        app.finerBox = PatchBox{};
+        app.finerFlags.clear();
+    };
+
     if (factor < 2 || app.stlActive) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        clearFiner();
         applyWallModelPolicy(app); // finest level is now the coarse grid
         return;
     }
@@ -523,6 +542,7 @@ void applyRefinement(App& app) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        clearFiner();
         applyWallModelPolicy(app);
         return;
     }
@@ -547,6 +567,7 @@ void applyRefinement(App& app) {
                            + " — running base grid only");
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        clearFiner();
         applyWallModelPolicy(app);
         return;
     }
@@ -573,6 +594,81 @@ void applyRefinement(App& app) {
                   factor, box.x0, box.x1, box.y0, box.y1, fineLayout.dims.nx,
                   fineLayout.dims.ny, fineLayout.dims.nz);
     logLine(msg);
+
+    // ---- nested VG patch (third level): a tiny box hugging just the vanes,
+    // run at 2x the fine factor (effective m*2 vs coarse). Built only when the
+    // user keeps it on AND there are VGs to wrap. Any failure tears down only
+    // level 2 — the 2x patch + coarse sim keep running. ---------------------
+    clearFiner();
+    if (app.params.refine.finerVGPatch && !app.params.vgs.empty()) {
+        constexpr int kFinerFactor = 2; // 2x the fine grid
+
+        // Margins ~half the vane extent on each side -> the box is roughly 2x
+        // the vane envelope with the vanes centered. Scaled off the FINE chord
+        // resolution so it tracks grid size. The floor is the coupling buffer
+        // that MUST sit between a vane and the box edge: the 2-cell Interface
+        // shell + the 2-cell restriction band + 2 cells of trilinear-stencil
+        // reach, so the shell is filled from clean fluid and the vane lives
+        // fully inside the restricted (fine-overwrites-coarse) interior. The
+        // solid-aware fill tolerates a vane grazing the stencil, but keeping
+        // this margin means it almost never has to.
+        constexpr int kVGMarginFloor =
+            kInterfaceShellFine + kRestrictBandCoarse + 2; // = 6 fine cells
+        const int fnc = fineLayout.chordCells;
+        auto vgCellsOf = [fnc](float chords) {
+            return std::max(kVGMarginFloor, static_cast<int>(std::lround(
+                                   chords * static_cast<float>(fnc))));
+        };
+        const int mx = vgCellsOf(0.05f); // streamwise pad (fine cells)
+        const int my = vgCellsOf(0.03f); // wall-normal pad
+        const PatchBox box2 = deriveVGPatchBoxFine(
+            fineLayout, app.params.vgs, app.airfoil, app.params.aoaDeg,
+            mx, mx, my, my);
+
+        if (box2.valid()) {
+            // Level-2 flag field: foil (so the vane roots have a wall + the
+            // wall model finds the surface) + every VG, at the finer layout.
+            const DomainLayout finerLayout =
+                makeFineLayout(fineLayout, box2, kFinerFactor);
+            std::vector<std::uint8_t> finer(
+                static_cast<std::size_t>(finerLayout.dims.cellCount()),
+                static_cast<std::uint8_t>(CellFlag::Fluid));
+            voxelizeAirfoil(app.airfoil, app.params.aoaDeg, finerLayout, finer);
+            for (const VGParams& vg : app.params.vgs)
+                voxelizeVG(vg, app.airfoil, app.params.aoaDeg, finerLayout, finer);
+            closeTrailingEdgeGaps(finerLayout.dims, finer);
+            stampInterfaceShell(finerLayout.dims, finer);
+
+            std::string err2;
+            if (app.solver.initFinerRefinement(box2, kFinerFactor, finer,
+                                               &err2)) {
+                // Clean (VG-free) finer reference for the wall model.
+                std::vector<std::uint8_t> finerClean(
+                    static_cast<std::size_t>(finerLayout.dims.cellCount()),
+                    static_cast<std::uint8_t>(CellFlag::Fluid));
+                voxelizeAirfoil(app.airfoil, app.params.aoaDeg, finerLayout,
+                                finerClean);
+                closeTrailingEdgeGaps(finerLayout.dims, finerClean);
+                app.solver.setRefinedFinerSurfaceReference(finerClean);
+
+                app.finerBox   = box2;
+                app.finerFlags = std::move(finer);
+                char msg2[180];
+                std::snprintf(msg2, sizeof msg2,
+                              "nested VG patch (%dx of fine = %dx): fine box "
+                              "[%d,%d)x[%d,%d) -> finer %d x %d x %d",
+                              kFinerFactor, factor * kFinerFactor,
+                              box2.x0, box2.x1, box2.y0, box2.y1,
+                              finerLayout.dims.nx, finerLayout.dims.ny,
+                              finerLayout.dims.nz);
+                logLine(msg2);
+            } else {
+                setStatus(app, "nested VG patch unavailable: " + err2
+                                   + " — running 2x patch only");
+                clearFiner();
+            }
+        }
+    }
     // The finest level changed; the Auto wall-model verdict may flip with it.
     applyWallModelPolicy(app);
 }
@@ -667,8 +763,10 @@ void pushQuad(std::vector<StlTriangle>& out, const Vec3f& a, const Vec3f& b,
 /// @param cellSize Cube edge length in COARSE lattice units (1.0 coarse,
 ///                 0.5 for the 2x fine patch).
 /// @param origin   Lattice-space position of cell (0,0,0)'s low corner.
-/// @param skipXY   Optional coarse-cell box to omit (the fine pass renders
-///                 that region at 2x instead).
+/// @param skipXY   Optional box (in THIS grid's own cells) to omit, because a
+///                 finer pass renders that region instead — the coarse pass
+///                 skips the fine-patch box, the fine pass skips the nested
+///                 VG box.
 void emitVoxelFaces(const GridDims& dims, const std::vector<std::uint8_t>& flags,
                     float cellSize, const Vec3f& origin, const PatchBox* skipXY,
                     std::vector<StlTriangle>& out) {
@@ -736,11 +834,30 @@ StlMesh buildVoxelMesh(const App& app) {
     if (fineActive) {
         const GridDims fineDims =
             fineDimsFor(app.patchBox, app.layout.dims, ri.factor);
-        emitVoxelFaces(fineDims, app.fineFlags,
-                       1.0f / static_cast<float>(ri.factor),
-                       Vec3f(static_cast<float>(app.patchBox.x0),
-                             static_cast<float>(app.patchBox.y0), 0.0f),
-                       nullptr, m.triangles);
+        const float fineCell = 1.0f / static_cast<float>(ri.factor);
+        // Fine-patch origin in coarse units.
+        const Vec3f fineOrigin(static_cast<float>(app.patchBox.x0),
+                               static_cast<float>(app.patchBox.y0), 0.0f);
+        // The nested VG level renders its own region at 1/(m*m2); the fine pass
+        // skips that region (finerBox is already in fine cells, which is the
+        // grid the fine pass iterates).
+        const bool finerActive = ri.finerActive && !app.finerFlags.empty();
+        emitVoxelFaces(fineDims, app.fineFlags, fineCell, fineOrigin,
+                       finerActive ? &app.finerBox : nullptr, m.triangles);
+        if (finerActive) {
+            const GridDims finerDims =
+                fineDimsFor(app.finerBox, fineDims, ri.finerFactor);
+            // Finer cell size in coarse units, and its origin = fine origin
+            // shifted by the finer box (in fine cells) scaled to coarse units.
+            const float finerCell =
+                fineCell / static_cast<float>(ri.finerFactor);
+            const Vec3f finerOrigin(
+                fineOrigin.x + fineCell * static_cast<float>(app.finerBox.x0),
+                fineOrigin.y + fineCell * static_cast<float>(app.finerBox.y0),
+                0.0f);
+            emitVoxelFaces(finerDims, app.finerFlags, finerCell, finerOrigin,
+                           nullptr, m.triangles);
+        }
     }
     return m;
 }
@@ -1165,6 +1282,21 @@ void updateReadouts(App& app) {
         rr.forcesFromFine  = ri.forcesFromFine;
         rr.patchX0 = ri.box.x0; rr.patchX1 = ri.box.x1;
         rr.patchY0 = ri.box.y0; rr.patchY1 = ri.box.y1;
+
+        rr.finerActive = ri.finerActive;
+        rr.finerFactor = ri.finerFactor;
+        rr.finerEffectiveFactor = ri.finerActive ? ri.factor * ri.finerFactor : 0;
+        rr.finerDims   = ri.finerDims;
+        rr.finerVramGB = ri.finerVramBytes / (1024.0 * 1024.0 * 1024.0);
+        if (ri.finerActive && ri.factor > 0) {
+            // finerBox is in FINE cells; map to coarse lattice space for the
+            // 3D overlay: coarse = patch origin + fineCell / factor.
+            const float inv = 1.0f / static_cast<float>(ri.factor);
+            rr.finerCX0 = ri.box.x0 + inv * static_cast<float>(ri.finerBox.x0);
+            rr.finerCX1 = ri.box.x0 + inv * static_cast<float>(ri.finerBox.x1);
+            rr.finerCY0 = ri.box.y0 + inv * static_cast<float>(ri.finerBox.y0);
+            rr.finerCY1 = ri.box.y0 + inv * static_cast<float>(ri.finerBox.y1);
+        }
     }
     // The presolve runs synchronously inside the apply functions, so there is
     // never a mid-flight progress value to report between frames.

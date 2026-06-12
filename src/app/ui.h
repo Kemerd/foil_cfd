@@ -138,11 +138,19 @@ struct UIParams {
         float wakeC     = 0.50f; ///< Margin behind (near-wake coverage).
         float aboveC    = 0.20f; ///< Margin above (suction-surface BL + VGs).
         float belowC    = 0.10f; ///< Margin below (pressure side).
-        bool  autoVGFactor = true; ///< Raise the factor to whatever
+        bool  autoVGFactor = false; ///< Raise the WHOLE fine patch to whatever
                                  ///< recommendedRefineFactorForVGs() asks
-                                 ///< (vane >= 8 cells tall) — accurate vortex
-                                 ///< strength needs a resolved vane, and an
-                                 ///< under-resolved one silently sheds weak.
+                                 ///< (vane >= 8 cells tall). OFF by default now
+                                 ///< the nested VG patch (finerVGPatch) handles
+                                 ///< vane resolution locally — leaving this on
+                                 ///< would stack on top of the nested 2x and
+                                 ///< over-refine (e.g. fine auto-raised to 4x,
+                                 ///< then nested 2x -> an 8x VG box).
+        bool  finerVGPatch = true; ///< Build the nested 4x box hugging the VGs
+                                 ///< (2x the fine factor) when VGs are on. Only
+                                 ///< effective with VGs + an active fine patch;
+                                 ///< degrades gracefully (OOM / tiny box) to the
+                                 ///< 2x-only behavior.
 
         /// Patch active at all (factor 1 = pure uniform grid).
         bool enabled() const { return factor >= 2; }
@@ -233,6 +241,16 @@ struct UIReadouts {
         float    fineReEffective = 0.0f; ///< Effective Re at the fine level.
         bool     forcesFromFine = false; ///< Momentum exchange runs on fine grid.
         int      patchX0 = 0, patchY0 = 0, patchX1 = 0, patchY1 = 0; ///< Coarse cells (diagram).
+
+        // -- nested VG patch (third level) --
+        bool     finerActive = false;  ///< Nested VG level allocated + stepping.
+        int      finerFactor = 0;      ///< Factor vs the fine grid (m2).
+        int      finerEffectiveFactor = 0; ///< Factor vs coarse (m * m2).
+        GridDims finerDims;            ///< Finer grid dimensions.
+        double   finerVramGB = 0.0;    ///< Finer-level f-pair + flags estimate.
+        // Nested box corners in COARSE lattice cells (for the 3D overlay):
+        // patch origin + finerBox(fine cells) / factor.
+        float    finerCX0 = 0, finerCY0 = 0, finerCX1 = 0, finerCY1 = 0;
     };
     RefinementReadout refine;
 

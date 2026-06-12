@@ -22,6 +22,14 @@
 // from the coarse tau, so the patch buys m-times spatial resolution (boundary
 // layer cells, VG geometry) at the same effective Re — it does not raise Re.
 //
+// These relations and the launch wrappers are LEVEL-AGNOSTIC: they consume two
+// lattice views, a PatchBox, a factor, and a tau pair, with nothing tied to the
+// base grid. The nested VG patch (third level) reuses them verbatim with the
+// FINE grid as the "coarse" argument and its box expressed in fine cells — the
+// tau composition fineTauFor(fineTauFor(tauC,m),m2) == fineTauFor(tauC,m*m2)
+// makes the two hops equivalent to a single factor m*m2, so the same fill /
+// restrict kernels couple fine<->finer exactly as they couple coarse<->fine.
+//
 // The fine level spans the FULL z extent (m*nz fine cells) and reuses the
 // padded-ghost-z layout + refresh kernels of lbm_core unchanged. Its x/y
 // faces carry a 2-fine-cell CellFlag::Interface shell written by the fill

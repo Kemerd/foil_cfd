@@ -1643,15 +1643,36 @@ void drawMeshPanel(UIContext& ctx) {
         if (ImGui::Checkbox("Auto-raise for VGs", &p.refine.autoVGFactor)) {
             ev.meshRefinementChanged = true;
         }
-        helpMarker("When a configured vane would be under 8 cells tall, the "
-                   "patch factor is raised (up to 4x) until it is not — an "
-                   "under-resolved vane sheds a systematically weak vortex "
-                   "and quietly corrupts VG-on/VG-off comparisons.");
+        helpMarker("Raises the WHOLE fine patch (up to 4x) when a vane would be "
+                   "under 8 cells tall. Off by default: the nested VG patch "
+                   "below already gives the vanes the finest resolution "
+                   "locally, so turning this on stacks on top of it and "
+                   "over-refines (a 4x auto-raised patch + the nested 2x = an "
+                   "8x VG box). Use it only if you want the whole foil refined, "
+                   "not just the vane region.");
         if (p.refine.autoVGFactor && r.refine.active
             && r.refine.factor > p.refine.factor) {
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
                                "auto-raised to %dx for VG resolution",
                                r.refine.factor);
+        }
+
+        // Nested VG patch: a tiny box at 2x the fine factor hugging only the
+        // vanes — the finest resolution exactly where the vortices are shed,
+        // for a fraction of a uniform 4x's cost. Only effective with VGs on.
+        if (ImGui::Checkbox("Finer VG patch (4x)", &p.refine.finerVGPatch)) {
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("Wraps the vortex generators in a small box that runs at 2x "
+                   "the fine factor (so 4x the coarse grid with the default 2x "
+                   "patch). The vanes shed their vortices here at the finest "
+                   "resolution, while the rest of the foil stays at 2x — far "
+                   "cheaper than refining the whole foil to 4x. Needs VGs and "
+                   "an active patch; falls back to 2x-only if it can't fit.");
+        if (r.refine.finerActive) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                               "nested VG box active at %dx (coarse)",
+                               r.refine.finerEffectiveFactor);
         }
     }
 
@@ -1723,6 +1744,14 @@ void drawMeshPanel(UIContext& ctx) {
                                          "pending re-init)");
         }
 
+        // Nested VG patch status: the tiny finest box, when present.
+        if (r.refine.finerActive) {
+            ImGui::TextDisabled(
+                "nested VG grid %d x %d x %d  (~%.2f GB VRAM)",
+                r.refine.finerDims.nx, r.refine.finerDims.ny,
+                r.refine.finerDims.nz, r.refine.finerVramGB);
+        }
+
         // VRAM guard readout: warn when the whole allocation crowds the card.
         if (r.vramUsedFraction > 0.8f) {
             ImGui::TextColored(kColBad, "VRAM %.0f%% — consider disabling the "
@@ -1781,17 +1810,6 @@ void drawPatchBoxOverlay(UIContext& ctx) {
     const UIReadouts& r = *ctx.readouts;
     if (!ctx.viewProj || !p.refine.showPatchBox || !r.refine.active) return;
 
-    // The eight corners in lattice space: the patch spans the full z extent.
-    const float x0 = static_cast<float>(r.refine.patchX0);
-    const float x1 = static_cast<float>(r.refine.patchX1);
-    const float y0 = static_cast<float>(r.refine.patchY0);
-    const float y1 = static_cast<float>(r.refine.patchY1);
-    const float z0 = 0.0f;
-    const float z1 = static_cast<float>(r.dims.nz);
-    const Vec3f corner[8] = {
-        {x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0},
-        {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1},
-    };
     static const int kEdges[12][2] = {
         {0, 1}, {1, 2}, {2, 3}, {3, 0},   // z = 0 face
         {4, 5}, {5, 6}, {6, 7}, {7, 4},   // z = nz face
@@ -1803,24 +1821,47 @@ void drawPatchBoxOverlay(UIContext& ctx) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const ImVec2 vpPos  = vp->Pos;
     const ImVec2 vpSize = vp->Size;
-
+    const float z0 = 0.0f;
+    const float z1 = static_cast<float>(r.dims.nz);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    const ImU32 col = IM_COL32(66, 140, 245, 190);
-    for (const auto& e : kEdges) {
-        ImVec2 a, b;
-        if (projectPoint(*ctx.viewProj, corner[e[0]], vpPos, vpSize, a)
-            && projectPoint(*ctx.viewProj, corner[e[1]], vpPos, vpSize, b)) {
-            dl->AddLine(a, b, col, 1.5f);
+
+    // Draw one axis-aligned box (spanning the full z extent) as 12 projected
+    // edges, tagged at its upper-left-front corner.
+    auto drawBox = [&](float x0, float x1, float y0, float y1, ImU32 col,
+                       ImU32 tagCol, const char* lbl) {
+        const Vec3f corner[8] = {
+            {x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0},
+            {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1},
+        };
+        for (const auto& e : kEdges) {
+            ImVec2 a, b;
+            if (projectPoint(*ctx.viewProj, corner[e[0]], vpPos, vpSize, a)
+                && projectPoint(*ctx.viewProj, corner[e[1]], vpPos, vpSize, b)) {
+                dl->AddLine(a, b, col, 1.5f);
+            }
         }
-    }
-    // Tag the box at its upper-left-front corner so the lines read as "the
-    // refinement patch" and not a stray gizmo.
-    ImVec2 tag;
-    if (projectPoint(*ctx.viewProj, corner[3], vpPos, vpSize, tag)) {
-        char lbl[16];
-        std::snprintf(lbl, sizeof lbl, "%dx patch", r.refine.factor);
-        dl->AddText(ImVec2(tag.x + 4.0f, tag.y - 16.0f),
-                    IM_COL32(140, 185, 255, 220), lbl);
+        ImVec2 tag;
+        if (projectPoint(*ctx.viewProj, corner[3], vpPos, vpSize, tag)) {
+            dl->AddText(ImVec2(tag.x + 4.0f, tag.y - 16.0f), tagCol, lbl);
+        }
+    };
+
+    char lbl[20];
+    std::snprintf(lbl, sizeof lbl, "%dx patch", r.refine.factor);
+    drawBox(static_cast<float>(r.refine.patchX0),
+            static_cast<float>(r.refine.patchX1),
+            static_cast<float>(r.refine.patchY0),
+            static_cast<float>(r.refine.patchY1),
+            IM_COL32(66, 140, 245, 190), IM_COL32(140, 185, 255, 220), lbl);
+
+    // The nested VG box, in a warmer hue so the two levels read apart.
+    if (r.refine.finerActive) {
+        char lbl2[24];
+        std::snprintf(lbl2, sizeof lbl2, "%dx VG box",
+                      r.refine.finerEffectiveFactor);
+        drawBox(r.refine.finerCX0, r.refine.finerCX1, r.refine.finerCY0,
+                r.refine.finerCY1, IM_COL32(245, 170, 66, 210),
+                IM_COL32(255, 200, 130, 230), lbl2);
     }
 }
 

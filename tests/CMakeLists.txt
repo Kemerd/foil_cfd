@@ -53,6 +53,7 @@ add_test(NAME test_airfoil COMMAND test_airfoil)
 add_executable(test_voxelizer
     test_voxelizer.cpp
     ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/vg.cpp  # voxelizer.cpp's deriveVGPatchBoxFine
     ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp)
 target_include_directories(test_voxelizer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_voxelizer PRIVATE CUDA::cudart)
@@ -102,7 +103,7 @@ add_test(NAME cuda_smoke COMMAND cuda_smoke)
 # Physics milestones M0-M3 (plan section 10 + plan M-refine). Host TUs
 # driving the solver's public API; all device work happens in the sim module.
 foreach(gpu_test IN ITEMS m0_taylor_green m1_cavity m2_cylinder m3_refine
-        m4_wallmodel)
+        m4_finer m4_wallmodel)
     add_executable(${gpu_test} ${gpu_test}.cpp)
     target_link_libraries(${gpu_test} PRIVATE foilcfd_test_sim)
     add_test(NAME ${gpu_test} COMMAND ${gpu_test})
@@ -128,7 +129,8 @@ add_test(NAME m5_integration COMMAND m5_integration)
 add_executable(polar_ls413
     polar_ls413.cpp
     ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp
-    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp)
+    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/vg.cpp) # voxelizer.cpp's deriveVGPatchBoxFine
 target_link_libraries(polar_ls413 PRIVATE foilcfd_test_sim)
 target_compile_definitions(polar_ls413 PRIVATE
     FOILCFD_AIRFOIL_DIR="${CMAKE_SOURCE_DIR}/airfoils")
@@ -136,7 +138,7 @@ target_compile_definitions(polar_ls413 PRIVATE
 # The "gpu" label lets machines without an NVIDIA card (or CI) skip every
 # device-touching test in one flag: ctest -LE gpu.
 set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder m3_refine
-    m4_wallmodel
+    m4_finer m4_wallmodel
     PROPERTIES LABELS "gpu")
 set_tests_properties(m5_integration PROPERTIES LABELS "gpu;slow" TIMEOUT 900)
 
@@ -149,4 +151,5 @@ set_tests_properties(m0_taylor_green PROPERTIES TIMEOUT 180)
 set_tests_properties(m1_cavity PROPERTIES TIMEOUT 300)
 set_tests_properties(m2_cylinder PROPERTIES TIMEOUT 300)
 set_tests_properties(m3_refine PROPERTIES TIMEOUT 180)
+set_tests_properties(m4_finer PROPERTIES TIMEOUT 240)
 set_tests_properties(m4_wallmodel PROPERTIES TIMEOUT 300)

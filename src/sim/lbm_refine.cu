@@ -51,6 +51,51 @@ __device__ __forceinline__ void equilibrium19(float rho, float ux, float uy,
     }
 }
 
+// Lattice sound speed (D3Q19): cs^2 = 1/3, so the Hermite normalization in the
+// regularization below is w_q / (2*cs^4) = w_q / (2/9) = 4.5 * w_q.
+constexpr float kCs2     = 1.0f / 3.0f;
+constexpr float kRegNorm = 4.5f; // 1 / (2 * cs^4)
+
+/// @brief Latt-Chopard regularization of a non-equilibrium population set.
+///
+/// The interpolated/averaged deviation @p fneqIn carries both the hydrodynamic
+/// stress AND the non-hydrodynamic ("ghost") moments. At a grid-refinement
+/// interface those ghost moments are exactly the spurious-vortex / speckle
+/// signature (aliasing energy dumped into modes the coarse grid cannot carry;
+/// Astoul et al. 2020). Projecting fneq onto the second-order Hermite (stress)
+/// space discards them while preserving mass and momentum exactly:
+///   Pi_neq_ab = sum_q c_qa c_qb fneq_q
+///   fneq_q    = (w_q / 2 cs^4) * (c_qa c_qb - cs^2 d_ab) : Pi_neq_ab
+/// (Latt & Chopard 2006, Eq. 10). The result replaces @p fneqIn in place.
+__device__ __forceinline__ void regularizeFneq(float fneq[kQ]) {
+    // Second-order non-equilibrium momentum-flux tensor (symmetric: 6 terms).
+    float pxx = 0.0f, pyy = 0.0f, pzz = 0.0f;
+    float pxy = 0.0f, pxz = 0.0f, pyz = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float f = fneq[q];
+        const float cx = static_cast<float>(rf_cx[q]);
+        const float cy = static_cast<float>(rf_cy[q]);
+        const float cz = static_cast<float>(rf_cz[q]);
+        pxx += cx * cx * f; pyy += cy * cy * f; pzz += cz * cz * f;
+        pxy += cx * cy * f; pxz += cx * cz * f; pyz += cy * cz * f;
+    }
+    // Project back: fneq_q = w_q/(2cs^4) * Q_q:Pi, Q_q = c_q c_q - cs^2 I.
+    // The diagonal trace term carries the -cs^2 I contraction once.
+    const float trace = kCs2 * (pxx + pyy + pzz);
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float cx = static_cast<float>(rf_cx[q]);
+        const float cy = static_cast<float>(rf_cy[q]);
+        const float cz = static_cast<float>(rf_cz[q]);
+        // Q_q : Pi = (c c):Pi - cs^2 tr(Pi); off-diagonals counted twice.
+        const float qPi = cx * cx * pxx + cy * cy * pyy + cz * cz * pzz
+                        + 2.0f * (cx * cy * pxy + cx * cz * pxz + cy * cz * pyz)
+                        - trace;
+        fneq[q] = kRegNorm * rf_w[q] * qPi;
+    }
+}
+
 /// @brief Decompose an UNPADDED linear cell index into (x, y, z).
 __device__ __forceinline__ void unpackCell(long long cell, int nx, long long nxny,
                                            int& x, int& y, int& z) {
@@ -77,6 +122,7 @@ __device__ __forceinline__ void unpackCell(long long cell, int nx, long long nxn
 
 __global__ void coarseToFineFillKernel(
     const FPop* __restrict__ fcT0, const FPop* __restrict__ fcT1,
+    const std::uint8_t* __restrict__ coarseFlags,
     const std::uint8_t* __restrict__ fineFlags, FPop* __restrict__ ff,
     long long fineNcells, long long fineNxny, long long fineNcellsPad,
     int fineNx, int fineNy,
@@ -137,6 +183,29 @@ __global__ void coarseToFineFillKernel(
         corner[c] = pIdx(cx, cy, cz, coarseNx, coarseNxny);
     }
 
+    // Solid-aware reweighting: a corner that lands INSIDE a parent solid (a VG
+    // vane, or a stair-step of the foil) holds bounce-back state, NOT a valid
+    // fluid distribution — interpolating through it injects garbage fneq that a
+    // near-floor-tau child grid amplifies into runaway. This bites the nested
+    // VG patch, whose shell hugs the vanes; the foil-bbox patch was solid-free
+    // by its clearance margin and is unaffected. We drop solid corners and
+    // renormalize the weights over the fluid corners so the shell is filled
+    // from fluid neighbours only — the vane itself stays SOLID and is resolved
+    // by the child grid's own bounce-back, exactly as intended.
+    float wsum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        if (coarseFlags[corner[c]] == kFlagSolid) wgt[c] = 0.0f;
+        wsum += wgt[c];
+    }
+    // All 8 corners solid (the target sits deep inside a parent solid): nothing
+    // fluid to pull from — leave the cell's current populations untouched. For
+    // a real shell/fluid target at least one fluid corner always exists.
+    if (wsum < 1e-6f) return;
+    const float invWsum = 1.0f / wsum;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) wgt[c] *= invWsum;
+
     // ---- interpolate the 19 populations (space, then time) ---------------
     float fi[kQ];
     float rho = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
@@ -170,12 +239,20 @@ __global__ void coarseToFineFillKernel(
         ux *= sc; uy *= sc; uz *= sc;
     }
 
-    // ---- split feq + fneq, rescale fneq to the fine level, store ----------
-    float feq[kQ];
+    // ---- split feq + fneq, REGULARIZE, rescale, store ---------------------
+    // Raw (fi - feq) carries non-hydrodynamic ghost moments that the resolution
+    // jump turns into the interface speckle. Project fneq onto the stress
+    // tensor (Latt-Chopard) so only the hydrodynamic part crosses the
+    // interface, THEN apply the Dupuis-Chopard tau rescale. Mass and momentum
+    // are untouched (the projection is traceless in the conserved moments).
+    float feq[kQ], fneq[kQ];
     equilibrium19(rho, ux, uy, uz, feq);
 #pragma unroll
+    for (int q = 0; q < kQ; ++q) fneq[q] = fi[q] - feq[q];
+    regularizeFneq(fneq);
+#pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        const float v = feq[q] + neqScale * (fi[q] - feq[q]);
+        const float v = feq[q] + neqScale * fneq[q];
         ff[static_cast<long long>(q) * fineNcellsPad + pf] = v;
     }
 }
@@ -188,6 +265,57 @@ __global__ void coarseToFineFillKernel(
 // coarse macroscopic arrays so every macro consumer (renderer, particles,
 // delta99 extraction) sees the fine-derived solution with zero code changes.
 // ===========================================================================
+
+/// @brief Child-averaged non-equilibrium populations of ONE coarse cell, for
+/// the Lagrava interface filter. Averages the m^3 fine children (skipping solid
+/// children), derives rho/u, and returns fneq = childAvg - feq(rho,u) plus the
+/// cell's own rho/u/velocity-capped state. Returns false when the cell has no
+/// fluid children (fully solid) so the caller can drop it from the stencil.
+__device__ __forceinline__ bool childAvgFneq(
+    const FPop* __restrict__ ff, const std::uint8_t* __restrict__ fineFlags,
+    long long fineNxny, long long fineNcellsPad, int fineNx,
+    int fxc, int fyc, int fzc, int factor, float fneqOut[kQ],
+    float& rhoOut, float& uxOut, float& uyOut, float& uzOut) {
+    float fi[kQ];
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) fi[q] = 0.0f;
+    int nFluid = 0;
+    for (int k = 0; k < factor; ++k)
+        for (int j = 0; j < factor; ++j)
+            for (int i = 0; i < factor; ++i) {
+                const long long pfc =
+                    pIdx(fxc + i, fyc + j, fzc + k, fineNx, fineNxny);
+                if (fineFlags[pfc] == kFlagSolid) continue;
+                ++nFluid;
+#pragma unroll
+                for (int q = 0; q < kQ; ++q)
+                    fi[q] += ff[static_cast<long long>(q) * fineNcellsPad + pfc];
+            }
+    if (nFluid == 0) return false;
+
+    const float invN = 1.0f / static_cast<float>(nFluid);
+    float rho = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        fi[q] *= invN;
+        rho += fi[q]; jx += rf_cx[q] * fi[q];
+        jy += rf_cy[q] * fi[q]; jz += rf_cz[q] * fi[q];
+    }
+    rho = fmaxf(rho, 0.05f);
+    const float invRho = 1.0f / rho;
+    float ux = jx * invRho, uy = jy * invRho, uz = jz * invRho;
+    const float u2 = ux * ux + uy * uy + uz * uz;
+    if (u2 > kMaxSimSpeed * kMaxSimSpeed) {
+        const float sc = kMaxSimSpeed * rsqrtf(u2);
+        ux *= sc; uy *= sc; uz *= sc;
+    }
+    float feq[kQ];
+    equilibrium19(rho, ux, uy, uz, feq);
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) fneqOut[q] = fi[q] - feq[q];
+    rhoOut = rho; uxOut = ux; uyOut = uy; uzOut = uz;
+    return true;
+}
 
 __global__ void fineToCoarseRestrictKernel(
     const FPop* __restrict__ ff, const std::uint8_t* __restrict__ fineFlags,
@@ -228,67 +356,57 @@ __global__ void fineToCoarseRestrictKernel(
         static_cast<float>(dEdge + 1)
             / static_cast<float>(kRestrictBlendCoarse + 1));
 
-    // The m^3 fine children of this coarse cell (patch-local fine coords).
+    // ---- center cell: child-averaged fneq + its own rho/u ----------------
+    // Stair-step walls differ slightly between levels; childAvgFneq averages
+    // over the fluid children only (skipping fine-solid children at the wall).
     const int fx = factor * (xc - boxX0);
     const int fy = factor * (yc - boxY0);
     const int fz = factor * zc;
+    float fneqC[kQ], rho, ux, uy, uz;
+    if (!childAvgFneq(ff, fineFlags, fineNxny, fineNcellsPad, fineNx,
+                      fx, fy, fz, factor, fneqC, rho, ux, uy, uz))
+        return; // fully solid at the fine level: leave coarse value
 
-    // ---- average fluid children per q, accumulate the averaged state -----
-    // Stair-step walls differ slightly between levels: a coarse-fluid cell
-    // may own fine-solid children right at the surface — average over the
-    // fluid children only. The child set is identical for every q, so the
-    // fluid mask is built once.
-    float fi[kQ];
+    // ---- Lagrava 1/19 box filter on fneq (Lagrava et al. 2012, Eq. 33) ----
+    // The small fine-grid structures otherwise pollute the coarse grid and
+    // trigger the high-ratio instability. Average fneq over this node and its
+    // 18 lattice neighbours (fneq ONLY — never rho/u, which would over-dissipate
+    // and inflate the interface viscosity). Neighbours outside the patch or with
+    // no fluid children simply drop from the average. q=0 is the node itself.
+    float fneqF[kQ];
 #pragma unroll
-    for (int q = 0; q < kQ; ++q) fi[q] = 0.0f;
-    int nFluid = 0;
-    for (int k = 0; k < factor; ++k) {
-        for (int j = 0; j < factor; ++j) {
-            for (int i = 0; i < factor; ++i) {
-                const long long pfc =
-                    pIdx(fx + i, fy + j, fz + k, fineNx, fineNxny);
-                if (fineFlags[pfc] == kFlagSolid) continue;
-                ++nFluid;
+    for (int q = 0; q < kQ; ++q) fneqF[q] = fneqC[q];
+    int nStencil = 1;
+    for (int n = 1; n < kQ; ++n) {
+        const int nxc = xc + rf_cx[n];
+        const int nyc = yc + rf_cy[n];
+        const int nzc = zc + rf_cz[n];
+        // Stay inside the restricted sub-box in x/y; z wraps periodically.
+        if (nxc < rx0 || nxc >= rx1 || nyc < ry0 || nyc >= ry1) continue;
+        const int nzw = (nzc + coarseNz) % coarseNz;
+        float fneqN[kQ], rn, un, vn, wn;
+        if (!childAvgFneq(ff, fineFlags, fineNxny, fineNcellsPad, fineNx,
+                          factor * (nxc - boxX0), factor * (nyc - boxY0),
+                          factor * nzw, factor, fneqN, rn, un, vn, wn))
+            continue;
 #pragma unroll
-                for (int q = 0; q < kQ; ++q)
-                    fi[q] += ff[static_cast<long long>(q) * fineNcellsPad + pfc];
-            }
-        }
+        for (int q = 0; q < kQ; ++q) fneqF[q] += fneqN[q];
+        ++nStencil;
     }
-    if (nFluid == 0) return; // fully solid at the fine level: leave coarse value
-
-    const float invN = 1.0f / static_cast<float>(nFluid);
-    float rho = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
+    const float invS = 1.0f / static_cast<float>(nStencil);
 #pragma unroll
-    for (int q = 0; q < kQ; ++q) {
-        fi[q] *= invN;
-        rho += fi[q];
-        jx += rf_cx[q] * fi[q];
-        jy += rf_cy[q] * fi[q];
-        jz += rf_cz[q] * fi[q];
-    }
-    rho = fmaxf(rho, 0.05f);
-    const float invRho = 1.0f / rho;
-    float ux = jx * invRho, uy = jy * invRho, uz = jz * invRho;
+    for (int q = 0; q < kQ; ++q) fneqF[q] *= invS;
 
-    // Velocity-validity cap, mirroring the fill kernel and the collision
-    // limiter — the inverse fneq rescale below AMPLIFIES the non-equilibrium
-    // part by m, so an already-hot averaged state must not also carry an
-    // over-bound velocity into the coarse grid.
-    const float u2 = ux * ux + uy * uy + uz * uz;
-    if (u2 > kMaxSimSpeed * kMaxSimSpeed) {
-        const float sc = kMaxSimSpeed * rsqrtf(u2);
-        ux *= sc; uy *= sc; uz *= sc;
-    }
-
-    // ---- inverse rescale + edge blend with the coarse-evolved state -------
+    // ---- regularize the filtered fneq (Latt-Chopard), then inverse-rescale
+    // and edge-blend with the coarse-evolved state ------------------------
+    regularizeFneq(fneqF);
     float feq[kQ];
     equilibrium19(rho, ux, uy, uz, feq);
     float br = 0.0f, bjx = 0.0f, bjy = 0.0f, bjz = 0.0f;
 #pragma unroll
     for (int q = 0; q < kQ; ++q) {
         const long long idx = static_cast<long long>(q) * coarseNcellsPad + pc;
-        const float restricted = feq[q] + neqScaleInv * (fi[q] - feq[q]);
+        const float restricted = feq[q] + neqScaleInv * fneqF[q];
         const float existing   = fc[idx]; // coarse post-collision value
         const float blended    = existing + blend * (restricted - existing);
         fc[idx] = blended;
@@ -400,7 +518,8 @@ cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
                                    float tauCoarse, float tauFine,
                                    bool fullVolume, cudaStream_t stream) {
     const long long fineNcells = fine.dims.cellCount();
-    if (fineNcells <= 0 || !coarseT0.f || !coarseT1F || !fine.f || !fine.flags
+    if (fineNcells <= 0 || !coarseT0.f || !coarseT0.flags || !coarseT1F
+        || !fine.f || !fine.flags
         || !box.valid() || factor < 2 || factor > kMaxRefineFactor)
         return cudaErrorInvalidValue;
 
@@ -413,7 +532,7 @@ cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
     const float neqScale = tauFine / (static_cast<float>(factor) * tauCoarse);
 
     coarseToFineFillKernel<<<gridFor(fineNcells), kBlock, 0, stream>>>(
-        coarseT0.f, coarseT1F, fine.flags, fine.f,
+        coarseT0.f, coarseT1F, coarseT0.flags, fine.flags, fine.f,
         fineNcells, fineNxny, fine.dims.paddedCellCount(),
         fine.dims.nx, fine.dims.ny,
         coarseNxny, coarseT0.dims.paddedCellCount(), coarseT0.dims.nx,

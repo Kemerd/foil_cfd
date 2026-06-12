@@ -90,6 +90,16 @@ struct RefinementInfo {
     bool           forcesFromFine = false; ///< Momentum exchange runs on the
                                       ///< fine grid (true when the patch
                                       ///< covers every coarse solid cell).
+
+    // ---- nested VG patch (third level): tiny box at 2x the fine factor,
+    // hugging the VG vanes. Active only when VGs exist and the fine patch is on.
+    bool           finerActive = false;  ///< Finer level allocated and stepping.
+    int            finerFactor = 0;      ///< Factor m2 relative to the FINE
+                                         ///< grid (effective vs coarse = m*m2).
+    PatchBox       finerBox;             ///< Nested box, in FINE cells.
+    GridDims       finerDims;            ///< Finer grid dimensions.
+    LatticeScaling finerScaling;         ///< refinedScaling(fineScaling, m2).
+    double         finerVramBytes = 0.0; ///< Finer f-pair + flag allocation.
 };
 
 /// @brief Host orchestrator for the D3Q19 TRT-Smagorinsky solver.
@@ -171,6 +181,44 @@ public:
     /// run setFlags() (coarse, cold restart) first, then this.
     /// @param fineFlags New fine flag field (must match the active fine dims).
     void setRefinedFlags(const std::vector<std::uint8_t>& fineFlags);
+
+    // ------ nested VG patch (third level) ------
+
+    /// @brief Allocate and seed the FINER level over the given box (in FINE
+    /// cells) at factor @p m2 relative to the fine grid — a tiny patch hugging
+    /// the VG vanes, where the finest wall treatment and vortex resolution
+    /// live. Requires an active fine level (the finer level couples to it the
+    /// same way the fine level couples to the coarse grid). Seeded from the
+    /// current fine field, so this is valid at any point of a run. Replaces any
+    /// previous finer level and fails gracefully on OOM — the two-level sim
+    /// keeps running.
+    /// @param finerBox   Nested box in FINE cells (deriveVGPatchBoxFine output).
+    /// @param m2         Factor relative to the fine grid (typically 2).
+    /// @param finerFlags Finer flag field, fineDimsFor(finerBox, fineDims, m2)
+    ///                   .cellCount() bytes, with the Interface shell stamped.
+    /// @param error      On failure, receives a human-readable reason.
+    /// @return True on success.
+    bool initFinerRefinement(const PatchBox& finerBox, int m2,
+                             const std::vector<std::uint8_t>& finerFlags,
+                             std::string* error);
+
+    /// @brief Release the finer level (no-op when inactive). The fine and
+    /// coarse sim continue unaffected.
+    void shutdownFinerRefinement();
+
+    /// @brief Replace the finer-level flag field (VG edit at fixed box) and
+    /// re-seed the finer state from the fine field. Callers run setFlags() +
+    /// setRefinedFlags() first.
+    /// @param finerFlags New finer flag field (must match the active finer dims).
+    void setRefinedFinerFlags(const std::vector<std::uint8_t>& finerFlags);
+
+    /// @brief Finer-level analog of setRefinedSurfaceReference: the VG-free
+    /// finer flag field the finer wall list derives foil normals and VG
+    /// exclusion from. Call after initFinerRefinement()/setRefinedFinerFlags()
+    /// whenever the clean finer geometry changes.
+    /// @param finerCleanFlags Clean finer flag field (must match finer dims).
+    void setRefinedFinerSurfaceReference(
+        const std::vector<std::uint8_t>& finerCleanFlags);
 
     /// @brief Refinement status for the UI (zeroed RefinementInfo when off).
     RefinementInfo refinementInfo() const;

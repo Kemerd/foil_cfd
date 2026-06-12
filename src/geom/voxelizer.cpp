@@ -10,6 +10,9 @@
 #include <cmath>
 #include <limits>
 
+#include "vg.h" // VGParams + voxelizeVG, for deriveVGPatchBoxFine (cycle-free:
+                // vg.h includes voxelizer.h, this .cpp includes vg.h)
+
 namespace foilcfd {
 namespace {
 
@@ -290,6 +293,34 @@ PatchBox derivePatchBox(const GridDims& dims,
     box.y0 = std::max(clearance, sy0 - marginY0);
     box.y1 = std::min(dims.ny - clearance, sy1 + 1 + marginY1);
     return box;
+}
+
+PatchBox deriveVGPatchBoxFine(const DomainLayout& fineLayout,
+                              const std::vector<VGParams>& vgs,
+                              const AirfoilGeometry& airfoil, float aoa_deg,
+                              int marginX0, int marginX1,
+                              int marginY0, int marginY1) {
+    // No vanes -> no nested level. Return the default-invalid box so the caller
+    // tears down (or never builds) level 2.
+    if (vgs.empty()) return PatchBox{};
+
+    // VG-only field at the FINE resolution: start all-Fluid, stamp ONLY the
+    // vanes. We deliberately skip the airfoil, TE closure, and Interface shell —
+    // derivePatchBox keys off Solid cells, and the only Solid we want measured
+    // here is the vane envelope (the foil under the vanes is covered separately
+    // in the level-2 flag field the solver actually steps).
+    std::vector<std::uint8_t> vgOnly(
+        static_cast<std::size_t>(fineLayout.dims.cellCount()), kFluid);
+    for (const VGParams& vg : vgs)
+        voxelizeVG(vg, airfoil, aoa_deg, fineLayout, vgOnly);
+
+    // Keep at least kInterfaceShellFine + 3 fine cells between the box and every
+    // fine-domain face: the fine Interface shell carries one-sub-step-old
+    // boundary populations, not evolved fluid, so the level-2 interpolation
+    // stencil (and the restriction band) must never reach it.
+    const int clearance = kInterfaceShellFine + 3;
+    return derivePatchBox(fineLayout.dims, vgOnly, marginX0, marginX1, marginY0,
+                          marginY1, clearance);
 }
 
 } // namespace foilcfd

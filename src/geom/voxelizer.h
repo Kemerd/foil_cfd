@@ -14,6 +14,10 @@
 
 namespace foilcfd {
 
+// VG model lives in vg.h, which includes THIS header — forward-declare to keep
+// the dependency one-directional (deriveVGPatchBoxFine takes VGParams by ref).
+struct VGParams;
+
 /// @brief Where the foil sits inside the lattice and how big it is. The
 /// defaults reproduce the plan 4.6 layout: chord = N_c cells, quarter-chord
 /// anchored at x = 0.3*nx, mid-height. Snapshot keys depend on grid dims and
@@ -160,5 +164,38 @@ PatchBox derivePatchBox(const GridDims& dims,
                         const std::vector<std::uint8_t>& flags,
                         int marginX0, int marginX1, int marginY0, int marginY1,
                         int clearance = 3);
+
+// ===========================================================================
+// Nested VG patch (third level, plan "nested-4x"). The finer level is a tiny
+// sub-box of the FINE patch, run at 2x the fine factor, hugging only the VG
+// vanes. Its box is expressed in FINE cells (it couples to the fine grid the
+// same way the fine grid couples to the coarse grid), so the same derivePatchBox
+// machinery applies — only the source flag field (VGs alone) and the larger
+// clearance (the fine Interface shell is an invalid interpolation source) differ.
+// ===========================================================================
+
+/// @brief Derive the nested VG refinement box, in FINE cells, from the VG
+/// vanes alone: voxelize every VG (NO foil, NO TE closure, NO shell) into an
+/// all-Fluid field at the fine layout, take the tight Solid bbox via
+/// derivePatchBox, and pad it by the given margins so the box is roughly 2x the
+/// vane envelope with the vanes centered. The clearance is forced to at least
+/// kInterfaceShellFine + 3 fine cells so the box never reaches the fine level's
+/// own Interface shell (whose populations are one-sub-step-old boundary data,
+/// not evolved fluid — an invalid source for the level-2 interpolation stencil).
+/// @param fineLayout The FINE level's layout (makeFineLayout output).
+/// @param vgs        Configured VG entries (empty -> invalid box).
+/// @param airfoil    Section the VGs mount on (placement frame source).
+/// @param aoa_deg    Current angle of attack (vanes rotate with the foil).
+/// @param marginX0   Fine cells added upstream  (-x) of the vane bbox.
+/// @param marginX1   Fine cells added downstream (+x).
+/// @param marginY0   Fine cells added below (-y).
+/// @param marginY1   Fine cells added above (+y).
+/// @return Box in FINE cells; .valid() is false when there are no VGs or the
+///         padded box is below the coupling minimum (caller skips level 2).
+PatchBox deriveVGPatchBoxFine(const DomainLayout& fineLayout,
+                              const std::vector<VGParams>& vgs,
+                              const AirfoilGeometry& airfoil, float aoa_deg,
+                              int marginX0, int marginX1,
+                              int marginY0, int marginY1);
 
 } // namespace foilcfd
