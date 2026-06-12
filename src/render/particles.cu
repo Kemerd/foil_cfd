@@ -195,6 +195,32 @@ __device__ float3 coolwarmColor(float t) {
     return lerp3(white, red, s * s * (3.0f - 2.0f * s));
 }
 
+/// Inferno (matplotlib) sequential hot map: near-black through purple and red
+/// to orange and pale yellow. Degree-6 polynomial fit (Matt Zucker, public
+/// domain, shadertoy XtGGzG) — perceptually uniform like viridis but reads as
+/// the "heat" palette the wind-tunnel velocity volume wants.
+__device__ float3 infernoColor(float t) {
+    t = fminf(fmaxf(t, 0.0f), 1.0f);
+    const float3 c0 = make_float3(-0.00021f,  0.00016f, -0.01976f);
+    const float3 c1 = make_float3( 0.10677f,  0.56329f,  3.93245f);
+    const float3 c2 = make_float3(11.60249f, -3.97282f, -15.94254f);
+    const float3 c3 = make_float3(-41.70399f, 17.43639f,  44.35414f);
+    const float3 c4 = make_float3(77.16296f, -33.40235f, -81.80730f);
+    const float3 c5 = make_float3(-71.31899f, 32.62606f,  73.20951f);
+    const float3 c6 = make_float3(25.13112f, -12.24266f, -23.07032f);
+    // Horner evaluation, vectorized by hand over the three channels.
+    float3 r = c6;
+    r = fma3(r, t, c5);
+    r = fma3(r, t, c4);
+    r = fma3(r, t, c3);
+    r = fma3(r, t, c2);
+    r = fma3(r, t, c1);
+    r = fma3(r, t, c0);
+    return make_float3(fminf(fmaxf(r.x, 0.0f), 1.0f),
+                       fminf(fmaxf(r.y, 0.0f), 1.0f),
+                       fminf(fmaxf(r.z, 0.0f), 1.0f));
+}
+
 // ===========================================================================
 // Respawn helpers (plan 9.1: inlet respawn rate-balanced + volume re-seeding).
 // ===========================================================================
@@ -385,7 +411,8 @@ __global__ void sliceFillKernel(cudaSurfaceObject_t surface,
     }
     if (!isfinite(tNorm)) tNorm = 0.0f;
 
-    const float3 rgb = (prm.colormap == 1) ? coolwarmColor(tNorm)
+    const float3 rgb = (prm.colormap == 2) ? infernoColor(tNorm)
+                     : (prm.colormap == 1) ? coolwarmColor(tNorm)
                                            : viridisColor(tNorm);
     surf2Dwrite(make_uchar4(static_cast<unsigned char>(rgb.x * 255.0f + 0.5f),
                             static_cast<unsigned char>(rgb.y * 255.0f + 0.5f),
@@ -443,6 +470,44 @@ __global__ void qCriterionKernel(cudaSurfaceObject_t surface,
         }
     }
     surf3Dwrite(out, surface, x * static_cast<int>(sizeof(unsigned char)), y, z);
+}
+
+/// Velocity-volume fill: one thread per cell. Writes the normalized speed
+/// magnitude |u| / speedScale (clamped to [0,1]) as a single float into the
+/// 3D surface. Solid cells and the one-cell domain boundary ring write 0 so
+/// the raymarcher's "void" test (value == 0) leaves the foil interior and the
+/// box shell fully transparent. The color palette and the slow-air opacity
+/// curve live entirely in the shader, so this scalar is all it needs.
+__global__ void velocityVolumeKernel(cudaSurfaceObject_t surface,
+                                     DeviceVelocityField vel,
+                                     const std::uint8_t* flags,
+                                     VelocityVolumeParams prm) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
+    const GridDims d = vel.dims;
+    if (x >= d.nx || y >= d.ny || z >= d.nz) return;
+
+    float out = 0.0f;
+    // Skip the boundary ring: inlet/outlet/wall planes carry imposed values
+    // that would paint a bright shell around the whole domain. Interior fluid
+    // only, exactly like the Q volume.
+    const bool interior = x > 0 && x < d.nx - 1 && y > 0 && y < d.ny - 1
+                       && z > 0 && z < d.nz - 1;
+    const bool isSolid = flags && flags[cellIndex(x, y, z, d)]
+                                      == static_cast<std::uint8_t>(CellFlag::Solid);
+    if (interior && !isSolid) {
+        const long long c = cellIndex(x, y, z, d);
+        const float ux = vel.u[c], uy = vel.v[c], uz = vel.w[c];
+        const float speed = sqrtf(ux * ux + uy * uy + uz * uz);
+        if (isfinite(speed)) {
+            // Normalize so freestream (~speedScale) lands near 1.0; the shader
+            // owns the actual color ramp and the transparency of slow air.
+            out = fminf(speed / fmaxf(prm.speedScale, 1e-9f), 1.0f);
+        }
+    }
+    // R16/float surface: write one float per voxel.
+    surf3Dwrite(out, surface, x * static_cast<int>(sizeof(float)), y, z);
 }
 
 } // namespace
@@ -506,6 +571,23 @@ cudaError_t launchQCriterionVolume(cudaSurfaceObject_t volumeSurface,
                     (vel.dims.nz + block.z - 1) / block.z);
     qCriterionKernel<<<grid, block, 0, stream>>>(volumeSurface, vel, flags,
                                                  qScale);
+    return cudaGetLastError();
+}
+
+cudaError_t launchVelocityVolume(cudaSurfaceObject_t volumeSurface,
+                                 DeviceVelocityField vel,
+                                 const std::uint8_t* flags,
+                                 const VelocityVolumeParams& params,
+                                 cudaStream_t stream) {
+    if (!volumeSurface || !vel.u || vel.dims.cellCount() <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 block(8, 8, 4);
+    const dim3 grid((vel.dims.nx + block.x - 1) / block.x,
+                    (vel.dims.ny + block.y - 1) / block.y,
+                    (vel.dims.nz + block.z - 1) / block.z);
+    velocityVolumeKernel<<<grid, block, 0, stream>>>(volumeSurface, vel, flags,
+                                                     params);
     return cudaGetLastError();
 }
 

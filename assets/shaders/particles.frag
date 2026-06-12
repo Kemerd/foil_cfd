@@ -8,7 +8,7 @@
 in float vAge;
 in float vKey;
 
-uniform int   uColormap;   // 0 = viridis, 1 = coolwarm
+uniform int   uColormap;   // 0 = viridis, 1 = coolwarm, 2 = inferno
 uniform float uAlphaScale; // overall brightness for the additive blend
 
 out vec4 fragColor;
@@ -35,6 +35,27 @@ vec3 coolwarm(float t) {
                      : mix(white, red,  smoothstep(0.0, 1.0, (t - 0.5) * 2.0));
 }
 
+// Inferno (matplotlib) degree-6 fit — identical coefficients to the CUDA
+// kernels' infernoColor. Black -> purple -> red -> orange -> pale yellow.
+vec3 inferno(float t) {
+    const vec3 c0 = vec3(-0.00021,  0.00016, -0.01976);
+    const vec3 c1 = vec3( 0.10677,  0.56329,  3.93245);
+    const vec3 c2 = vec3(11.60249, -3.97282, -15.94254);
+    const vec3 c3 = vec3(-41.70399, 17.43639,  44.35414);
+    const vec3 c4 = vec3(77.16296, -33.40235, -81.80730);
+    const vec3 c5 = vec3(-71.31899, 32.62606,  73.20951);
+    const vec3 c6 = vec3(25.13112, -12.24266, -23.07032);
+    return clamp(c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6))))), 0.0, 1.0);
+}
+
+// Palette dispatch shared by particles and the volume raymarch (kept in sync
+// with the CUDA-side selector: 2 = inferno, 1 = coolwarm, else viridis).
+vec3 palette(int which, float t) {
+    return (which == 2) ? inferno(t)
+         : (which == 1) ? coolwarm(t)
+                        : viridis(t);
+}
+
 void main() {
     // Round sprite: kill corners of the point square, soften the rim so 1-2px
     // points don't shimmer.
@@ -43,7 +64,7 @@ void main() {
     if (r2 > 0.25) discard;
     float soft = 1.0 - smoothstep(0.15, 0.25, r2);
 
-    vec3 rgb = (uColormap == 1) ? coolwarm(vKey) : viridis(vKey);
+    vec3 rgb = palette(uColormap, vKey);
 
     // Age fade (plan 9.1): newborns bright, dying particles vanish. Slight
     // ease-in keeps freshly respawned inlet sheets from flashing.

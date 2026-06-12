@@ -141,4 +141,38 @@ cudaError_t launchQCriterionVolume(cudaSurfaceObject_t volumeSurface,
                                    const std::uint8_t* flags, float qScale,
                                    cudaStream_t stream);
 
+// ===========================================================================
+// Velocity volume (the hero "wind-tunnel smoke" mode): the per-cell speed
+// magnitude normalized into [0,1], stored as R16 (GL_R16) into a registered
+// GL 3D texture. The raymarch shader colormaps it on the GPU and culls the
+// quiet freestream so only accelerated / wake air lights up (the wind-tunnel
+// smoke look). Storing the SCALAR (not a baked color) keeps the palette + the
+// slow-air opacity entirely in the shader, so both update with zero re-fills.
+// ===========================================================================
+
+/// @brief Parameters for one velocity-volume fill.
+struct VelocityVolumeParams {
+    float speedScale = 0.15f; ///< Speed magnitude (lattice units) mapped to 1.0.
+    int   width      = 0;     ///< Volume texture extent (= grid nx).
+    int   height     = 0;     ///< (= grid ny).
+    int   depth      = 0;     ///< (= grid nz).
+};
+
+/// @brief Fill the velocity-volume 3D texture: write normalized |u| (in
+/// [0,1], clamped) to every cell as a single-channel float, so the raymarch
+/// shader can colormap + threshold it. Solid and domain-boundary cells write
+/// 0 (the shader treats 0 as fully transparent void), keeping the foil
+/// interior and the box shell dark.
+/// @param volumeSurface R16/float surface object over the mapped GL 3D array.
+/// @param vel           Velocity field view.
+/// @param flags         Cell flags (solid masking).
+/// @param params        Volume description (speed normalization + extents).
+/// @param stream        Stream to run on.
+/// @return cudaGetLastError() from the launch.
+cudaError_t launchVelocityVolume(cudaSurfaceObject_t volumeSurface,
+                                 DeviceVelocityField vel,
+                                 const std::uint8_t* flags,
+                                 const VelocityVolumeParams& params,
+                                 cudaStream_t stream);
+
 } // namespace foilcfd

@@ -232,13 +232,14 @@ void handleHotkeys(UIContext& ctx) {
     const ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput) return; // typing a NACA code, not toggling views
     UIParams& p = *ctx.params;
-    // Plan 9.1 mode hotkeys: 1 = particles, 2 = slices, 3 = Q-criterion
-    // raycast (the "screenshot mode"). The foil mesh is not a plan mode and
-    // lives on 4 so all three numbered modes match the spec.
+    // Mode hotkeys: 1 = particles, 2 = slices, 3 = Q-criterion raycast,
+    // 4 = foil mesh, 5 = velocity volume (the default hero "wind-tunnel smoke"
+    // look). Modes overlay freely.
     if (ImGui::IsKeyPressed(ImGuiKey_1, false)) p.viz.showParticles = !p.viz.showParticles;
     if (ImGui::IsKeyPressed(ImGuiKey_2, false)) p.viz.showSlices    = !p.viz.showSlices;
     if (ImGui::IsKeyPressed(ImGuiKey_3, false)) p.viz.showQRaycast  = !p.viz.showQRaycast;
     if (ImGui::IsKeyPressed(ImGuiKey_4, false)) p.viz.showFoilMesh  = !p.viz.showFoilMesh;
+    if (ImGui::IsKeyPressed(ImGuiKey_5, false)) p.viz.showVelocityVolume = !p.viz.showVelocityVolume;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) p.running = !p.running;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) ctx.events->frameFoilView = true;
 }
@@ -1031,7 +1032,35 @@ void drawViewPanel(UIContext& ctx) {
     UIEvents& ev = *ctx.events;
     if (!ImGui::Begin("View")) { ImGui::End(); return; }
 
+    static const char* kMaps3[] = {"Viridis", "Coolwarm", "Inferno"};
+
     ImGui::TextDisabled("MODES");
+
+    // ---- velocity volume: the default hero "wind-tunnel smoke" look ----
+    ImGui::Checkbox("Velocity volume  [5]", &p.viz.showVelocityVolume);
+    helpMarker("The hero view: a volume raymarch of the air speed. Fast and "
+               "wake air glows hot; the quiet freestream fades to a faint haze "
+               "you can still see through. Color = speed, no streamlines.");
+    if (p.viz.showVelocityVolume) {
+        ImGui::Indent();
+        int vm = static_cast<int>(p.viz.volumeColormap);
+        if (ImGui::Combo("Palette", &vm, kMaps3, 3))
+            p.viz.volumeColormap = static_cast<Colormap>(vm);
+        // Slow-air haze: floor opacity for undisturbed air. NOT a hard cull —
+        // low but non-zero by default so the body stays faintly visible.
+        ImGui::SliderFloat("Slow-air opacity", &p.viz.slowAirOpacity, 0.0f, 0.5f,
+                           "%.2f");
+        helpMarker("How visible the calm, undisturbed air is. 0 = invisible "
+                   "(only disturbed air shows), higher = more of a translucent "
+                   "fog so you can see structure underneath.");
+        ImGui::SliderFloat("Disturbed density", &p.viz.volumeDensity, 0.1f, 1.0f,
+                           "%.2f");
+        // Which speed maps to the top of the palette (contrast knob).
+        ImGui::SliderFloat("Speed scale", &p.viz.velocitySpeedScale, 0.02f, 0.4f,
+                           "%.3f");
+        ImGui::Unindent();
+    }
+
     ImGui::Checkbox("Particles  [1]", &p.viz.showParticles);
     ImGui::Checkbox("Slices  [2]", &p.viz.showSlices);
     ImGui::Checkbox("Q-criterion isosurface  [3]", &p.viz.showQRaycast);
@@ -1049,9 +1078,22 @@ void drawViewPanel(UIContext& ctx) {
         // VizSettings each frame).
         ImGui::SliderFloat("Q scale", &p.viz.qScale, 1e-6f, 1e-3f, "%.1e",
                            ImGuiSliderFlags_Logarithmic);
+        // Color the cores by local speed (shares the velocity volume) instead
+        // of the flat cyan tint.
+        ImGui::Checkbox("Color by velocity", &p.viz.qColorByVelocity);
         ImGui::Unindent();
     }
+
+    ImGui::Spacing();
     ImGui::Checkbox("Foil mesh  [4]", &p.viz.showFoilMesh);
+    if (p.viz.showFoilMesh) {
+        ImGui::Indent();
+        ImGui::Checkbox("Wireframe", &p.viz.foilWireframe);
+        helpMarker("Draw the airfoil/VG geometry as an edge cage instead of a "
+                   "shaded solid — handy for seeing the flow field through the "
+                   "body.");
+        ImGui::Unindent();
+    }
     if (ImGui::Button("Focus foil  [F]")) ev.frameFoilView = true;
 
     // ---- particles ----
@@ -1071,9 +1113,8 @@ void drawViewPanel(UIContext& ctx) {
         int cb = static_cast<int>(p.viz.particleColorBy);
         if (ImGui::Combo("Color by", &cb, kColorBy, 2))
             p.viz.particleColorBy = static_cast<ParticleColorBy>(cb);
-        static const char* kMaps[] = {"Viridis", "Coolwarm"};
         int cm = static_cast<int>(p.viz.particleColormap);
-        if (ImGui::Combo("Colormap", &cm, kMaps, 2))
+        if (ImGui::Combo("Colormap", &cm, kMaps3, 3))
             p.viz.particleColormap = static_cast<Colormap>(cm);
         ImGui::SliderFloat("Point size", &p.viz.particlePointSize, 0.5f, 4.0f,
                            "%.1f px");

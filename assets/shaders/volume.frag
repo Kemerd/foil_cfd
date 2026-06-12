@@ -1,31 +1,31 @@
-// Q-criterion raycast fragment stage: fixed-step march of the eye ray through
-// the normalized Q volume (R8 3D texture); cells above the threshold light up
-// and composite front-to-back. The box is drawn with FRONT faces culled (back
-// faces rasterized) so the march also works with the camera inside the domain.
+// Velocity-volume fragment stage: fixed-step march of the eye ray through the
+// normalized speed volume (single-channel float 3D texture), colormapped on
+// the GPU with the quiet freestream culled to a faint haze. This is the hero
+// "wind-tunnel smoke" look: fast / wake air glows hot, undisturbed air stays
+// nearly transparent so you can see the structure floating in space.
 //
-// Two correctness pieces:
-//   1. The march terminates at the opaque scene (foil/VG mesh) by reading the
-//      depth-buffer copy in uSceneDepth, so geometry correctly occludes vortex
-//      cores that sit BEHIND it along the view ray (fixes the foil appearing
-//      to float over the isosurface from every angle).
-//   2. Optional velocity coloring (uColorByVel): instead of the fixed cyan
-//      core tint, sample the speed volume and colormap it, so the isosurface
-//      carries the same velocity field the volume mode shows.
+// Two correctness pieces beyond a plain volume render:
+//   1. Slow-air opacity is a SLIDER (uSlowOpacity), not a hard cull — slow
+//      cells keep a small floor alpha so the body and the field underneath
+//      stay faintly visible instead of vanishing into black.
+//   2. The march terminates at the opaque scene (foil/VG mesh) by reading the
+//      depth buffer copied into uSceneDepth, so geometry correctly occludes
+//      vortices that sit BEHIND it along the view ray (the old bug: the foil
+//      appeared to float over the volume from every angle).
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 #version 330 core
 
 in vec3 vWorldPos; // back-face hit point, lattice cell space
 
-uniform sampler3D uVolume;       // normalized Q in [0,1]
-uniform sampler3D uSpeedVolume;  // normalized speed |u| in [0,1] (vel coloring)
+uniform sampler3D uVolume;       // normalized speed |u| in [0,1]
 uniform sampler2D uSceneDepth;   // copied depth buffer of the opaque pass
 uniform vec3  uDims;             // grid dimensions in cells
 uniform vec3  uEye;              // camera position, cell space
 uniform mat4  uInvViewProj;      // clip -> world, to un-project the depth fetch
 uniform vec2  uViewport;         // framebuffer size (pixels), for depth fetch
-uniform float uThreshold;        // iso threshold on normalized Q
-uniform int   uColorByVel;       // 0 = fixed cyan cores, 1 = speed colormap
-uniform int   uColormap;         // palette selector when coloring by velocity
+uniform int   uColormap;         // palette selector (2 = inferno default)
+uniform float uSlowOpacity;      // floor alpha for quiet/freestream air [0,1]
+uniform float uDensity;          // overall opacity gain for fast air
 
 out vec4 fragColor;
 
@@ -74,8 +74,9 @@ vec2 intersectBox(vec3 ro, vec3 rd) {
                 min(min(tmax3.x, tmax3.y), tmax3.z));
 }
 
-// Un-project a window-space depth sample into a WORLD-space position so its
-// eye distance is exact along the view ray, regardless of view angle.
+// Un-project a window-space depth sample at this fragment into a WORLD-space
+// position, so its distance from the eye is exact along the view ray (no
+// forward-axis / cosine bookkeeping needed). Returns the world point.
 vec3 worldFromDepth(vec2 uv, float depth) {
     vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 world = uInvViewProj * ndc;
@@ -89,6 +90,9 @@ void main() {
     float tFar  = min(hit.y, length(vWorldPos - uEye));
 
     // ---- occlude against the opaque scene (depth-buffer copy) -------------
+    // Reconstruct the foil's world position from its depth sample and clamp
+    // the march to its distance from the eye, so solid geometry correctly
+    // hides vortices behind it at ANY view angle (the old floating-foil bug).
     vec2 uv = gl_FragCoord.xy / uViewport;
     float sceneD = texture(uSceneDepth, uv).r;
     if (sceneD < 1.0) {
@@ -97,48 +101,41 @@ void main() {
     }
     if (tFar <= tNear) discard;
 
-    const int   kSteps = 160;
+    // Fixed step count keeps the cost bounded on huge grids; ~1.5-cell steps
+    // at the default domain.
+    const int kSteps = 192;
     float stepLen = (tFar - tNear) / float(kSteps);
-    vec3  texel   = 1.0 / uDims;
 
     vec3  accumRgb = vec3(0.0);
     float accumA   = 0.0;
-    vec3  L = normalize(vec3(-0.45, 0.80, 0.40)); // matches the mesh key light
 
     for (int i = 0; i < kSteps; ++i) {
         vec3 p = uEye + rd * (tNear + (float(i) + 0.5) * stepLen);
         vec3 uvw = p / uDims;
-        float q = texture(uVolume, uvw).r;
-        if (q > uThreshold) {
-            // Gradient of the Q field = surface normal of the pseudo-iso.
-            float gx = texture(uVolume, uvw + vec3(texel.x, 0, 0)).r
-                     - texture(uVolume, uvw - vec3(texel.x, 0, 0)).r;
-            float gy = texture(uVolume, uvw + vec3(0, texel.y, 0)).r
-                     - texture(uVolume, uvw - vec3(0, texel.y, 0)).r;
-            float gz = texture(uVolume, uvw + vec3(0, 0, texel.z)).r
-                     - texture(uVolume, uvw - vec3(0, 0, texel.z)).r;
-            vec3 g = vec3(gx, gy, gz);
-            vec3 N = (dot(g, g) > 1e-12) ? normalize(-g) : -rd;
-            if (dot(N, rd) > 0.0) N = -N;
+        float s = texture(uVolume, uvw).r;   // normalized speed in [0,1]
+        // Exact-zero cells are void (solid interior / boundary ring) — skip so
+        // the foil shell and domain walls never tint the haze.
+        if (s <= 0.0) continue;
 
-            float diffuse = max(dot(N, L), 0.0);
-            float rim = pow(1.0 - clamp(dot(N, -rd), 0.0, 1.0), 2.0);
-            float density = smoothstep(uThreshold,
-                                       min(uThreshold + 0.1, 1.0), q);
-            // Surface color: pale cyan cores by default, or the speed colormap
-            // when the user asks the isosurface to carry the velocity field.
-            vec3 base = (uColorByVel == 1)
-                          ? palette(uColormap, texture(uSpeedVolume, uvw).r)
-                          : vec3(0.55, 0.85, 0.95);
-            vec3 shade = base * (0.25 + 0.75 * diffuse) + vec3(0.25) * rim;
+        // Opacity curve: quiet air (s near the freestream baseline) keeps only
+        // the user's floor alpha (uSlowOpacity) so it reads as faint haze;
+        // faster-or-slower-than-stream air ramps up smoothly toward uDensity.
+        // "Disturbance" is distance from the freestream baseline (~the speed
+        // the volume normalizes to 1.0), so both the suction-peak speedup and
+        // the wake slowdown light up.
+        float disturb = clamp(abs(s - 1.0) * 1.4 + max(s - 1.0, 0.0), 0.0, 1.0);
+        float a = mix(uSlowOpacity, uDensity, disturb);
 
-            float a = density * 0.35;
-            accumRgb += (1.0 - accumA) * a * shade;
-            accumA   += (1.0 - accumA) * a;
-            if (accumA > 0.95) break;
-        }
+        // Per-step alpha scaled by step length so the look is resolution
+        // independent (more steps != denser fog).
+        a = 1.0 - pow(1.0 - clamp(a, 0.0, 1.0), stepLen);
+
+        vec3 shade = palette(uColormap, s);
+        accumRgb += (1.0 - accumA) * a * shade;
+        accumA   += (1.0 - accumA) * a;
+        if (accumA > 0.98) break;
     }
 
-    if (accumA <= 0.003) discard;
+    if (accumA <= 0.002) discard;
     fragColor = vec4(accumRgb, accumA);
 }

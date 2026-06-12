@@ -29,8 +29,10 @@ inline constexpr int kDefaultParticleCount = 1'000'000;
 
 /// @brief Colormaps offered for field rendering. NO rainbow/jet (plan 9.1):
 /// sequential viridis for speed-like scalars, diverging coolwarm for signed
-/// quantities (vorticity-z, pressure deviation).
-enum class Colormap { Viridis, Coolwarm };
+/// quantities (vorticity-z, pressure deviation), and inferno — a perceptually
+/// uniform "heat" map — for the velocity-volume wind-tunnel look. Numeric
+/// order matches the shader/kernel palette selector (0/1/2).
+enum class Colormap { Viridis, Coolwarm, Inferno };
 
 /// @brief What scalar drives particle color (plan 9.1).
 enum class ParticleColorBy { Speed, VorticityMag };
@@ -63,9 +65,28 @@ struct SliceConfig {
 /// Modes can overlay freely (plan 9.1: hotkeys 1/2/3, all can overlay).
 struct VizSettings {
     // -- mode toggles --
-    bool showParticles = true;    ///< Mode 1, the hero mode.
+    bool showParticles = false;   ///< Mode 1 (off by default: the velocity
+                                  ///< volume below is the new hero mode).
     bool showSlices    = false;   ///< Mode 2.
     bool showFoilMesh  = true;    ///< Extruded foil + VG geometry.
+    bool foilWireframe = false;   ///< Draw the foil/VG mesh as wireframe lines
+                                  ///< instead of shaded solid (view option).
+
+    // -- velocity volume (mode 5, the wind-tunnel "smoke" hero look) --
+    bool  showVelocityVolume = true;  ///< Default ON: raymarch the speed field,
+                                      ///< color it, cull the quiet freestream.
+    Colormap volumeColormap  = Colormap::Inferno; ///< Hot map by default.
+    float velocitySpeedScale = 0.16f; ///< Speed (lattice units) mapped to the
+                                      ///< palette top — ~2x freestream u_lat so
+                                      ///< the wake/suction peak spans the ramp.
+    float slowAirOpacity     = 0.05f; ///< Floor alpha for quiet/freestream air
+                                      ///< (NOT a hard cull: slow air stays a
+                                      ///< faint haze so structure underneath
+                                      ///< it is still visible).
+    float volumeDensity      = 0.85f; ///< Opacity gain for disturbed (fast/wake)
+                                      ///< air at the top of the ramp.
+    int   volumeUpdateEveryNFrames = 2; ///< Recompute cadence (cheap, but the
+                                      ///< field barely moves frame-to-frame).
 
     // -- particle appearance --
     int             particleCount = kDefaultParticleCount;
@@ -94,6 +115,9 @@ struct VizSettings {
     float qScale       = 5e-5f;   ///< Q value mapped to 1.0 in the volume
                                   ///< texture (lattice 1/step^2 units).
     int   qUpdateEveryNFrames = 4;///< Recompute cadence (plan 9.1: every N frames).
+    bool  qColorByVelocity = true;///< Color the isosurface by local speed
+                                  ///< (shares the velocity volume) vs the
+                                  ///< fixed pale-cyan vortex-core tint.
 };
 
 /// @brief Renderer + interop owner. Construction order contract: a current
