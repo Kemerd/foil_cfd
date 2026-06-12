@@ -61,6 +61,23 @@ struct SolverPerfStats {
                                     ///< refinement patch is active).
 };
 
+/// @brief Live status of the iMEM slip-velocity wall function for the UI
+/// sim panel: how many surface cells are wall-modeled, where the sampled y+
+/// sits (the honesty number — y+ far above ~300 means even the log layer is
+/// marginal), and how often the slip safety clamp engaged (a healthy run
+/// clamps essentially never; a large fraction means the model is fighting
+/// the resolved flow and its output should not be trusted).
+struct WallModelReadout {
+    bool  enabled   = false; ///< Wall model switched on by the app.
+    bool  fromFine  = false; ///< Stats below describe the fine level.
+    int   cells     = 0;     ///< Wall cells carrying a live u_tau last update.
+    float meanYplus = 0.0f;  ///< Mean sampled y+ across those cells.
+    float maxYplus  = 0.0f;  ///< Max sampled y+.
+    float clampedFrac = 0.0f;///< Fraction of cells whose slip hit the clamp.
+    int   excludedVG  = 0;   ///< Build: cells dropped for touching VG vanes.
+    int   degenerate  = 0;   ///< Build: cells dropped for unresolvable normals.
+};
+
 /// @brief Status of the two-level refinement patch (plan M-refine), for the
 /// UI Mesh panel. All fields are derived at initRefinement() time.
 struct RefinementInfo {
@@ -181,6 +198,33 @@ public:
     /// @param cleanFlags Clean-foil host flag field (must match init dims).
     void setSurfaceReference(const std::vector<std::uint8_t>& cleanFlags);
 
+    // ------ iMEM slip-velocity wall model (lbm_wallmodel.cuh) ------
+
+    /// @brief Switch the wall-function boundary treatment on or off. ON
+    /// builds the wall-cell lists for the coarse level (and the fine level
+    /// when the patch is active) and allocates the slip fields; OFF frees
+    /// everything and the solver runs the exact plain bounce-back kernels.
+    /// Lists rebuild automatically on every flag change while enabled.
+    /// The setting survives re-init (the app applies its Auto policy).
+    void setWallModelEnabled(bool enabled);
+
+    /// @brief Current wall-model switch state.
+    bool wallModelEnabled() const;
+
+    /// @brief Fine-level analog of setSurfaceReference: the VG-free fine
+    /// flag field (buildFinePatchFlags WITHOUT VG stamping) the fine wall
+    /// list derives foil normals and VG exclusion from. Call after
+    /// initRefinement()/setRefinedFlags() whenever the clean fine geometry
+    /// changes; without it the live fine flags serve as the reference and
+    /// VG exclusion at the fine level degrades to "no exclusion".
+    /// @param fineCleanFlags Clean fine flag field (must match fine dims).
+    void setRefinedSurfaceReference(const std::vector<std::uint8_t>& fineCleanFlags);
+
+    /// @brief Live wall-model diagnostics (zeroed struct when disabled).
+    /// Performs a small synchronous device read — call at UI rate, not per
+    /// frame.
+    WallModelReadout wallModelReadout() const;
+
     /// @brief Run @p n fused stream-collide steps, swapping the ping-pong
     /// buffers each step. Applies the ramped tau (units.h rampedTau) while the
     /// startup ramp is active. Polls the NaN watchdog every 200 steps; on
@@ -220,6 +264,28 @@ public:
     /// (first station where near-wall flow reverses), or < 0 when attached.
     /// Feeds vg.h recommendedStationBand (Lin 2002: VGs 5-10 h upstream).
     float separationOnsetXc() const;
+
+    // ------ crossflow access for the VG vortex audit (geom/vg_audit.h) ------
+
+    /// @brief Download the macroscopic (v, w) crossflow plane at lattice
+    /// column ix into ny*nz host arrays (index y + ny*z). One small D2H
+    /// strided copy + stream sync — UI-rate calls only, like the delta99
+    /// extraction. In the refinement-patch overlap the coarse macro arrays
+    /// already carry fine-derived moments (restriction contract), so the
+    /// plane is patch-accurate for free.
+    /// @return False before init or on a copy failure.
+    bool downloadCrossflowPlane(int ix, std::vector<float>& v,
+                                std::vector<float>& w) const;
+
+    /// @brief Topmost solid row of the CLEAN suction surface at column ix
+    /// (from the setSurfaceReference field, so vanes don't raise it), or -1
+    /// when no surface exists there.
+    int suctionSurfaceY(int ix) const;
+
+    /// @brief Lattice x column for a chordwise station x/c, mapped through
+    /// the projected solid extent (tracks the AoA-rotated foil exactly like
+    /// extractSuctionDelta99 does), or -1 when no geometry is loaded.
+    int latticeXForChordStation(float xc) const;
 
     /// @brief True once the NaN watchdog has tripped; sim is paused.
     bool nanDetected() const;

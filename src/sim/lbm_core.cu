@@ -7,6 +7,7 @@
 #include "lbm_core.cuh"
 
 #include <cmath>
+#include <cuda_fp16.h> // half-bit decode of the wall-model slip field
 
 namespace foilcfd {
 
@@ -204,6 +205,11 @@ __global__ void initFromMacroKernel(FPop* __restrict__ f,
 // its own cell. dst ghost planes are refreshed by a separate tiny kernel.
 // ===========================================================================
 
+/// WM = true compiles in the iMEM slip-velocity wall correction on bounce-
+/// back links (lbm_wallmodel.cuh); WM = false is the exact pre-wall-model
+/// kernel — the if constexpr blocks vanish, so the plain path stays
+/// bit-identical and pays nothing.
+template <bool WM>
 __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     FPop* __restrict__ dst,
                                     const std::uint8_t* __restrict__ flags,
@@ -215,7 +221,7 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     long long nxny, int nx,
                                     float tau0, float magicLambda,
                                     float smagPrefactor, float uInlet,
-                                    int writeMacro) {
+                                    int writeMacro, WallSlipView slip) {
     const long long cell =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (cell >= ncells) return;
@@ -289,6 +295,12 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
     // by the ghost planes — no modulo anywhere in this loop (plan 11). When
     // the z faces are flagged SlipFront/SlipBack instead of being periodic,
     // fluid cells satisfy z in [1,nz-2] too, so the ghosts are never read.
+    // Wall-model slip velocity of THIS cell, decoded lazily on the first
+    // bounce-back link (most fluid cells touch no solid; surface warps pay
+    // one 6-byte read). Dead code when WM is false.
+    float uwx = 0.0f, uwy = 0.0f, uwz = 0.0f;
+    bool uwLoaded = false;
+
     float fpop[kQ];
 #pragma unroll
     for (int q = 0; q < kQ; ++q) {
@@ -314,6 +326,24 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
         const long long cs = solid ? pcell
                                    : (slipY ? pslipY : (slipZ ? pslipZ : pn));
         fpop[q] = load_f(src, static_cast<long long>(qs) * ncellsPad + cs);
+
+        if constexpr (WM) {
+            // Ladd moving-wall bounce-back: the population returning off a
+            // solid link gains 2 w_q rho_w (c_q . u_w)/cs^2 = 6 w_q (c_q.u_w)
+            // (rho_w = 1, O(Ma^2) error). u_w is zero bits for every cell the
+            // wall model excluded, so vanes and degenerate cells stay exact
+            // plain bounce-back even inside the WM instantiation.
+            if (solid) {
+                if (!uwLoaded) {
+                    uwx = __half2float(__ushort_as_half(slip.uwx[cell]));
+                    uwy = __half2float(__ushort_as_half(slip.uwy[cell]));
+                    uwz = __half2float(__ushort_as_half(slip.uwz[cell]));
+                    uwLoaded = true;
+                }
+                fpop[q] += 6.0f * d_w[q]
+                         * (d_cx[q] * uwx + d_cy[q] * uwy + d_cz[q] * uwz);
+            }
+        }
     }
 
     // Macroscopic moments from the freshly streamed populations.
@@ -500,11 +530,17 @@ __global__ void nanWatchdogKernel(const FPop* __restrict__ f,
 // then 3 atomics per block — microseconds at this scale.
 // ===========================================================================
 
+/// WM mirrors the stream-collide template: with the wall model active, the
+/// moving-wall bounce-back hands back 6 w_q (c_q . u_w) less momentum per
+/// solid link, and the wall force tally must say so or the modeled skin
+/// friction silently disappears from Cd.
+template <bool WM>
 __global__ void forceReductionKernel(const FPop* __restrict__ f,
                                      const std::uint8_t* __restrict__ flags,
                                      long long ncells, long long ncellsPad,
                                      long long nxny, int nx,
-                                     float* __restrict__ d_force) {
+                                     float* __restrict__ d_force,
+                                     WallSlipView slip) {
     __shared__ float sFx[kBlock], sFy[kBlock], sFz[kBlock];
     const long long cell =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -515,6 +551,9 @@ __global__ void forceReductionKernel(const FPop* __restrict__ f,
         if (flags[pcell] == kFlagFluid) {
             int x, y, z;
             unpackCell(cell, nx, nxny, x, y, z);
+            // Lazy slip decode, as in the stream-collide hot loop.
+            float uwx = 0.0f, uwy = 0.0f, uwz = 0.0f;
+            bool uwLoaded = false;
 #pragma unroll
             for (int q = 1; q < kQ; ++q) {
                 // Link pointing INTO the candidate wall: neighbor at +c_q.
@@ -525,9 +564,22 @@ __global__ void forceReductionKernel(const FPop* __restrict__ f,
                 if (flags[pn] == kFlagSolid) {
                     const float fq =
                         load_f(f, static_cast<long long>(q) * ncellsPad + pcell);
-                    fx += 2.0f * d_cx[q] * fq;
-                    fy += 2.0f * d_cy[q] * fq;
-                    fz += 2.0f * d_cz[q] * fq;
+                    float corr = 0.0f;
+                    if constexpr (WM) {
+                        if (!uwLoaded) {
+                            uwx = __half2float(__ushort_as_half(slip.uwx[cell]));
+                            uwy = __half2float(__ushort_as_half(slip.uwy[cell]));
+                            uwz = __half2float(__ushort_as_half(slip.uwz[cell]));
+                            uwLoaded = true;
+                        }
+                        // Per link, the wall receives c_q (2 f_q - corr): the
+                        // Ladd correction momentum never reaches the wall.
+                        corr = 6.0f * d_w[q]
+                             * (d_cx[q] * uwx + d_cy[q] * uwy + d_cz[q] * uwz);
+                    }
+                    fx += d_cx[q] * (2.0f * fq - corr);
+                    fy += d_cy[q] * (2.0f * fq - corr);
+                    fz += d_cz[q] * (2.0f * fq - corr);
                 }
             }
         }
@@ -686,7 +738,8 @@ cudaError_t launchSpanwisePerturbation(DeviceLatticeView lattice, float amplitud
 cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 const StepParams& params,
                                 float* macroRho, float* macroU, float* macroV,
-                                float* macroW, cudaStream_t stream) {
+                                float* macroW, cudaStream_t stream,
+                                WallSlipView slip) {
     const long long ncells = src.dims.cellCount();
     if (ncells <= 0 || !src.f || !dst.f || !src.flags) return cudaErrorInvalidValue;
     const bool wantMacro = params.writeMacro && macroRho && macroU && macroV && macroW;
@@ -697,11 +750,21 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
         ? 18.0f * 1.41421356f * params.smagorinskyCs * params.smagorinskyCs
         : 0.0f;
 
-    streamCollideKernel<<<gridFor(ncells), kBlock, 0, stream>>>(
-        src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
-        ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
-        params.tau, params.magicLambda, smagPre, params.uInlet,
-        wantMacro ? 1 : 0);
+    // Template dispatch keeps the plain path's machine code untouched: the
+    // WM=false instantiation IS the pre-wall-model kernel.
+    if (slip.active()) {
+        streamCollideKernel<true><<<gridFor(ncells), kBlock, 0, stream>>>(
+            src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
+            ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
+            params.tau, params.magicLambda, smagPre, params.uInlet,
+            wantMacro ? 1 : 0, slip);
+    } else {
+        streamCollideKernel<false><<<gridFor(ncells), kBlock, 0, stream>>>(
+            src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
+            ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
+            params.tau, params.magicLambda, smagPre, params.uInlet,
+            wantMacro ? 1 : 0, slip);
+    }
     return cudaGetLastError();
 }
 
@@ -775,7 +838,8 @@ cudaError_t launchFillFloat(float* d_dst, long long count, float value,
 }
 
 cudaError_t launchForceReduction(DeviceLatticeView lattice,
-                                 DeviceForceAccumulator acc, cudaStream_t stream) {
+                                 DeviceForceAccumulator acc, cudaStream_t stream,
+                                 WallSlipView slip) {
     const long long ncells = lattice.dims.cellCount();
     if (ncells <= 0 || !lattice.f || !lattice.flags || !acc.d_force)
         return cudaErrorInvalidValue;
@@ -784,9 +848,15 @@ cudaError_t launchForceReduction(DeviceLatticeView lattice,
         err != cudaSuccess)
         return err;
     const long long nxny = static_cast<long long>(lattice.dims.nx) * lattice.dims.ny;
-    forceReductionKernel<<<gridFor(ncells), kBlock, 0, stream>>>(
-        lattice.f, lattice.flags, ncells, lattice.dims.paddedCellCount(), nxny,
-        lattice.dims.nx, acc.d_force);
+    if (slip.active()) {
+        forceReductionKernel<true><<<gridFor(ncells), kBlock, 0, stream>>>(
+            lattice.f, lattice.flags, ncells, lattice.dims.paddedCellCount(),
+            nxny, lattice.dims.nx, acc.d_force, slip);
+    } else {
+        forceReductionKernel<false><<<gridFor(ncells), kBlock, 0, stream>>>(
+            lattice.f, lattice.flags, ncells, lattice.dims.paddedCellCount(),
+            nxny, lattice.dims.nx, acc.d_force, slip);
+    }
     return cudaGetLastError();
 }
 

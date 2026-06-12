@@ -11,8 +11,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "lbm_refine.cuh"
+#include "lbm_wallmodel.cuh"
+#include "wall_model.h"
 
 namespace foilcfd {
 
@@ -179,11 +182,191 @@ struct LBMSolver::Impl {
         return DeviceLatticeView{fine.f[which], fine.flags, fine.dims};
     }
 
+    // ---- iMEM wall model (lbm_wallmodel.cuh + wall_model.h) ----------------
+    // One device mirror of the host-built wall-cell list per level, plus the
+    // half-precision slip field the hot kernels read. Everything here exists
+    // only while the wall model is enabled; the slip view degrades to the
+    // inactive (plain bounce-back) state whenever a level has no list.
+    struct WMLevel {
+        bool           active = false;
+        int            count  = 0;       ///< Listed wall cells.
+        long long*     dCellIdx    = nullptr;
+        long long*     dSampleIdx  = nullptr;
+        float*         dNormalX    = nullptr;
+        float*         dNormalY    = nullptr;
+        float*         dNormalZ    = nullptr;
+        float*         dSampleDist = nullptr;
+        std::uint32_t* dLinkMask   = nullptr;
+        float*         dUTau       = nullptr; ///< Persistent EMA state.
+        std::uint16_t* dUwx = nullptr;        ///< Slip field, half bits,
+        std::uint16_t* dUwy = nullptr;        ///< level-cellCount entries
+        std::uint16_t* dUwz = nullptr;        ///< each (zero = plain BB).
+        WallModelDeviceStats* dStats = nullptr;
+        WallListStats  buildStats{};          ///< Host-side build diagnostics.
+
+        /// @brief Slip view for the hot kernels (inactive when unbuilt).
+        WallSlipView slipView() const {
+            return active ? WallSlipView{dUwx, dUwy, dUwz} : WallSlipView{};
+        }
+
+        /// @brief Device list view for the update kernel.
+        WallCellListView listView() const {
+            return WallCellListView{dCellIdx, dSampleIdx, dNormalX, dNormalY,
+                                    dNormalZ, dSampleDist, dLinkMask, dUTau,
+                                    count};
+        }
+
+        /// @brief Release every device allocation of this level's mirror.
+        void free() {
+            cudaFree(dCellIdx);    cudaFree(dSampleIdx);
+            cudaFree(dNormalX);    cudaFree(dNormalY);
+            cudaFree(dNormalZ);    cudaFree(dSampleDist);
+            cudaFree(dLinkMask);   cudaFree(dUTau);
+            cudaFree(dUwx);        cudaFree(dUwy);
+            cudaFree(dUwz);        cudaFree(dStats);
+            *this = WMLevel{};
+        }
+    };
+    bool    wmEnabled = false; ///< User/app switch (survives re-init).
+    WMLevel wmCoarse;
+    WMLevel wmFine;
+
+    // Host copies the FINE wall-list rebuild needs (the coarse analogs are
+    // hostFlags / surfaceRefFlags above): the live fine flags as uploaded by
+    // initRefinement/setRefinedFlags, and the clean (VG-free) fine reference.
+    std::vector<std::uint8_t> fineHostFlags;
+    std::vector<std::uint8_t> fineSurfaceRefFlags;
+
+    /// @brief Build one level's wall-cell list on the host and mirror it to
+    /// the device. Frees the previous mirror first; leaves the level inactive
+    /// when the list is empty or any allocation fails (the sim then simply
+    /// runs plain bounce-back there — never fatal).
+    cudaError_t buildWMLevel(WMLevel& wm, const GridDims& d,
+                             const std::vector<std::uint8_t>& active,
+                             const std::vector<std::uint8_t>& clean,
+                             int sampleCells, long long levelNcells) {
+        wm.free();
+        const WallCellList list =
+            buildWallCellList(d, active, clean, sampleCells, &wm.buildStats);
+        if (list.size() == 0) return cudaSuccess;
+        const auto n = static_cast<long long>(list.size());
+
+        // Allocations: list arrays sized by the surface, slip field by the
+        // level's full cell count (the hot kernels index it per cell).
+        struct Alloc { void** p; std::size_t bytes; };
+        const Alloc allocs[] = {
+            {reinterpret_cast<void**>(&wm.dCellIdx),    n * sizeof(long long)},
+            {reinterpret_cast<void**>(&wm.dSampleIdx),  n * sizeof(long long)},
+            {reinterpret_cast<void**>(&wm.dNormalX),    n * sizeof(float)},
+            {reinterpret_cast<void**>(&wm.dNormalY),    n * sizeof(float)},
+            {reinterpret_cast<void**>(&wm.dNormalZ),    n * sizeof(float)},
+            {reinterpret_cast<void**>(&wm.dSampleDist), n * sizeof(float)},
+            {reinterpret_cast<void**>(&wm.dLinkMask),   n * sizeof(std::uint32_t)},
+            {reinterpret_cast<void**>(&wm.dUTau),       n * sizeof(float)},
+            {reinterpret_cast<void**>(&wm.dUwx), static_cast<std::size_t>(levelNcells) * sizeof(std::uint16_t)},
+            {reinterpret_cast<void**>(&wm.dUwy), static_cast<std::size_t>(levelNcells) * sizeof(std::uint16_t)},
+            {reinterpret_cast<void**>(&wm.dUwz), static_cast<std::size_t>(levelNcells) * sizeof(std::uint16_t)},
+            {reinterpret_cast<void**>(&wm.dStats), sizeof(WallModelDeviceStats)},
+        };
+        for (const Alloc& a : allocs) {
+            if (auto err = cudaMalloc(a.p, a.bytes); err != cudaSuccess) {
+                wm.free();
+                return err;
+            }
+        }
+
+        // Upload the list; prime u_tau and the slip field to zero (the model
+        // ramps in over the first updates through the EMA — the very first
+        // batch after a build runs plain bounce-back values everywhere).
+        struct Up { void* dst; const void* src; std::size_t bytes; };
+        const Up ups[] = {
+            {wm.dCellIdx,    list.cellIdx.data(),    n * sizeof(long long)},
+            {wm.dSampleIdx,  list.sampleIdx.data(),  n * sizeof(long long)},
+            {wm.dNormalX,    list.normalX.data(),    n * sizeof(float)},
+            {wm.dNormalY,    list.normalY.data(),    n * sizeof(float)},
+            {wm.dNormalZ,    list.normalZ.data(),    n * sizeof(float)},
+            {wm.dSampleDist, list.sampleDist.data(), n * sizeof(float)},
+            {wm.dLinkMask,   list.linkMask.data(),   n * sizeof(std::uint32_t)},
+        };
+        for (const Up& u_ : ups) {
+            if (auto err = cudaMemcpyAsync(u_.dst, u_.src, u_.bytes,
+                                           cudaMemcpyHostToDevice, stream);
+                err != cudaSuccess) {
+                // The host vectors live until the function returns; sync so
+                // the failed-state teardown cannot race in-flight copies.
+                cudaStreamSynchronize(stream);
+                wm.free();
+                return err;
+            }
+        }
+        cudaMemsetAsync(wm.dUTau, 0, n * sizeof(float), stream);
+        cudaMemsetAsync(wm.dUwx, 0, levelNcells * sizeof(std::uint16_t), stream);
+        cudaMemsetAsync(wm.dUwy, 0, levelNcells * sizeof(std::uint16_t), stream);
+        cudaMemsetAsync(wm.dUwz, 0, levelNcells * sizeof(std::uint16_t), stream);
+        cudaMemsetAsync(wm.dStats, 0, sizeof(WallModelDeviceStats), stream);
+        // The async uploads read the list's host vectors, which die when this
+        // function returns — fence them before the buffers go away.
+        if (auto err = cudaStreamSynchronize(stream); err != cudaSuccess) {
+            wm.free();
+            return err;
+        }
+        wm.count = static_cast<int>(n);
+        wm.active = true;
+        return cudaSuccess;
+    }
+
+    /// @brief (Re)build the coarse wall-cell list from the current host
+    /// flags. No-op (free only) when the wall model is off.
+    void rebuildWallModelCoarse() {
+        wmCoarse.free();
+        if (!wmEnabled || hostFlags.size() != static_cast<std::size_t>(ncells))
+            return;
+        const std::vector<std::uint8_t>& clean =
+            (surfaceRefFlags.size() == hostFlags.size()) ? surfaceRefFlags
+                                                         : hostFlags;
+        buildWMLevel(wmCoarse, dims, hostFlags, clean,
+                     kWallSampleCellsCoarse, ncells);
+    }
+
+    /// @brief (Re)build the fine wall-cell list (needs the fine host flag
+    /// copy kept by initRefinement/setRefinedFlags).
+    void rebuildWallModelFine() {
+        wmFine.free();
+        if (!wmEnabled || !fine.active
+            || fineHostFlags.size() != static_cast<std::size_t>(fine.ncells))
+            return;
+        const std::vector<std::uint8_t>& clean =
+            (fineSurfaceRefFlags.size() == fineHostFlags.size())
+                ? fineSurfaceRefFlags
+                : fineHostFlags;
+        buildWMLevel(wmFine, fine.dims, fineHostFlags, clean,
+                     kWallSampleCellsFine, fine.ncells);
+    }
+
+    /// @brief Zero the persistent wall-model state (u_tau EMA + slip field)
+    /// of both levels — cold starts must not inherit the previous run's wall
+    /// stress.
+    void resetWallModelState() {
+        for (WMLevel* wm : {&wmCoarse, &wmFine}) {
+            if (!wm->active) continue;
+            const long long n = (wm == &wmCoarse) ? ncells : fine.ncells;
+            cudaMemsetAsync(wm->dUTau, 0, wm->count * sizeof(float), stream);
+            cudaMemsetAsync(wm->dUwx, 0, n * sizeof(std::uint16_t), stream);
+            cudaMemsetAsync(wm->dUwy, 0, n * sizeof(std::uint16_t), stream);
+            cudaMemsetAsync(wm->dUwz, 0, n * sizeof(std::uint16_t), stream);
+        }
+    }
+
     /// @brief Release only the fine level's device memory.
     void freeFine() {
         for (FPop*& p : fine.f) { cudaFree(p); p = nullptr; }
         cudaFree(fine.flags); fine.flags = nullptr;
         fine = FineLevel{};
+        // The fine wall-model mirror indexes fine-level cells; it dies with
+        // the level (a later initRefinement rebuilds it).
+        wmFine.free();
+        fineHostFlags.clear();
+        fineSurfaceRefFlags.clear();
     }
 
     /// @brief Seed the fine level from the CURRENT coarse field: full-volume
@@ -344,6 +527,8 @@ struct LBMSolver::Impl {
             }
         }
         rebuildSurfaceCache();
+        // Geometry changed: the wall-cell list is keyed to the flags.
+        rebuildWallModelCoarse();
         midStamp = -1; // velocity planes are stale relative to new geometry
         return cudaSuccess;
     }
@@ -401,6 +586,8 @@ struct LBMSolver::Impl {
     /// @brief Release everything; safe to call repeatedly / when empty.
     void freeAll() {
         freeFine();
+        wmCoarse.free(); // wmFine already died with freeFine(); the wmEnabled
+                         // SETTING survives so re-init reapplies the policy.
         for (FPop*& p : f) { cudaFree(p); p = nullptr; }
         cudaFree(flags); flags = nullptr;
         cudaFree(rho); rho = nullptr;
@@ -576,6 +763,8 @@ void LBMSolver::reset() {
     }
     // Fine level restarts from the freshly initialized coarse field.
     s.seedFineFromCoarse();
+    // Wall-model EMA state and slip field restart with the flow.
+    s.resetWallModelState();
 }
 
 void LBMSolver::setFlags(const std::vector<std::uint8_t>& flags) {
@@ -594,6 +783,63 @@ void LBMSolver::setSurfaceReference(const std::vector<std::uint8_t>& cleanFlags)
     // The live flags may already include VG voxels (init/setFlags receive the
     // merged field) — re-derive the surface description from the clean foil.
     s.rebuildSurfaceCache();
+    // The wall list keys normals and VG exclusion off the clean reference.
+    s.rebuildWallModelCoarse();
+}
+
+void LBMSolver::setWallModelEnabled(bool enabled) {
+    Impl& s = *impl_;
+    if (s.wmEnabled == enabled) return;
+    s.wmEnabled = enabled;
+    if (!s.initialized) return; // setting persists; init's flag upload builds
+    // Build or tear down both levels; the slip view goes (in)active with
+    // them, which is the entire switch the hot kernels see.
+    s.rebuildWallModelCoarse();
+    s.rebuildWallModelFine();
+}
+
+bool LBMSolver::wallModelEnabled() const { return impl_->wmEnabled; }
+
+void LBMSolver::setRefinedSurfaceReference(
+    const std::vector<std::uint8_t>& fineCleanFlags) {
+    Impl& s = *impl_;
+    if (!s.initialized || !s.fine.active) return;
+    if (fineCleanFlags.size() != static_cast<std::size_t>(s.fine.ncells)) return;
+    s.fineSurfaceRefFlags = fineCleanFlags;
+    s.rebuildWallModelFine();
+}
+
+WallModelReadout LBMSolver::wallModelReadout() const {
+    const Impl& s = *impl_;
+    WallModelReadout r;
+    r.enabled = s.wmEnabled;
+    if (!s.initialized || !s.wmEnabled) return r;
+    // Report the level that carries the wall physics for the force readout:
+    // the fine patch when it is wall-modeling, the coarse level otherwise.
+    const Impl::WMLevel& wm = s.wmFine.active ? s.wmFine : s.wmCoarse;
+    r.fromFine   = s.wmFine.active;
+    r.excludedVG = wm.buildStats.excludedVG;
+    r.degenerate = wm.buildStats.degenerate;
+    if (!wm.active) return r;
+
+    // Small synchronous read; the readout is a UI-rate call (header note).
+    WallModelDeviceStats st{};
+    if (cudaMemcpy(&st, wm.dStats, sizeof st, cudaMemcpyDeviceToHost)
+        != cudaSuccess)
+        return r;
+    r.cells = st.activeCells;
+    if (st.activeCells > 0) {
+        r.meanYplus = st.sumYplus / static_cast<float>(st.activeCells);
+        // maxYplusBits carries a positive float's bit pattern (atomicMax
+        // over int is monotone there) — undo the punning.
+        float maxY = 0.0f;
+        static_assert(sizeof maxY == sizeof st.maxYplusBits);
+        std::memcpy(&maxY, &st.maxYplusBits, sizeof maxY);
+        r.maxYplus = maxY;
+        r.clampedFrac = static_cast<float>(st.clampedCells)
+                      / static_cast<float>(st.activeCells);
+    }
+    return r;
 }
 
 void LBMSolver::applyEditedFlags(const std::vector<std::uint8_t>& flags) {
@@ -666,7 +912,7 @@ cudaError_t LBMSolver::stepN(int n) {
 
         const cudaError_t err = launchStreamCollide(
             s.view(s.src), s.view(1 - s.src), params,
-            s.rho, s.u, s.v, s.w, s.stream);
+            s.rho, s.u, s.v, s.w, s.stream, s.wmCoarse.slipView());
         if (err != cudaSuccess) return err;
 
         // The freshly written buffer needs its spanwise ghost planes synced
@@ -708,7 +954,7 @@ cudaError_t LBMSolver::stepN(int n) {
                 if (auto e = launchStreamCollide(
                         s.fineView(s.fine.src), s.fineView(1 - s.fine.src),
                         fineParams, nullptr, nullptr, nullptr, nullptr,
-                        s.stream);
+                        s.stream, s.wmFine.slipView());
                     e != cudaSuccess)
                     return e;
                 if (auto e = launchRefreshGhostZ(s.fine.f[1 - s.fine.src],
@@ -776,17 +1022,44 @@ cudaError_t LBMSolver::stepN(int n) {
     // coefficient normalization switches to the fine scaling in forces()).
     if (!s.forcePending) {
         DeviceForceAccumulator acc{s.force};
+        const bool fineForces = s.fine.active && s.fine.forcesFromFine;
         const DeviceLatticeView forceView =
-            (s.fine.active && s.fine.forcesFromFine)
-                ? s.fineView(s.fine.src)
-                : s.view(s.src);
-        if (launchForceReduction(forceView, acc, s.stream) == cudaSuccess) {
+            fineForces ? s.fineView(s.fine.src) : s.view(s.src);
+        // The reduction must see the same slip field the stream-collide of
+        // its grid used, or the modeled wall stress drops out of Cd.
+        const WallSlipView forceSlip =
+            fineForces ? s.wmFine.slipView() : s.wmCoarse.slipView();
+        if (launchForceReduction(forceView, acc, s.stream, forceSlip)
+            == cudaSuccess) {
             cudaMemcpyAsync(s.hForce, s.force, 3 * sizeof(float),
                             cudaMemcpyDeviceToHost, s.stream);
             cudaEventRecord(s.evForce, s.stream);
             s.forcePending = true;
             s.stepsAtForceLaunch = s.steps;
         }
+    }
+
+    // One wall-model update per batch (u_tau is a slow quantity; per-step
+    // updates would only feed the u_tau <-> u_w loop). Reads the buffer the
+    // batch just produced; the refreshed slip field takes effect next batch.
+    if (s.wmCoarse.active) {
+        WallModelParams wmp;
+        const float tauNow = s.effectiveTau();
+        wmp.nuLat    = (tauNow - 0.5f) / 3.0f;
+        wmp.utCutoff = 1e-3f * s.scaling.u_lat;
+        launchWallModelUpdate(s.wmCoarse.listView(), s.view(s.src),
+                              s.wmCoarse.dUwx, s.wmCoarse.dUwy, s.wmCoarse.dUwz,
+                              wmp, s.wmCoarse.dStats, s.stream);
+    }
+    if (s.wmFine.active) {
+        WallModelParams wmp;
+        // The fine level runs at its own (acoustically scaled) viscosity.
+        const float tauF = fineTauFor(s.effectiveTau(), s.fine.factor);
+        wmp.nuLat    = (tauF - 0.5f) / 3.0f;
+        wmp.utCutoff = 1e-3f * s.scaling.u_lat;
+        launchWallModelUpdate(s.wmFine.listView(), s.fineView(s.fine.src),
+                              s.wmFine.dUwx, s.wmFine.dUwy, s.wmFine.dUwz,
+                              wmp, s.wmFine.dStats, s.stream);
     }
     return cudaSuccess;
 }
@@ -973,6 +1246,44 @@ float LBMSolver::separationOnsetXc() const {
         }
     }
     return -1.0f; // attached all the way to the trailing edge
+}
+
+bool LBMSolver::downloadCrossflowPlane(int ix, std::vector<float>& v,
+                                       std::vector<float>& w) const {
+    const Impl& s = *impl_;
+    if (!s.initialized || ix < 0 || ix >= s.dims.nx) return false;
+    const std::size_t count = static_cast<std::size_t>(s.dims.ny)
+                            * static_cast<std::size_t>(s.dims.nz);
+    v.resize(count);
+    w.resize(count);
+    // One strided D2H copy per component: the plane at fixed x is a column
+    // of ny*nz elements spaced nx floats apart in the unpadded macro arrays.
+    const std::size_t spitch = static_cast<std::size_t>(s.dims.nx)
+                             * sizeof(float);
+    struct { const float* src; float* dst; } planes[] = {
+        {s.v + ix, v.data()}, {s.w + ix, w.data()}};
+    for (const auto& p : planes) {
+        if (cudaMemcpy2DAsync(p.dst, sizeof(float), p.src, spitch,
+                              sizeof(float), count, cudaMemcpyDeviceToHost,
+                              s.stream) != cudaSuccess)
+            return false;
+    }
+    return cudaStreamSynchronize(s.stream) == cudaSuccess;
+}
+
+int LBMSolver::suctionSurfaceY(int ix) const {
+    const Impl& s = *impl_;
+    if (!s.initialized || !s.surfValid || ix < 0 || ix >= s.dims.nx) return -1;
+    return s.topSolidY[static_cast<std::size_t>(ix)];
+}
+
+int LBMSolver::latticeXForChordStation(float xc) const {
+    const Impl& s = *impl_;
+    if (!s.initialized || !s.surfValid) return -1;
+    const float span = static_cast<float>(s.xTE - s.xLE);
+    return std::clamp(
+        static_cast<int>(std::lround(static_cast<float>(s.xLE) + xc * span)),
+        0, s.dims.nx - 1);
 }
 
 bool LBMSolver::nanDetected() const { return impl_->nanLatched; }
@@ -1191,6 +1502,11 @@ bool LBMSolver::initRefinement(const PatchBox& box, int factor,
     fl.active = true;
     s.updateForcesFromFine();
 
+    // Keep the host copy the fine wall-cell list rebuild scans, then build
+    // that list (no-op while the wall model is off).
+    s.fineHostFlags = fineFlags;
+    s.rebuildWallModelFine();
+
     // Seed the fine state from the current coarse field (valid mid-run).
     if (auto err = s.seedFineFromCoarse(); err != cudaSuccess)
         return fail("fine level seeding failed", err);
@@ -1211,6 +1527,9 @@ void LBMSolver::setRefinedFlags(const std::vector<std::uint8_t>& fineFlags) {
         return;
     launchRefreshGhostZFlags(s.fine.flags, s.fine.dims, s.stream);
     s.updateForcesFromFine();
+    // Fine geometry changed: refresh the wall list's host source and rebuild.
+    s.fineHostFlags = fineFlags;
+    s.rebuildWallModelFine();
     // Geometry changed: re-derive the whole fine state from the (freshly
     // cold-restarted) coarse field so no stale vane flow survives the edit.
     s.seedFineFromCoarse();

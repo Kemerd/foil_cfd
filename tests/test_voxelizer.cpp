@@ -197,11 +197,64 @@ void checkTrailingEdgeClosure() {
     }
 }
 
+// -----------------------------------------------------------------------
+// AoA 25-degree margin lock (high-AoA support): at the slider's new extreme
+// the rotated geometry must keep enough clearance to every domain face for
+// the slip walls, the patch-derivation clearance (3 cells), and the
+// restriction band (2 cells). The diamond's 50% total thickness makes it a
+// strictly harsher case than any real section, so a pass here covers the
+// whole catalog. The layout reproduces the plan-4.6 proportions
+// (3 Nc x 1.25 Nc, quarter-chord anchored at 0.3 nx / 0.5 ny).
+// -----------------------------------------------------------------------
+void checkAoA25Margins() {
+    const int nc = 128;
+    DomainLayout layout;
+    layout.dims = GridDims{3 * nc, nc + nc / 4, 8};
+    layout.chordCells = nc;
+
+    for (const float aoa : {25.0f, -5.0f}) {
+        std::vector<std::uint8_t> flags = buildBoundaryFlags(layout.dims);
+        voxelizeAirfoil(makeDiamond(), aoa, layout, flags);
+
+        // Tight bbox of all Solid cells in the z=0 layer (extrusion makes
+        // every layer identical — checked by checkDiamondParity).
+        int x0 = layout.dims.nx, x1 = -1, y0 = layout.dims.ny, y1 = -1;
+        for (int j = 0; j < layout.dims.ny; ++j) {
+            for (int i = 0; i < layout.dims.nx; ++i) {
+                if (flags[idx(layout.dims, i, j, 0)] != flagOf(CellFlag::Solid))
+                    continue;
+                x0 = std::min(x0, i); x1 = std::max(x1, i);
+                y0 = std::min(y0, j); y1 = std::max(y1, j);
+            }
+        }
+        TREQUIRE_VOID(x1 >= 0); // something voxelized at all
+
+        // 8 cells of clearance: 1 boundary plane + 3 patch clearance + 2
+        // restriction band + 2 of slack. The y faces are the tight ones
+        // (the TE swings down 0.75c * sin 25 ~ 0.32c at +25 deg).
+        constexpr int kClear = 8;
+        TCHECK_MSG(y0 >= kClear, "aoa %.0f: bottom clearance %d", aoa, y0);
+        TCHECK_MSG(y1 < layout.dims.ny - kClear,
+                   "aoa %.0f: top clearance %d", aoa, layout.dims.ny - 1 - y1);
+        TCHECK_MSG(x0 >= kClear, "aoa %.0f: inlet clearance %d", aoa, x0);
+        TCHECK_MSG(x1 < layout.dims.nx - kClear,
+                   "aoa %.0f: outlet clearance %d", aoa,
+                   layout.dims.nx - 1 - x1);
+
+        // The default-margin patch derivation must still produce a valid box
+        // (margins in cells at this chord: 0.2c/0.5c/0.1c/0.2c).
+        const PatchBox box = derivePatchBox(layout.dims, flags,
+                                            nc / 5, nc / 2, nc / 10, nc / 5);
+        TCHECK_MSG(box.valid(), "aoa %.0f: patch box invalid", aoa);
+    }
+}
+
 } // namespace
 
 int main() {
     checkBoundaryFlags();
     checkDiamondParity();
     checkTrailingEdgeClosure();
+    checkAoA25Margins();
     return finish("test_voxelizer");
 }

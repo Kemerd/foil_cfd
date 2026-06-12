@@ -71,7 +71,7 @@ std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims);
 /// Does NOT run TE closure — call closeTrailingEdgeGaps() after all solid
 /// stamping (foil + VGs) so vane roots also benefit from the pass.
 /// @param airfoil Normalized section to voxelize.
-/// @param aoa_deg Angle of attack in degrees (UI range -5..20).
+/// @param aoa_deg Angle of attack in degrees (UI range -5..25).
 /// @param layout  Foil placement and scale inside the grid.
 /// @param flags   Flag field to mark (from buildBoundaryFlags or a copy of a
 ///                cached clean-foil mask). Only writes CellFlag::Solid.

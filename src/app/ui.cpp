@@ -539,9 +539,19 @@ void drawAirfoilPanel(UIContext& ctx) {
     ImGui::TextDisabled("FLOW");
     const bool stlMode = (p.source == AirfoilSource::StlImport);
     ImGui::BeginDisabled(stlMode);
-    // AoA: re-voxelize ONLY on release (plan 13) — dragging is free.
-    ImGui::SliderFloat("AoA", &p.aoaDeg, -5.0f, 20.0f, "%.1f deg");
+    // AoA: re-voxelize ONLY on release (plan 13) — dragging is free. Range
+    // reaches 25 deg so post-stall VG behavior is testable; the blockage
+    // caveat below keeps the high end honest.
+    ImGui::SliderFloat("AoA", &p.aoaDeg, -5.0f, 25.0f, "%.1f deg");
     if (ImGui::IsItemDeactivatedAfterEdit()) ev.aoaChanged = true;
+    if (p.aoaDeg > 20.0f) {
+        // The domain is 1.25 chords tall: past ~20 deg the projected foil
+        // blocks a third of it and the slip walls squeeze the streamtube,
+        // inflating absolute Cl. Deltas on identical settings stay honest.
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f),
+                           "high AoA: domain blockage inflates absolutes —\n"
+                           "trust VG-on/VG-off deltas, not raw Cl/Cd.");
+    }
     ImGui::EndDisabled();
     if (stlMode) {
         ImGui::TextDisabled("AoA applies to airfoil sections only —\n"
@@ -739,10 +749,13 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
     }
 
     // Under-resolution guard (plan 6.1): warn instead of rendering noise.
+    // With the Mesh panel's auto-raise on, this only still fires when even
+    // the 4x patch can't lift the vane to height — say so.
     if (vgUnderResolved(vg, chordCells)) {
         ImGui::TextColored(kColWarn,
                            "VG under-resolved (%.1f cells tall, need %d) —\n"
-                           "increase chord resolution or VG size",
+                           "increase chord resolution or VG size\n"
+                           "(or enable the Mesh panel's refinement patch)",
                            vgHeightCells(vg, chordCells), kMinVGHeightCells);
     } else {
         ImGui::TextDisabled("vane height: %.1f cells",
@@ -1014,6 +1027,48 @@ void drawVGGuidancePanel(UIContext& ctx) {
                          ImVec2(-1, 56));
     }
 
+    // ---- vortex-strength audit: the honesty meter (Mission statement) ----
+    // Measured shed circulation vs the Wendt correlation. A vane that sheds
+    // what the wind-tunnel data says it should can be trusted for placement
+    // deltas; one shedding weak needs more resolution before its numbers
+    // mean anything — and this line is what says which one you have.
+    if (haveVG) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("VORTEX STRENGTH AUDIT");
+        const VGAuditReadout& a = r.vgAudit;
+        if (a.valid) {
+            ImGui::Text("shed / predicted: %.4f / %.4f  (x/c %.2f)",
+                        a.gammaMeasured, a.gammaPredicted, a.planeXc);
+            if (a.ratio >= kAuditRatioGood) {
+                ImGui::TextColored(kColGood,
+                                   "  %.0f%% of Wendt — vortex resolved, "
+                                   "placement results trustworthy",
+                                   a.ratio * 100.0f);
+            } else if (a.ratio >= kAuditRatioMarginal) {
+                ImGui::TextColored(kColWarn,
+                                   "  %.0f%% of Wendt — marginal; raise the "
+                                   "patch factor for final comparisons",
+                                   a.ratio * 100.0f);
+            } else {
+                ImGui::TextColored(kColBad,
+                                   "  %.0f%% of Wendt — under-resolved vortex;"
+                                   "\n  increase patch factor or VG size",
+                                   a.ratio * 100.0f);
+            }
+            helpMarker("Streamwise circulation integrated from the crossflow "
+                       "plane ~3 vane heights behind the vane row, per vortex, "
+                       "minus the ambient floor measured upstream — compared "
+                       "against the Wendt (NASA/CR-2001-211144) wind-tunnel "
+                       "correlation at the LIVE local edge velocity and "
+                       "boundary-layer thickness. Ratios above ~0.8 mean the "
+                       "voxelized vane sheds what real hardware sheds.");
+        } else {
+            ImGui::TextDisabled("audit pending — needs a converged flow and "
+                                "a valid BL sample at the vane station");
+        }
+    }
+
     // Under-resolution cross-check mirrored here because this is the panel
     // the user reads while choosing h (geom/vg guard, plan 6.1).
     if (haveVG && vgUnderResolved(p.vgs[static_cast<size_t>(p.selectedVG)],
@@ -1089,6 +1144,13 @@ void drawSimPanel(UIContext& ctx) {
     ImGui::Separator();
     ImGui::TextDisabled("REYNOLDS");
     ImGui::Text("simulating at Re %.2e", r.scaling.reEffective);
+    // Refinement patch line (plan M-refine): the fine level halves the cell
+    // size, so its effective Re differs from the base grid's — show it
+    // whenever the patch is live so the honesty display covers BOTH grids.
+    if (r.refine.active) {
+        ImGui::Text("patch (%dx) simulating at Re %.2e", r.refine.factor,
+                    r.refine.fineReEffective);
+    }
     ImGui::Text("target Re %.2e", r.scaling.reTarget);
     if (r.scaling.tauClamped) {
         ImGui::TextColored(kColWarn, "tau clamped: target Re unreachable at\n"
@@ -1099,6 +1161,49 @@ void drawSimPanel(UIContext& ctx) {
                "resolution; the solver runs at the highest stable effective "
                "Re instead. Vortex topology, separation behavior, and VG-on "
                "vs VG-off deltas remain actionable.");
+
+    // ---- iMEM wall function (the second honesty section): at high Re the
+    // viscous sublayer is far below the cell size, so plain bounce-back
+    // under-predicts wall friction and separates too early — the wall model
+    // closes that gap with a law-of-the-wall stress on the foil surface ----
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("WALL MODEL");
+    {
+        int mode = std::clamp(p.wallModel, 0, 2);
+        const char* kModes[] = {"Auto", "On", "Off"};
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::Combo("##wallmodel", &mode, kModes, 3)) {
+            p.wallModel = mode;
+            ev.wallModelChanged = true;
+        }
+        ImGui::SameLine();
+        helpMarker("Slip-velocity wall function (Reichardt law) on the foil "
+                   "surface: models the unresolvable inner boundary layer so "
+                   "skin friction and separation behavior stay honest at "
+                   "high Reynolds numbers. Auto enables it whenever the "
+                   "first cell can't resolve the viscous sublayer (y+ > 2). "
+                   "VG vanes always keep exact no-slip walls.");
+        if (r.wallModel.enabled) {
+            ImGui::Text("%d wall cells (%s grid)   y+ %.0f mean / %.0f max",
+                        r.wallModel.cells,
+                        r.wallModel.fromFine ? "fine" : "coarse",
+                        r.wallModel.meanYplus, r.wallModel.maxYplus);
+            if (r.wallModel.clampedFrac > 0.01f) {
+                ImGui::TextColored(kColWarn,
+                                   "slip clamp engaged on %.0f%% of wall cells "
+                                   "— wall stress readouts degraded",
+                                   r.wallModel.clampedFrac * 100.0f);
+            }
+            if (r.wallModel.excludedVG > 0 || r.wallModel.degenerate > 0) {
+                ImGui::TextDisabled("excluded: %d near VGs, %d degenerate",
+                                    r.wallModel.excludedVG,
+                                    r.wallModel.degenerate);
+            }
+        } else {
+            ImGui::TextDisabled("off — walls use plain bounce-back");
+        }
+    }
 
     // ---- live solver numbers ----
     ImGui::Spacing();
@@ -1530,6 +1635,24 @@ void drawMeshPanel(UIContext& ctx) {
                    "sub-steps per base step, so compute grows ~m^4 and VRAM "
                    "~m^3. 2x is the engineering sweet spot; 4x is for final "
                    "VG-comparison runs on big cards.");
+
+        // VG resolution guard: the frame loop raises the live factor to
+        // whatever lifts every vane to its minimum resolved height, so the
+        // shed vortex strength stays trustworthy without babysitting this
+        // panel. Surfacing the override here keeps the setting honest.
+        if (ImGui::Checkbox("Auto-raise for VGs", &p.refine.autoVGFactor)) {
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("When a configured vane would be under 8 cells tall, the "
+                   "patch factor is raised (up to 4x) until it is not — an "
+                   "under-resolved vane sheds a systematically weak vortex "
+                   "and quietly corrupts VG-on/VG-off comparisons.");
+        if (p.refine.autoVGFactor && r.refine.active
+            && r.refine.factor > p.refine.factor) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                               "auto-raised to %dx for VG resolution",
+                               r.refine.factor);
+        }
     }
 
     // ---- live domain diagram ----

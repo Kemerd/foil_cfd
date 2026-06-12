@@ -12,6 +12,7 @@
 #include "../geom/airfoil.h"
 #include "../geom/stl.h"
 #include "../geom/vg.h"
+#include "../geom/vg_audit.h"
 #include "../render/viz.h"
 #include "../sim/lbm_solver.h"
 #include "../sim/units.h"
@@ -83,7 +84,9 @@ struct UIParams {
                                            ///< Aircraft section (anchors the
                                            ///< root/tip selector); reset by
                                            ///< main.cpp on manifest reload.
-    float aoaDeg = 4.0f;                   ///< AoA slider, -5..20 deg (plan 9.2).
+    float aoaDeg = 4.0f;                   ///< AoA slider, -5..25 deg (plan 9.2;
+                                           ///< extended past 20 for post-stall
+                                           ///< VG testing — see blockage note).
     float airspeedMs = 35.7632f;           ///< Physical airspeed [m/s] (canonical);
                                            ///< default = 80 mph, a typical EAB
                                            ///< approach/climb regime.
@@ -135,6 +138,11 @@ struct UIParams {
         float wakeC     = 0.50f; ///< Margin behind (near-wake coverage).
         float aboveC    = 0.20f; ///< Margin above (suction-surface BL + VGs).
         float belowC    = 0.10f; ///< Margin below (pressure side).
+        bool  autoVGFactor = true; ///< Raise the factor to whatever
+                                 ///< recommendedRefineFactorForVGs() asks
+                                 ///< (vane >= 8 cells tall) — accurate vortex
+                                 ///< strength needs a resolved vane, and an
+                                 ///< under-resolved one silently sheds weak.
 
         /// Patch active at all (factor 1 = pure uniform grid).
         bool enabled() const { return factor >= 2; }
@@ -149,6 +157,12 @@ struct UIParams {
 
     // -- sim panel --
     bool running = true;                   ///< Run/pause.
+    int  wallModel = 0;                    ///< iMEM wall-function policy:
+                                           ///< 0 = Auto (on when the first
+                                           ///< cell cannot resolve the viscous
+                                           ///< sublayer, i.e. estimated
+                                           ///< y+ > 2 on the finest level),
+                                           ///< 1 = forced On, 2 = forced Off.
 
     // -- view panel --
     VizSettings viz;
@@ -202,6 +216,13 @@ struct UIReadouts {
     float separationXc = -1.0f;            ///< <0 = attached.
     GuidanceBand heightBand;               ///< Lin h-band at the selected station.
     GuidanceBand stationBand;              ///< Lin station band for current h.
+    VGAuditReadout vgAudit;                ///< Vortex-strength honesty meter
+                                           ///< (measured vs Wendt-predicted
+                                           ///< circulation for the selected
+                                           ///< VG; .valid false when off).
+
+    // -- iMEM wall-function status (sim panel telemetry) --
+    WallModelReadout wallModel;
 
     // -- refinement patch status (plan M-refine) --
     struct RefinementReadout {
@@ -243,6 +264,7 @@ struct UIEvents {
     bool meshRefinementChanged   = false; ///< Zone weights / preset changed -> rebuild stretch + cold restart.
     bool particleCountChanged = false; ///< Pool slider released -> resizeParticlePool.
     bool frameFoilView   = false; ///< "Focus foil" -> camera.frameRegion on the foil.
+    bool wallModelChanged = false; ///< Wall-model combo changed -> re-apply policy.
 
     /// @brief Clear all events (main.cpp calls after applying).
     void reset() { *this = UIEvents{}; }

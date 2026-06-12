@@ -29,6 +29,7 @@
 #include "geom/airfoil.h"
 #include "geom/stl.h"
 #include "geom/vg.h"
+#include "geom/vg_audit.h"
 #include "geom/voxelizer.h"
 #include "geom/voxelizer_stl.cuh"
 #include "platform/platform.h"
@@ -455,19 +456,57 @@ void rebuildFlagFields(App& app) {
                             app.layout, app.cleanFlags);
 }
 
+/// Apply the wall-model policy (UIParams::wallModel) to the solver: forced
+/// On/Off pass straight through; Auto enables the wall function whenever the
+/// FINEST level's first cell cannot resolve the viscous sublayer. The y+
+/// estimate uses the flat-plate correlation Cf = 0.0576 Re^(-1/5) at the
+/// EFFECTIVE Re (the flow the lattice actually runs), u_tau = u sqrt(Cf/2),
+/// y+ = 0.5 u_tau / nu in the level's lattice units. Below y+ ~ 2 the
+/// sublayer is genuinely resolved and plain bounce-back is the better wall.
+void applyWallModelPolicy(App& app) {
+    bool enable = false;
+    if (app.params.wallModel == 1) {
+        enable = true;
+    } else if (app.params.wallModel == 0) {
+        const RefinementInfo ri = app.solver.refinementInfo();
+        const LatticeScaling& sc =
+            ri.active ? ri.fineScaling : app.solver.scaling();
+        if (sc.u_lat > 0.0f && sc.nu_lat > 0.0f) {
+            const float re = std::max(sc.reEffective, 1.0e3f);
+            const float cf = 0.0576f * std::pow(re, -0.2f);
+            const float uTau = sc.u_lat * std::sqrt(0.5f * cf);
+            const float yPlusFirst = 0.5f * uTau / sc.nu_lat;
+            enable = yPlusFirst > 2.0f;
+        }
+    }
+    app.solver.setWallModelEnabled(enable);
+}
+
 /// (Re)build the two-level refinement patch (plan M-refine) for the current
 /// geometry: derive the box from the VG-merged flags (vanes must sit inside),
 /// voxelize foil + VGs at 2x into the fine flag field, stamp the Interface
 /// shell, and hand it to the solver. Disabled/STL/derivation-failure paths
 /// tear the fine level down — the coarse sim continues either way.
 void applyRefinement(App& app) {
-    if (!app.params.refine.enabled() || app.stlActive) {
+    // Effective factor: the user's Mesh-panel setting, raised by the VG
+    // resolution guard when it is on — a vane below kMinVGHeightCells sheds
+    // a systematically weak vortex, and the patch is the cheap fix because
+    // it multiplies resolution only around the geometry. The guard can pull
+    // the patch into existence from factor 1 for the same reason.
+    int factor = std::clamp(app.params.refine.factor, 1, kMaxRefineFactor);
+    if (app.params.refine.autoVGFactor && !app.params.vgs.empty()
+        && !app.stlActive) {
+        factor = std::max(factor, recommendedRefineFactorForVGs(
+                                      app.params.vgs, app.layout.chordCells));
+    }
+
+    if (factor < 2 || app.stlActive) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        applyWallModelPolicy(app); // finest level is now the coarse grid
         return;
     }
-    const int factor = std::clamp(app.params.refine.factor, 2, kMaxRefineFactor);
 
     // Margins from chord fractions to coarse cells (>= 2 so the restriction
     // band never touches a solid).
@@ -484,6 +523,7 @@ void applyRefinement(App& app) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        applyWallModelPolicy(app);
         return;
     }
 
@@ -507,8 +547,23 @@ void applyRefinement(App& app) {
                            + " — running base grid only");
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
+        applyWallModelPolicy(app);
         return;
     }
+
+    // Fine CLEAN reference for the wall model: the foil alone at fine
+    // resolution (no VGs, no shell) — the fine wall list keys its normals
+    // and VG-vane exclusion off this exactly like the coarse level keys off
+    // cleanFlags (sim-module contract: setRefinedSurfaceReference).
+    {
+        std::vector<std::uint8_t> fineClean(
+            static_cast<std::size_t>(fineLayout.dims.cellCount()),
+            static_cast<std::uint8_t>(CellFlag::Fluid));
+        voxelizeAirfoil(app.airfoil, app.params.aoaDeg, fineLayout, fineClean);
+        closeTrailingEdgeGaps(fineLayout.dims, fineClean);
+        app.solver.setRefinedSurfaceReference(fineClean);
+    }
+
     app.patchBox  = box;
     app.fineFlags = std::move(fine);
     char msg[160];
@@ -518,6 +573,8 @@ void applyRefinement(App& app) {
                   factor, box.x0, box.x1, box.y0, box.y1, fineLayout.dims.nx,
                   fineLayout.dims.ny, fineLayout.dims.nz);
     logLine(msg);
+    // The finest level changed; the Auto wall-model verdict may flip with it.
+    applyWallModelPolicy(app);
 }
 
 /// Mesh-sequencing pre-convergence (plan M-refine part 2): converge a 4x-
@@ -1160,6 +1217,9 @@ void refreshGuidance(App& app) {
     const double now = platform::timerSeconds();
     if (now - app.lastGuidanceT < kGuidancePeriod) return;
     app.lastGuidanceT = now;
+    // Wall-model telemetry rides the same UI-rate throttle (its readout does
+    // a small synchronous device read — sim-module contract).
+    app.readouts.wallModel = app.solver.wallModelReadout();
     if (app.stlActive || app.solver.stepCount() <= 0) {
         app.readouts.delta99Profile.clear();
         app.readouts.separationXc = -1.0f;
@@ -1201,6 +1261,20 @@ void refreshGuidance(App& app) {
         ? recommendedHeightBand(nearest->delta99_c) : GuidanceBand{};
     app.readouts.stationBand =
         recommendedStationBand(app.readouts.separationXc, heightC);
+
+    // ---- vortex-strength audit (Mission statement honesty meter): two
+    // small plane downloads, only when a VG exists, the flow has settled
+    // past the force gate, and the BL sample at the vane station is live ----
+    app.readouts.vgAudit = VGAuditReadout{};
+    if (app.params.selectedVG >= 0
+        && app.params.selectedVG < static_cast<int>(app.params.vgs.size())
+        && app.readouts.forces.valid && nearest) {
+        const VGParams& vg =
+            app.params.vgs[static_cast<size_t>(app.params.selectedVG)];
+        app.readouts.vgAudit = auditVGVortexStrength(
+            app.solver, vg, app.layout.chordCells, nearest->ueEdge,
+            nearest->delta99_c * static_cast<float>(app.layout.chordCells));
+    }
 }
 
 // ===========================================================================
@@ -1309,6 +1383,14 @@ void applyEvents(App& app) {
         logLine(app.params.refine.enabled()
                     ? "refinement patch rebuilt (live)"
                     : "refinement patch disabled");
+    }
+
+    // ---- wall-model combo: re-apply the Auto/On/Off policy in place. The
+    // solver rebuilds its wall lists internally; the flow keeps running ----
+    if (ev.wallModelChanged) {
+        applyWallModelPolicy(app);
+        logLine(app.solver.wallModelEnabled() ? "wall model ON"
+                                              : "wall model off");
     }
 
     // ---- voxel view toggle: swap the render mesh, nothing else changes ----

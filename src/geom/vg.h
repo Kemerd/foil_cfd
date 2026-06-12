@@ -5,6 +5,8 @@
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -112,6 +114,28 @@ inline float vgHeightCells(const VGParams& vg, int chordCells) {
 /// resolution or VG size".
 inline bool vgUnderResolved(const VGParams& vg, int chordCells) {
     return vgHeightCells(vg, chordCells) < static_cast<float>(kMinVGHeightCells);
+}
+
+/// @brief Smallest refinement factor that lifts EVERY configured vane to at
+/// least kMinVGHeightCells of resolved height (vortex circulation is what a
+/// vane sheds, and an under-resolved vane sheds it weak — the patch is the
+/// cheap fix because it multiplies resolution only around the geometry).
+/// Returns 1 when no patch is needed (no VGs, or all tall enough at the
+/// base grid); never exceeds kMaxRefineFactor — a vane that stays short
+/// even at 4x needs a chord-resolution or height change instead, which the
+/// under-resolution warning continues to say.
+/// @param vgs        Configured VG entries.
+/// @param chordCells BASE-grid chord resolution N_c.
+inline int recommendedRefineFactorForVGs(const std::vector<VGParams>& vgs,
+                                         int chordCells) {
+    int rec = 1;
+    for (const VGParams& vg : vgs) {
+        const float h = vgHeightCells(vg, chordCells);
+        if (h <= 0.0f) continue;
+        rec = std::max(rec, static_cast<int>(std::ceil(
+                                static_cast<float>(kMinVGHeightCells) / h)));
+    }
+    return std::min(rec, kMaxRefineFactor);
 }
 
 // ===========================================================================

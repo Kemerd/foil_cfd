@@ -97,6 +97,7 @@ add_executable(FoilCFD
     src/geom/airfoil.cpp
     src/geom/stl.cpp
     src/geom/vg.cpp
+    src/geom/vg_audit.cpp
     src/geom/voxelizer.cpp
     src/geom/voxelizer_stl.cu
     src/platform/gl_loader.cpp
@@ -106,7 +107,9 @@ add_executable(FoilCFD
     src/sim/lbm_core.cu
     src/sim/lbm_refine.cu
     src/sim/lbm_solver.cpp
-    src/sim/snapshot.cpp)
+    src/sim/lbm_wallmodel.cu
+    src/sim/snapshot.cpp
+    src/sim/wall_model.cpp)
 
 target_include_directories(FoilCFD PRIVATE
     src

@@ -191,6 +191,22 @@ struct DeviceLatticeView {
     GridDims            dims;            ///< REAL grid dims (excluding ghosts).
 };
 
+/// @brief Read-only device view of the wall-model slip-velocity field (the
+/// iMEM wall function, lbm_wallmodel.cuh): per UNPADDED cell, the fictitious
+/// wall velocity the bounce-back links of that cell carry, as IEEE half bits
+/// (planar SoA, cellCount() entries each). Zero bits everywhere except listed
+/// wall cells, so the correction term vanishes identically off the surface.
+/// Stored as raw uint16 so host TUs including this header never need
+/// cuda_fp16.h; device code reinterprets via __ushort_as_half.
+struct WallSlipView {
+    const std::uint16_t* uwx = nullptr; ///< Slip x-velocity (half bits).
+    const std::uint16_t* uwy = nullptr; ///< Slip y-velocity (half bits).
+    const std::uint16_t* uwz = nullptr; ///< Slip z-velocity (half bits).
+
+    /// @brief True when the wall model supplies a field this step.
+    bool active() const { return uwx != nullptr && uwy != nullptr && uwz != nullptr; }
+};
+
 // ===========================================================================
 // Per-step kernel parameters, grouped so the launch wrappers stay stable as
 // the collision model gains terms.
@@ -251,10 +267,14 @@ cudaError_t launchSpanwisePerturbation(DeviceLatticeView lattice, float amplitud
 /// @param macroU    Optional x-velocity output, as macroRho.
 /// @param macroV    Optional y-velocity output.
 /// @param macroW    Optional z-velocity output.
+/// @param slip      Wall-model slip field (iMEM wall function). Default
+///                  (inactive) view selects the plain bounce-back kernel
+///                  instantiation — bit-identical to the pre-wall-model path.
 cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 const StepParams& params,
                                 float* macroRho, float* macroU, float* macroV,
-                                float* macroW, cudaStream_t stream);
+                                float* macroW, cudaStream_t stream,
+                                WallSlipView slip = WallSlipView{});
 
 /// @brief NaN watchdog (plan 4.5): checks a strided sample of cells (~1/4093,
 /// prime stride so the sample set cannot alias onto boundary columns of
@@ -293,8 +313,14 @@ cudaError_t launchFillFloat(float* d_dst, long long count, float value,
 /// Block-level reduction + atomics — fine at this scale.
 /// @param lattice Post-collision buffer to read populations from.
 /// @param acc     Device accumulator receiving (Fx, Fy, Fz) in lattice units.
+/// @param slip    Wall-model slip field. When active, each solid link's
+///                exchange becomes c_q*(2 f_q - 6 w_q (c_q . u_w)) — the
+///                moving-wall bounce-back returns less momentum, and skipping
+///                this correction here would erase the modeled wall stress
+///                from Cd while the flow field still feels it.
 cudaError_t launchForceReduction(DeviceLatticeView lattice,
-                                 DeviceForceAccumulator acc, cudaStream_t stream);
+                                 DeviceForceAccumulator acc, cudaStream_t stream,
+                                 WallSlipView slip = WallSlipView{});
 
 /// @brief Refresh the two spanwise ghost planes of a padded f buffer (all kQ
 /// population slices): ghost z=-1 <- real z=nz-1, ghost z=nz <- real z=0.
