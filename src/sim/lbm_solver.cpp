@@ -163,9 +163,10 @@ struct LBMSolver::Impl {
     // (renderer, particles, delta99 extraction) is fine-aware for free.
     struct FineLevel {
         bool           active = false;
+        int            factor = kRefineFactor; ///< m: sub-steps + cell ratio.
         PatchBox       box;
         GridDims       dims{};
-        LatticeScaling scaling{};            ///< refinedScaling(coarse, 2).
+        LatticeScaling scaling{};            ///< refinedScaling(coarse, m).
         FPop*          f[2] = {nullptr, nullptr};
         std::uint8_t*  flags = nullptr;      ///< Padded ghost-z layout.
         int            src = 0;
@@ -192,12 +193,12 @@ struct LBMSolver::Impl {
     cudaError_t seedFineFromCoarse() {
         if (!fine.active) return cudaSuccess;
         const float tauC = effectiveTau();
-        const float tauF = fineTauFor(tauC);
+        const float tauF = fineTauFor(tauC, fine.factor);
         for (int i = 0; i < 2; ++i) {
             // Both time levels point at the same buffer (weight 0): seeding
             // is a snapshot, not a time interpolation.
             if (auto err = launchCoarseToFineFill(
-                    view(src), f[src], fineView(i), fine.box,
+                    view(src), f[src], fineView(i), fine.box, fine.factor,
                     /*timeWeight=*/0.0f, tauC, tauF,
                     /*fullVolume=*/true, stream);
                 err != cudaSuccess)
@@ -675,23 +676,25 @@ cudaError_t LBMSolver::stepN(int n) {
             return err2;
 
         // ---- two-level coupling (plan M-refine): the fine patch advances
-        // two half-dt steps per coarse step. The coarse ping-pong pair
+        // m sub-steps of dt/m per coarse step. The coarse ping-pong pair
         // provides both time levels for the interface fill — f[src] still
         // holds t, f[1-src] just received t+1. ----------------------------
         if (s.fine.active) {
+            const int   m    = s.fine.factor;
             const float tauC = params.tau;
-            const float tauF = fineTauFor(tauC);
+            const float tauF = fineTauFor(tauC, m);
             StepParams fineParams = params;
             fineParams.tau        = tauF;
             fineParams.writeMacro = false; // fine level has no macro arrays
 
-            for (int half = 0; half < 2; ++half) {
-                // Interface fill: fine step 1 sees the coarse field at t
-                // (weight 0), step 2 at t + dt_c/2 (weight 0.5).
+            for (int half = 0; half < m; ++half) {
+                // Interface fill: sub-step k sees the coarse field time-
+                // interpolated at t + k/m of the coarse step.
                 if (auto e = launchCoarseToFineFill(
                         s.view(s.src), s.f[1 - s.src],
-                        s.fineView(s.fine.src), s.fine.box,
-                        half == 0 ? 0.0f : 0.5f, tauC, tauF,
+                        s.fineView(s.fine.src), s.fine.box, m,
+                        static_cast<float>(half) / static_cast<float>(m),
+                        tauC, tauF,
                         /*fullVolume=*/false, s.stream);
                     e != cudaSuccess)
                     return e;
@@ -719,7 +722,7 @@ cudaError_t LBMSolver::stepN(int n) {
             // solution (and the coarse macro arrays on render steps, so
             // every macro consumer sees fine-derived data for free).
             if (auto e = launchFineToCoarseRestrict(
-                    s.fineView(s.fine.src), s.view(1 - s.src), s.fine.box,
+                    s.fineView(s.fine.src), s.view(1 - s.src), s.fine.box, m,
                     tauC, tauF,
                     params.writeMacro ? s.rho : nullptr,
                     params.writeMacro ? s.u : nullptr,

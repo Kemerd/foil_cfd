@@ -65,6 +65,7 @@ struct SolverPerfStats {
 /// UI Mesh panel. All fields are derived at initRefinement() time.
 struct RefinementInfo {
     bool           active = false;    ///< Fine level allocated and stepping.
+    int            factor = 0;        ///< Refinement factor m (2..4); 0 = off.
     PatchBox       box;               ///< Patch in coarse cells.
     GridDims       fineDims;          ///< Fine grid dimensions.
     LatticeScaling fineScaling;       ///< Fine-level scaling (refinedScaling).
@@ -125,18 +126,21 @@ public:
 
     // ------ two-level refinement patch (plan M-refine) ------
 
-    /// @brief Allocate and seed the 2x fine level over the given patch box.
+    /// @brief Allocate and seed the fine level over the given patch box at
+    /// the chosen refinement factor (2..kMaxRefineFactor; the fine grid runs
+    /// `factor` sub-steps per coarse step at 1/factor the cell size).
     /// Call after init()/setFlags() with the matching fine flag field (from
     /// buildFinePatchFlags + VG stamping). The fine state is seeded from the
     /// current coarse field via the full-volume coarse-to-fine fill, so this
     /// is valid at any point of a run. Replaces any previous fine level.
     /// Fails gracefully on OOM — the coarse-only sim keeps running.
     /// @param box       Patch in coarse cells (derivePatchBox output).
-    /// @param fineFlags Fine flag field, fineDimsFor(box, dims()).cellCount()
-    ///                  bytes, with the Interface shell stamped.
+    /// @param factor    Refinement factor m (2..kMaxRefineFactor).
+    /// @param fineFlags Fine flag field, fineDimsFor(box, dims(), factor)
+    ///                  .cellCount() bytes, with the Interface shell stamped.
     /// @param error     On failure, receives a human-readable reason.
     /// @return True on success.
-    bool initRefinement(const PatchBox& box,
+    bool initRefinement(const PatchBox& box, int factor,
                         const std::vector<std::uint8_t>& fineFlags,
                         std::string* error);
 

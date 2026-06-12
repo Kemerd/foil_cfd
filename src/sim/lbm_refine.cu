@@ -81,7 +81,7 @@ __global__ void coarseToFineFillKernel(
     long long fineNcells, long long fineNxny, long long fineNcellsPad,
     int fineNx, int fineNy,
     long long coarseNxny, long long coarseNcellsPad, int coarseNx, int coarseNz,
-    int boxX0, int boxY0,
+    int boxX0, int boxY0, float invFactor,
     float timeWeight, float neqScale, int fullVolume) {
     const long long cell =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -100,12 +100,12 @@ __global__ void coarseToFineFillKernel(
         if (flag != kFlagInterface) return;
     }
 
-    // ---- locate in coarse cell-center grid coordinates -------------------
+    // ---- locate in coarse cell-center grid coordinates (factor-generic) --
     const float gx = static_cast<float>(boxX0)
-                   + (static_cast<float>(xf) + 0.5f) * 0.5f - 0.5f;
+                   + (static_cast<float>(xf) + 0.5f) * invFactor - 0.5f;
     const float gy = static_cast<float>(boxY0)
-                   + (static_cast<float>(yf) + 0.5f) * 0.5f - 0.5f;
-    const float gz = (static_cast<float>(zf) + 0.5f) * 0.5f - 0.5f;
+                   + (static_cast<float>(yf) + 0.5f) * invFactor - 0.5f;
+    const float gz = (static_cast<float>(zf) + 0.5f) * invFactor - 0.5f;
 
     const int ix = static_cast<int>(floorf(gx));
     const int iy = static_cast<int>(floorf(gy));
@@ -195,7 +195,7 @@ __global__ void fineToCoarseRestrictKernel(
     long long fineNxny, long long fineNcellsPad, int fineNx,
     long long coarseNxny, long long coarseNcellsPad, int coarseNx, int coarseNz,
     int rx0, int ry0, int rx1, int ry1,   // restricted coarse sub-box
-    int boxX0, int boxY0,
+    int boxX0, int boxY0, int factor,
     float neqScaleInv,
     float* __restrict__ macroRho, float* __restrict__ macroU,
     float* __restrict__ macroV, float* __restrict__ macroW, int writeMacro) {
@@ -218,58 +218,62 @@ __global__ void fineToCoarseRestrictKernel(
     const long long pc = cCell + coarseNxny;
     if (coarseFlags[pc] != kFlagFluid) return; // solids/markers keep their state
 
-    // The 8 fine children of this coarse cell (patch-local fine coords).
-    const int fx = 2 * (xc - boxX0);
-    const int fy = 2 * (yc - boxY0);
-    const int fz = 2 * zc;
+    // Edge blend weight: 0 at the band edge ramping to 1 over
+    // kRestrictBlendCoarse cells inward. A hard hand-off leaves a velocity
+    // kink the Q-criterion renders as a spurious vortex sheet standing on
+    // the patch faces; the ramp hands the levels over smoothly instead.
+    const int dEdge = min(min(xc - rx0, rx1 - 1 - xc),
+                          min(yc - ry0, ry1 - 1 - yc));
+    const float blend = fminf(1.0f,
+        static_cast<float>(dEdge + 1)
+            / static_cast<float>(kRestrictBlendCoarse + 1));
 
-    long long child[8];
-    int nFluid = 0;
+    // The m^3 fine children of this coarse cell (patch-local fine coords).
+    const int fx = factor * (xc - boxX0);
+    const int fy = factor * (yc - boxY0);
+    const int fz = factor * zc;
+
+    // ---- average fluid children per q, accumulate the averaged state -----
+    // Stair-step walls differ slightly between levels: a coarse-fluid cell
+    // may own fine-solid children right at the surface — average over the
+    // fluid children only. The child set is identical for every q, so the
+    // fluid mask is built once.
+    float fi[kQ];
 #pragma unroll
-    for (int c = 0; c < 8; ++c) {
-        const int cxn = fx + (c & 1);
-        const int cyn = fy + ((c >> 1) & 1);
-        const int czn = fz + ((c >> 2) & 1);
-        const long long pfc = pIdx(cxn, cyn, czn, fineNx, fineNxny);
-        // Stair-step walls differ slightly between levels: a coarse-fluid
-        // cell may own one or two fine-solid children right at the surface.
-        // Average over the fluid children only; -1 marks an excluded slot.
-        if (fineFlags[pfc] == kFlagSolid) {
-            child[c] = -1;
-        } else {
-            child[c] = pfc;
-            ++nFluid;
+    for (int q = 0; q < kQ; ++q) fi[q] = 0.0f;
+    int nFluid = 0;
+    for (int k = 0; k < factor; ++k) {
+        for (int j = 0; j < factor; ++j) {
+            for (int i = 0; i < factor; ++i) {
+                const long long pfc =
+                    pIdx(fx + i, fy + j, fz + k, fineNx, fineNxny);
+                if (fineFlags[pfc] == kFlagSolid) continue;
+                ++nFluid;
+#pragma unroll
+                for (int q = 0; q < kQ; ++q)
+                    fi[q] += ff[static_cast<long long>(q) * fineNcellsPad + pfc];
+            }
         }
     }
     if (nFluid == 0) return; // fully solid at the fine level: leave coarse value
 
     const float invN = 1.0f / static_cast<float>(nFluid);
-
-    // ---- average children, accumulate moments ----------------------------
-    float fi[kQ];
     float rho = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
 #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        const long long qBase = static_cast<long long>(q) * fineNcellsPad;
-        float s = 0.0f;
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            if (child[c] >= 0) s += ff[qBase + child[c]];
-        }
-        const float fq = s * invN;
-        fi[q] = fq;
-        rho += fq;
-        jx += rf_cx[q] * fq;
-        jy += rf_cy[q] * fq;
-        jz += rf_cz[q] * fq;
+        fi[q] *= invN;
+        rho += fi[q];
+        jx += rf_cx[q] * fi[q];
+        jy += rf_cy[q] * fi[q];
+        jz += rf_cz[q] * fi[q];
     }
     rho = fmaxf(rho, 0.05f);
     const float invRho = 1.0f / rho;
     float ux = jx * invRho, uy = jy * invRho, uz = jz * invRho;
 
     // Velocity-validity cap, mirroring the fill kernel and the collision
-    // limiter — the inverse fneq rescale below DOUBLES the non-equilibrium
-    // part, so an already-hot averaged state must not also carry an
+    // limiter — the inverse fneq rescale below AMPLIFIES the non-equilibrium
+    // part by m, so an already-hot averaged state must not also carry an
     // over-bound velocity into the coarse grid.
     const float u2 = ux * ux + uy * uy + uz * uz;
     if (u2 > kMaxSimSpeed * kMaxSimSpeed) {
@@ -277,20 +281,32 @@ __global__ void fineToCoarseRestrictKernel(
         ux *= sc; uy *= sc; uz *= sc;
     }
 
-    // ---- inverse rescale, overwrite the coarse post-collision state -------
+    // ---- inverse rescale + edge blend with the coarse-evolved state -------
     float feq[kQ];
     equilibrium19(rho, ux, uy, uz, feq);
+    float br = 0.0f, bjx = 0.0f, bjy = 0.0f, bjz = 0.0f;
 #pragma unroll
     for (int q = 0; q < kQ; ++q) {
-        fc[static_cast<long long>(q) * coarseNcellsPad + pc] =
-            feq[q] + neqScaleInv * (fi[q] - feq[q]);
+        const long long idx = static_cast<long long>(q) * coarseNcellsPad + pc;
+        const float restricted = feq[q] + neqScaleInv * (fi[q] - feq[q]);
+        const float existing   = fc[idx]; // coarse post-collision value
+        const float blended    = existing + blend * (restricted - existing);
+        fc[idx] = blended;
+        // Macro moments of the BLENDED state, so the displayed field matches
+        // the populations exactly (moments are linear in f).
+        br  += blended;
+        bjx += rf_cx[q] * blended;
+        bjy += rf_cy[q] * blended;
+        bjz += rf_cz[q] * blended;
     }
 
     if (writeMacro) {
-        macroRho[cCell] = rho;
-        macroU[cCell] = ux;
-        macroV[cCell] = uy;
-        macroW[cCell] = uz;
+        br = fmaxf(br, 0.05f);
+        const float bInv = 1.0f / br;
+        macroRho[cCell] = br;
+        macroU[cCell] = bjx * bInv;
+        macroV[cCell] = bjy * bInv;
+        macroW[cCell] = bjz * bInv;
     }
 }
 
@@ -380,12 +396,12 @@ inline unsigned int gridFor(long long n) {
 cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
                                    const FPop* coarseT1F,
                                    DeviceLatticeView fine,
-                                   PatchBox box, float timeWeight,
+                                   PatchBox box, int factor, float timeWeight,
                                    float tauCoarse, float tauFine,
                                    bool fullVolume, cudaStream_t stream) {
     const long long fineNcells = fine.dims.cellCount();
     if (fineNcells <= 0 || !coarseT0.f || !coarseT1F || !fine.f || !fine.flags
-        || !box.valid())
+        || !box.valid() || factor < 2 || factor > kMaxRefineFactor)
         return cudaErrorInvalidValue;
 
     const long long fineNxny =
@@ -393,8 +409,8 @@ cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
     const long long coarseNxny =
         static_cast<long long>(coarseT0.dims.nx) * coarseT0.dims.ny;
 
-    // fneq rescale coarse -> fine: tau_f / (m * tau_c) with m = 2.
-    const float neqScale = tauFine / (2.0f * tauCoarse);
+    // fneq rescale coarse -> fine: tau_f / (m * tau_c).
+    const float neqScale = tauFine / (static_cast<float>(factor) * tauCoarse);
 
     coarseToFineFillKernel<<<gridFor(fineNcells), kBlock, 0, stream>>>(
         coarseT0.f, coarseT1F, fine.flags, fine.f,
@@ -402,18 +418,20 @@ cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
         fine.dims.nx, fine.dims.ny,
         coarseNxny, coarseT0.dims.paddedCellCount(), coarseT0.dims.nx,
         coarseT0.dims.nz,
-        box.x0, box.y0, timeWeight, neqScale, fullVolume ? 1 : 0);
+        box.x0, box.y0, 1.0f / static_cast<float>(factor),
+        timeWeight, neqScale, fullVolume ? 1 : 0);
     return cudaGetLastError();
 }
 
 cudaError_t launchFineToCoarseRestrict(DeviceLatticeView fine,
                                        DeviceLatticeView coarse,
-                                       PatchBox box,
+                                       PatchBox box, int factor,
                                        float tauCoarse, float tauFine,
                                        float* macroRho, float* macroU,
                                        float* macroV, float* macroW,
                                        cudaStream_t stream) {
-    if (!fine.f || !fine.flags || !coarse.f || !coarse.flags || !box.valid())
+    if (!fine.f || !fine.flags || !coarse.f || !coarse.flags || !box.valid()
+        || factor < 2 || factor > kMaxRefineFactor)
         return cudaErrorInvalidValue;
 
     // Interior sub-box: skip the band feeding the next interface fill.
@@ -431,7 +449,8 @@ cudaError_t launchFineToCoarseRestrict(DeviceLatticeView fine,
         static_cast<long long>(coarse.dims.nx) * coarse.dims.ny;
 
     // fneq rescale fine -> coarse: (m * tau_c) / tau_f, the exact inverse.
-    const float neqScaleInv = (2.0f * tauCoarse) / tauFine;
+    const float neqScaleInv =
+        (static_cast<float>(factor) * tauCoarse) / tauFine;
     const bool wantMacro = macroRho && macroU && macroV && macroW;
 
     fineToCoarseRestrictKernel<<<gridFor(total), kBlock, 0, stream>>>(
@@ -439,7 +458,7 @@ cudaError_t launchFineToCoarseRestrict(DeviceLatticeView fine,
         fineNxny, fine.dims.paddedCellCount(), fine.dims.nx,
         coarseNxny, coarse.dims.paddedCellCount(), coarse.dims.nx,
         coarse.dims.nz,
-        rx0, ry0, rx1, ry1, box.x0, box.y0, neqScaleInv,
+        rx0, ry0, rx1, ry1, box.x0, box.y0, factor, neqScaleInv,
         macroRho, macroU, macroV, macroW, wantMacro ? 1 : 0);
     return cudaGetLastError();
 }

@@ -2,14 +2,16 @@
 // level-scaling relations, and the host-callable launch wrappers for the
 // coarse<->fine coupling kernels — coarse-to-fine interface fill (trilinear +
 // temporal interpolation with non-equilibrium rescaling), fine-to-coarse
-// restriction (8-child average with the inverse rescale), and the macroscopic
-// trilinear upsample used by the mesh-sequencing presolve.
+// restriction (child average with the inverse rescale and an edge blend that
+// suppresses seam vorticity), and the macroscopic trilinear upsample used by
+// the mesh-sequencing presolve.
 //
-// Physics contract (factor m = 2, acoustic scaling):
-//   dx_f = dx_c / 2          dt_f = dt_c / 2          u_lat unchanged
-//   nu_lat_f = 2 * nu_lat_c  ->  tau_f = 2*(tau_c - 1/2) + 1/2
-// The equilibrium part of f is invariant under the level change (same rho, u);
-// the non-equilibrium part carries the strain rate and rescales as
+// Physics contract (runtime factor m in {2, 3, 4}, acoustic scaling):
+//   dx_f = dx_c / m          dt_f = dt_c / m          u_lat unchanged
+//   nu_lat_f = m * nu_lat_c  ->  tau_f = m*(tau_c - 1/2) + 1/2
+// The fine level advances m sub-steps per coarse step. The equilibrium part
+// of f is invariant under the level change (same rho, u); the non-equilibrium
+// part carries the strain rate and rescales as
 //   coarse->fine:  fneq_f = fneq_c * tau_f / (m * tau_c)
 //   fine->coarse:  fneq_c = fneq_f * (m * tau_c) / tau_f
 // (Dupuis & Chopard 2003 / Filippova & Haenel family; the rescale uses the
@@ -17,13 +19,13 @@
 // excluded, the standard practice for LES-coupled multi-level lattices.)
 //
 // Both Reynolds numbers are SHARED across levels: the fine tau is derived
-// from the coarse tau, so the patch buys 2x spatial resolution (boundary
+// from the coarse tau, so the patch buys m-times spatial resolution (boundary
 // layer cells, VG geometry) at the same effective Re — it does not raise Re.
 //
-// The fine level spans the FULL z extent (2*nz fine cells) and reuses the
+// The fine level spans the FULL z extent (m*nz fine cells) and reuses the
 // padded-ghost-z layout + refresh kernels of lbm_core unchanged. Its x/y
 // faces carry a 2-fine-cell CellFlag::Interface shell written by the fill
-// kernel before every fine step; no inlet/outlet/slip flags exist at the
+// kernel before every fine sub-step; no inlet/outlet/slip flags exist at the
 // fine level.
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 #pragma once
@@ -40,7 +42,7 @@ namespace foilcfd {
 // ===========================================================================
 
 /// @brief Axis-aligned refinement patch in COARSE cell coordinates. The fine
-/// grid covers [x0, x1) x [y0, y1) x [0, nz) at 2x resolution (full span).
+/// grid covers [x0, x1) x [y0, y1) x [0, nz) at the chosen factor (full span).
 struct PatchBox {
     int x0 = 0, y0 = 0;  ///< Inclusive lower corner (coarse cells).
     int x1 = 0, y1 = 0;  ///< Exclusive upper corner (coarse cells).
@@ -50,9 +52,9 @@ struct PatchBox {
     bool valid()  const { return width() > 8 && height() > 8; }
 };
 
-/// Refinement factor between levels. The coupling kernels hard-code the
-/// 8-child stencils this implies; treat as frozen for v1.
-inline constexpr int kRefineFactor = 2;
+/// Default refinement factor; runtime factors 2..kMaxRefineFactor supported.
+inline constexpr int kRefineFactor    = 2;
+inline constexpr int kMaxRefineFactor = 4;
 
 /// Interface-shell thickness on the fine level's x/y faces, in FINE cells.
 /// Two cells: the outer ring feeds the pull of the inner ring, which feeds
@@ -66,19 +68,28 @@ inline constexpr int kInterfaceShellFine = 2;
 /// short-circuit fine data back into the fine boundary condition).
 inline constexpr int kRestrictBandCoarse = 2;
 
+/// Width (in coarse cells) of the restriction's edge BLEND ramp: the first
+/// cells inside the restricted region mix coarse-evolved and fine-restricted
+/// populations with a weight ramping 0 -> 1 inward. A hard cutoff leaves a
+/// velocity kink at the band edge that the Q-criterion lights up as a
+/// spurious vortex sheet standing on the patch faces (observed in the fog
+/// view); the ramp spreads the level hand-off over a few cells instead.
+inline constexpr int kRestrictBlendCoarse = 3;
+
 /// @brief Fine grid dimensions for a patch over the given coarse grid.
-inline GridDims fineDimsFor(const PatchBox& box, const GridDims& coarse) {
+inline GridDims fineDimsFor(const PatchBox& box, const GridDims& coarse,
+                            int factor = kRefineFactor) {
     GridDims d;
-    d.nx = kRefineFactor * box.width();
-    d.ny = kRefineFactor * box.height();
-    d.nz = kRefineFactor * coarse.nz;
+    d.nx = factor * box.width();
+    d.ny = factor * box.height();
+    d.nz = factor * coarse.nz;
     return d;
 }
 
 /// @brief Relaxation time at the fine level for a given coarse tau (acoustic
-/// scaling, factor 2): same physical viscosity on both levels.
-inline float fineTauFor(float tauCoarse) {
-    return 2.0f * (tauCoarse - 0.5f) + 0.5f;
+/// scaling): same physical viscosity on both levels.
+inline float fineTauFor(float tauCoarse, int factor = kRefineFactor) {
+    return static_cast<float>(factor) * (tauCoarse - 0.5f) + 0.5f;
 }
 
 // ===========================================================================
@@ -91,38 +102,41 @@ inline float fineTauFor(float tauCoarse) {
 /// mode). For each target fine cell, the 19 populations are trilinearly
 /// interpolated from the 8 surrounding coarse cells — blended between the two
 /// coarse time levels by @p timeWeight — then split into feq + fneq via the
-/// interpolated moments and the fneq part is rescaled by tau_f/(2*tau_c).
+/// interpolated moments and the fneq part is rescaled by tau_f/(m*tau_c).
 ///
 /// The coarse ping-pong pair provides both time levels for free: pass the
-/// pre-step buffer as @p coarseT0 and the post-step buffer as @p coarseT1.
+/// pre-step buffer as @p coarseT0 and the post-step buffer as @p coarseT1F.
 /// z interpolation rides the coarse ghost planes (periodic span).
 /// @param coarseT0   Coarse lattice view at time t (padded base + dims/flags).
 /// @param coarseT1F  Coarse f buffer at time t+1 (padded base; same dims).
 /// @param fine       Fine lattice view; the buffer about to be PULLED from.
 /// @param box        Patch box in coarse cells.
-/// @param timeWeight 0 = coarse time t, 0.5 = t+1/2 (before fine step 2).
+/// @param factor     Refinement factor m (2..kMaxRefineFactor).
+/// @param timeWeight k/m before fine sub-step k (0, 1/m, ..., (m-1)/m).
 /// @param tauCoarse  Coarse base relaxation time this step (ramped).
-/// @param tauFine    Fine base relaxation time (fineTauFor(tauCoarse)).
+/// @param tauFine    Fine base relaxation time (fineTauFor(tauCoarse, m)).
 /// @param fullVolume False: Interface shell only (the per-step path).
 ///                   True: every Fluid + Interface fine cell (seeding after
 ///                   init/reset/presolve; call once per fine buffer).
 cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
                                    const FPop* coarseT1F,
                                    DeviceLatticeView fine,
-                                   PatchBox box, float timeWeight,
+                                   PatchBox box, int factor, float timeWeight,
                                    float tauCoarse, float tauFine,
                                    bool fullVolume, cudaStream_t stream);
 
 /// @brief Fine-to-coarse restriction: for every coarse Fluid cell inside the
 /// patch (excluding the kRestrictBandCoarse band), average the populations of
-/// its 8 fine children (skipping Solid children near stair-step walls),
-/// rescale fneq by (2*tau_c)/tau_f, and overwrite the coarse post-collision
+/// its m^3 fine children (skipping Solid children near stair-step walls),
+/// rescale fneq by (m*tau_c)/tau_f, BLEND with the existing coarse value over
+/// the kRestrictBlendCoarse edge ramp, and overwrite the coarse post-collision
 /// buffer. Optionally writes the coarse macroscopic arrays in the overlap so
 /// rendering and the delta99 extraction see fine-derived data with zero
 /// changes to any consumer.
 /// @param fine      Fine lattice view (post-collision, current src).
 /// @param coarse    Coarse lattice view to overwrite (the t+1 buffer).
 /// @param box       Patch box in coarse cells.
+/// @param factor    Refinement factor m (2..kMaxRefineFactor).
 /// @param tauCoarse Coarse base relaxation time this step.
 /// @param tauFine   Fine base relaxation time.
 /// @param macroRho  Optional coarse density array (unpadded); may be null.
@@ -131,7 +145,7 @@ cudaError_t launchCoarseToFineFill(DeviceLatticeView coarseT0,
 /// @param macroW    Optional z-velocity output.
 cudaError_t launchFineToCoarseRestrict(DeviceLatticeView fine,
                                        DeviceLatticeView coarse,
-                                       PatchBox box,
+                                       PatchBox box, int factor,
                                        float tauCoarse, float tauFine,
                                        float* macroRho, float* macroU,
                                        float* macroV, float* macroW,
