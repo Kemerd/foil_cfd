@@ -754,7 +754,11 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
 void drawVGEditorPanel(UIContext& ctx) {
     UIParams& p = *ctx.params;
     UIEvents& ev = *ctx.events;
-    const int chordCells = ctx.readouts->scaling.chordCells;
+    // Under-resolution checks judge against the grid the vanes are actually
+    // voxelized on: the 2x fine patch when it is active (plan M-refine —
+    // doubling vane resolution is the patch's headline win), else the base.
+    const int chordCells = (ctx.readouts->refine.active ? 2 : 1)
+                         * ctx.readouts->scaling.chordCells;
     if (!ImGui::Begin("VG Editor")) { ImGui::End(); return; }
 
     if (p.source == AirfoilSource::StlImport) {
@@ -1317,6 +1321,13 @@ void drawViewPanel(UIContext& ctx) {
     ImGui::Checkbox("Foil mesh  [4]", &p.viz.showFoilMesh);
     if (p.viz.showFoilMesh) {
         ImGui::Indent();
+        if (ImGui::Checkbox("Voxel view (solver cells)", &p.voxelView))
+            ev.voxelViewToggled = true;
+        helpMarker("Show the geometry the SOLVER actually sees: the stair-step "
+                   "voxelization of the flag field instead of the smooth "
+                   "outline. Inside the refinement patch the cubes are half "
+                   "size (the 2x fine grid). The definitive way to judge "
+                   "whether a VG vane is adequately resolved.");
         ImGui::Checkbox("Wireframe", &p.viz.foilWireframe);
         helpMarker("Draw the airfoil/VG geometry as an edge cage instead of a "
                    "shaded solid — handy for seeing the flow field through the "
@@ -1389,23 +1400,17 @@ void drawViewPanel(UIContext& ctx) {
 }
 
 // ===========================================================================
-// Panel: Mesh Refinement — non-uniform coordinate stretching.
-//
-// The LBM solver uses a uniform logical grid; this panel configures a tanh-
-// based coordinate map that packs more cells into aerodynamically critical
-// regions (leading edge, suction-surface BL, VG zone, near wake) without
-// changing the cell count or VRAM budget. Four presets cover most use cases;
-// Custom unlocks all seven zone-weight sliders. A live domain diagram
-// (drawn with ImDrawList) shows the relative cell density across the domain
-// so the user can see the stretching effect before committing.
+// Panel: Mesh — the two-level refinement patch (plan M-refine) + the mesh-
+// sequencing startup toggle. The patch is a 2x-finer nested lattice over the
+// foil/VG/near-wake region, coupled to the base grid every step; the panel
+// configures its margins, shows the live patch box in a mini domain diagram,
+// and surfaces the VRAM bill BEFORE the user commits.
 // ===========================================================================
 
-/// @brief Draw a mini top-view of the stretched domain density map using
-/// ImDrawList. The domain is shown as a horizontal bar; darker fill indicates
-/// higher cell density (more refinement). The foil silhouette is overlaid as
-/// a simple teardrop outline for reference.
-static void drawDomainDiagram(const MeshRefinementParams& params,
-                               const ImVec2& canvasPos, const ImVec2& canvasSize) {
+/// @brief Mini top-view of the domain with the refinement patch box drawn
+/// over a foil silhouette — the at-a-glance "what am I refining" picture.
+static void drawPatchDiagram(const UIReadouts& r, bool enabled,
+                             const ImVec2& canvasPos, const ImVec2& canvasSize) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     const float W  = canvasSize.x;
@@ -1413,93 +1418,19 @@ static void drawDomainDiagram(const MeshRefinementParams& params,
     const float px = canvasPos.x;
     const float py = canvasPos.y;
 
-    // Background frame.
+    // Background frame (domain extents).
     dl->AddRectFilled(ImVec2(px, py), ImVec2(px + W, py + H),
                       IM_COL32(18, 20, 25, 255), 4.0f);
     dl->AddRect(ImVec2(px, py), ImVec2(px + W, py + H),
                 IM_COL32(50, 55, 65, 200), 4.0f);
 
-    if (params.preset == MeshRefinementPreset::Off) {
-        // Uniform density — single mid-grey fill, label.
-        dl->AddRectFilled(ImVec2(px + 2, py + 2),
-                          ImVec2(px + W - 2, py + H - 2),
-                          IM_COL32(55, 60, 72, 200), 3.0f);
-        const char* lbl = "Uniform (Off)";
-        const ImVec2 ts  = ImGui::CalcTextSize(lbl);
-        dl->AddText(ImVec2(px + (W - ts.x) * 0.5f, py + (H - ts.y) * 0.5f),
-                    IM_COL32(120, 125, 135, 200), lbl);
-        return;
-    }
-
-    // Approximate domain proportions: foil at 30% from left, chord = 33% of W.
-    const float domChord = W * 0.33f;
-    const float domAncX  = W * 0.30f; // quarter-chord x in diagram space
-
-    // Zone layout mirrors GridStretch::build() proportions.
-    const float leStart  = domAncX - 0.05f * domChord;
-    const float leEnd    = domAncX + 0.15f * domChord;
-    const float nuStart  = domAncX - 0.80f * domChord;
-    const float wakeNear = domAncX + 0.75f * domChord;
-    const float wakeFar  = domAncX + 1.50f * domChord;
-    const float vgCtr    = domAncX + (params.vgZoneXc - 0.25f) * domChord;
-    const float vgHalf   = params.vgZoneHalfWidth * domChord;
-    const float vgStart  = vgCtr - vgHalf;
-    const float vgEnd    = vgCtr + vgHalf;
-    const float trans    = 0.04f * domChord;
-
-    // For each pixel column, compute an approximate density weight.
-    const float* w = params.zoneWeight;
-    const int    nCols = static_cast<int>(W - 4);
-
-    auto smoothStep = [](float x) -> float {
-        x = std::clamp(x, 0.0f, 1.0f);
-        return x * x * (3.0f - 2.0f * x);
-    };
-    auto blendW = [&](float x, float s, float e, float wi, float wo) {
-        const float t0 = smoothStep((x - s) / trans);
-        const float t1 = smoothStep((e - x) / trans);
-        return wo + (wi - wo) * std::min(t0, t1);
-    };
-
-    // Find the max weight to normalise the colour brightness.
-    float maxW = 0.01f;
-    for (int k = 0; k < kNumMeshZones; ++k)
-        maxW = std::max(maxW, w[k]);
-
-    for (int col = 0; col < nCols; ++col) {
-        const float xDiag  = static_cast<float>(col) + 2.0f;
-        const float x      = xDiag; // diagram x == domain fraction
-
-        float weight = (x < nuStart) ? w[0] : w[6];
-        weight = blendW(x, nuStart, leStart, w[1], weight);
-        weight = blendW(x, leStart, leEnd,   w[2], weight);
-        weight = blendW(x, wakeNear, wakeFar, w[5], weight);
-        if (x > vgStart - trans && x < vgEnd + trans) {
-            const float vw = blendW(x, vgStart, vgEnd, w[4], weight);
-            weight = std::max(weight, vw);
-        }
-        weight = std::max(0.01f, weight);
-
-        // Map weight to a blue-accent colour: low density = dark, high = bright.
-        const float t = std::clamp(weight / maxW, 0.0f, 1.0f);
-        const ImU32 col32 = IM_COL32(
-            static_cast<int>(20  + t * 40),
-            static_cast<int>(60  + t * 100),
-            static_cast<int>(120 + t * 120),
-            static_cast<int>(140 + t * 100));
-        dl->AddLine(ImVec2(px + xDiag, py + 2),
-                    ImVec2(px + xDiag, py + H - 2),
-                    col32, 1.0f);
-    }
-
-    // Foil silhouette: simple ellipse-ish teardrop outline as a visual anchor.
+    // Foil silhouette: anchored like the real layout (quarter-chord at 30%
+    // of nx, mid-height, chord = nx/3).
+    const float chordPx = W / 3.0f;
+    const float foilX0  = px + 0.30f * W - 0.25f * chordPx; // LE
+    const float foilX1  = foilX0 + chordPx;                 // TE
+    const float foilMY  = py + H * 0.5f;
     {
-        const float foilX0 = px + domAncX - 0.25f * domChord; // LE x
-        const float foilX1 = px + domAncX + 0.75f * domChord; // TE x
-        const float foilMY = py + H * 0.5f;
-        const float camber = H * 0.08f;   // camber offset (upward)
-        const float thick  = H * 0.13f;   // max half-thickness
-
         const int segs = 32;
         std::vector<ImVec2> upper, lower;
         upper.reserve(segs + 1);
@@ -1507,169 +1438,153 @@ static void drawDomainDiagram(const MeshRefinementParams& params,
         for (int s = 0; s <= segs; ++s) {
             const float t   = static_cast<float>(s) / static_cast<float>(segs);
             const float xpt = foilX0 + t * (foilX1 - foilX0);
-            // NACA-like thickness distribution (simplified).
-            const float tck = thick * std::sqrt(t) * (1.0f - t) * 2.5f;
-            const float cam = camber * (4.0f * t * (1.0f - t));
+            const float tck = H * 0.12f * std::sqrt(t) * (1.0f - t) * 2.5f;
+            const float cam = H * 0.06f * (4.0f * t * (1.0f - t));
             upper.push_back(ImVec2(xpt, foilMY - cam - tck));
             lower.push_back(ImVec2(xpt, foilMY - cam + tck));
         }
-        dl->AddPolyline(upper.data(), segs + 1, IM_COL32(230, 80, 80, 200), 0, 1.5f);
-        dl->AddPolyline(lower.data(), segs + 1, IM_COL32(230, 80, 80, 200), 0, 1.5f);
+        dl->AddPolyline(upper.data(), segs + 1, IM_COL32(220, 90, 90, 220), 0, 1.5f);
+        dl->AddPolyline(lower.data(), segs + 1, IM_COL32(220, 90, 90, 220), 0, 1.5f);
     }
 
-    // VG zone indicator: thin vertical band marker with label.
-    {
-        const float vgX0 = px + vgStart;
-        const float vgX1 = px + vgEnd;
-        dl->AddRectFilled(ImVec2(vgX0, py + 2), ImVec2(vgX1, py + H - 2),
-                          IM_COL32(255, 200, 60, 30));
-        dl->AddRect(ImVec2(vgX0, py + 2), ImVec2(vgX1, py + H - 2),
-                    IM_COL32(255, 200, 60, 140), 1.0f);
-    }
-
-    // Zone boundary tick marks.
-    const float tickCol = IM_COL32(90, 95, 110, 180);
-    auto tick = [&](float xAbs) {
-        if (xAbs < 0 || xAbs > W) return;
-        const float sx = px + xAbs;
-        dl->AddLine(ImVec2(sx, py + H - 8), ImVec2(sx, py + H - 2), tickCol, 1.0f);
-    };
-    tick(nuStart); tick(leStart); tick(leEnd);
-    tick(wakeNear); tick(wakeFar);
-}
-
-/// @brief Draw the Mesh Refinement panel.
-void drawMeshPanel(UIContext& ctx) {
-    UIParams&  p  = *ctx.params;
-    UIEvents&  ev = *ctx.events;
-    MeshRefinementParams& mr = p.meshRefinement;
-
-    if (!ImGui::Begin("Mesh")) { ImGui::End(); return; }
-
-    ImGui::TextDisabled("MESH REFINEMENT");
-    helpMarker(
-        "Non-uniform coordinate stretching packs more logical cells into "
-        "aerodynamically critical regions — the leading edge, suction-surface "
-        "boundary layer, VG zone, and near wake — without increasing the "
-        "total cell count or VRAM. The solver runs on the same uniform logical "
-        "grid; only the physical spacing distribution changes. Stretching "
-        "introduces a metric correction of order (ratio-1)*Ma^2, which is "
-        "within the existing LBM compressibility error for ratios up to ~8:1.");
-
-    // ---- Preset selector ----
-    ImGui::Spacing();
-    static const char* kPresetNames[] = {
-        "Off  (uniform grid)",
-        "Balanced  (2x LE, 4x VG)",
-        "Aggressive  (4x LE, 8x VG)",
-        "Custom"
-    };
-    int presetIdx = static_cast<int>(mr.preset);
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##meshpreset", &presetIdx, kPresetNames, 4)) {
-        const auto newPreset = static_cast<MeshRefinementPreset>(presetIdx);
-        // Apply canonical weights when switching to a named preset.
-        if (newPreset != MeshRefinementPreset::Custom || mr.preset == MeshRefinementPreset::Off) {
-            mr.applyPreset(newPreset);
-        } else {
-            mr.preset = newPreset; // Custom: keep existing weights
-        }
-        ev.meshRefinementChanged = true;
-    }
-
-    // ---- Live domain diagram ----
-    ImGui::Spacing();
-    {
-        const ImVec2 cpos = ImGui::GetCursorScreenPos();
-        // Reserve a fixed-height canvas; width fills the panel.
-        const float W = ImGui::GetContentRegionAvail().x;
-        constexpr float H = 56.0f;
-        drawDomainDiagram(mr, cpos, ImVec2(W, H));
-        // Advance the cursor past the canvas so subsequent widgets flow below.
-        ImGui::Dummy(ImVec2(W, H));
-    }
-    ImGui::TextDisabled("darker = coarser  |  brighter = finer  |  red = foil  |  yellow = VG zone");
-
-    if (mr.preset == MeshRefinementPreset::Off) {
-        ImGui::End();
+    if (!enabled || r.dims.nx <= 0) {
+        const char* lbl = enabled ? "patch pending re-init" : "uniform grid";
+        const ImVec2 ts = ImGui::CalcTextSize(lbl);
+        dl->AddText(ImVec2(px + (W - ts.x) * 0.5f, py + H - ts.y - 4.0f),
+                    IM_COL32(110, 115, 125, 200), lbl);
         return;
     }
 
-    // ---- VG zone tracking ----
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextDisabled("VG ZONE");
-    {
-        bool autoTrack = mr.autoTrackVGs;
-        if (ImGui::Checkbox("Auto-track VG stations", &autoTrack)) {
-            mr.autoTrackVGs = autoTrack;
-            ev.meshRefinementChanged = true;
-        }
-        helpMarker(
-            "When enabled, the VG refinement zone centre follows the first "
-            "VG station automatically. Disable to position it manually.");
+    // Patch box mapped from coarse cells into diagram space. When the sim has
+    // a live patch, draw the REAL box; otherwise nothing (pending re-init).
+    if (r.refine.active) {
+        const float sx = W / static_cast<float>(r.dims.nx);
+        const float sy = H / static_cast<float>(r.dims.ny);
+        // y is flipped: lattice y=0 is the bottom slip wall.
+        const float bx0 = px + r.refine.patchX0 * sx;
+        const float bx1 = px + r.refine.patchX1 * sx;
+        const float by0 = py + H - r.refine.patchY1 * sy;
+        const float by1 = py + H - r.refine.patchY0 * sy;
+        dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                          IM_COL32(66, 140, 245, 28), 2.0f);
+        dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
+                    IM_COL32(66, 140, 245, 220), 2.0f, 0, 1.5f);
+        const char* lbl = "2x patch";
+        dl->AddText(ImVec2(bx0 + 4.0f, by0 + 2.0f),
+                    IM_COL32(140, 185, 255, 230), lbl);
+    }
+}
 
-        ImGui::BeginDisabled(mr.autoTrackVGs);
-        float vgPct = mr.vgZoneXc * 100.0f;
-        ImGui::SliderFloat("Zone centre (x/c %)", &vgPct, 1.0f, 70.0f, "%.1f%%");
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            mr.vgZoneXc = vgPct / 100.0f;
-            ev.meshRefinementChanged = true;
-        }
-        ImGui::EndDisabled();
+/// @brief Draw the Mesh panel: refinement patch config + startup options.
+void drawMeshPanel(UIContext& ctx) {
+    UIParams&   p  = *ctx.params;
+    UIReadouts& r  = *ctx.readouts;
+    UIEvents&   ev = *ctx.events;
 
-        float hwPct = mr.vgZoneHalfWidth * 100.0f;
-        ImGui::SliderFloat("Zone half-width (x/c %)", &hwPct, 1.0f, 20.0f, "%.1f%%");
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            mr.vgZoneHalfWidth = hwPct / 100.0f;
-            ev.meshRefinementChanged = true;
-        }
-        helpMarker("Physical half-width of the VG ultra-refinement band in "
-                   "chord fractions. Wider = more cells around the vane roots "
-                   "and shed vortex path.");
+    if (!ImGui::Begin("Mesh")) { ImGui::End(); return; }
+
+    // ---- refinement patch ----
+    ImGui::TextDisabled("REFINEMENT PATCH");
+    helpMarker(
+        "Two-level grid refinement: a 2x-finer nested lattice covering the "
+        "foil, VGs, and near wake, two-way coupled to the base grid every "
+        "step. Doubles the wall/VG/boundary-layer resolution exactly where "
+        "the guidance reads, at a fraction of the cost of doubling the whole "
+        "domain. Effective Re is shared across levels — the patch buys "
+        "RESOLUTION at the same Re, not a higher Re.");
+
+    bool enabled = p.refine.enabled;
+    if (ImGui::Checkbox("Enable 2x refinement patch", &enabled)) {
+        p.refine.enabled = enabled;
+        ev.meshRefinementChanged = true;
     }
 
-    // ---- Custom zone weight sliders (Custom mode only) ----
-    if (mr.preset == MeshRefinementPreset::Custom) {
+    // ---- live domain diagram ----
+    ImGui::Spacing();
+    {
+        const ImVec2 cpos = ImGui::GetCursorScreenPos();
+        const float W = ImGui::GetContentRegionAvail().x;
+        constexpr float H = 64.0f;
+        drawPatchDiagram(r, p.refine.enabled, cpos, ImVec2(W, H));
+        ImGui::Dummy(ImVec2(W, H));
+    }
+
+    if (p.refine.enabled) {
+        // Margins around the solid bbox, in chord fractions. Release-commit:
+        // every change re-derives the patch and re-allocates the fine level.
+        ImGui::Spacing();
+        ImGui::TextDisabled("MARGINS (chords around the foil+VG bbox)");
+        auto marginSlider = [&ev](const char* label, float* v, float lo,
+                                  float hi, const char* tip) {
+            ImGui::SliderFloat(label, v, lo, hi, "%.2f c");
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ev.meshRefinementChanged = true;
+            helpMarker(tip);
+        };
+        marginSlider("Upstream", &p.refine.upstreamC, 0.05f, 0.50f,
+                     "Patch extent ahead of the leading edge — covers the "
+                     "stagnation/suction-peak region.");
+        marginSlider("Wake", &p.refine.wakeC, 0.10f, 1.00f,
+                     "Patch extent behind the trailing edge — covers the "
+                     "near-wake rollup of the VG vortices.");
+        marginSlider("Above", &p.refine.aboveC, 0.05f, 0.50f,
+                     "Patch extent above the foil — must cover the suction-"
+                     "surface boundary layer plus the VG vanes and their "
+                     "shed vortex path.");
+        marginSlider("Below", &p.refine.belowC, 0.05f, 0.50f,
+                     "Patch extent below the foil (pressure side needs less).");
+
+        // ---- live status from the solver ----
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextDisabled("ZONE WEIGHTS  (1.0 = neutral)");
-        helpMarker(
-            "Relative cell density per zone. 2.0 = twice as many cells per "
-            "metre in that region. The total cell count stays constant — "
-            "finer zones borrow from coarser ones automatically.");
-
-        // Zone names and their indices in zoneWeight[].
-        static const char* kZoneLabels[kNumMeshZones] = {
-            "Far upstream",
-            "Near upstream",
-            "Leading edge",
-            "Top surface BL",
-            "VG zone (ultra)",
-            "Near wake",
-            "Far wake",
-        };
-        // Accent colour for the VG zone slider to visually distinguish it.
-        bool changed = false;
-        for (int i = 0; i < kNumMeshZones; ++i) {
-            const bool isVG = (i == static_cast<int>(MeshZone::VGZone));
-            if (isVG) ImGui::PushStyleColor(ImGuiCol_SliderGrab,
-                                            ImVec4(0.95f, 0.78f, 0.20f, 1.0f));
-            ImGui::PushID(i);
-            ImGui::SliderFloat(kZoneLabels[i], &mr.zoneWeight[i], 0.1f, 10.0f,
-                               "%.2f", ImGuiSliderFlags_Logarithmic);
-            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
-            ImGui::PopID();
-            if (isVG) ImGui::PopStyleColor();
+        if (r.refine.active) {
+            ImGui::TextDisabled(
+                "fine grid %d x %d x %d  (~%.1f GB VRAM)",
+                r.refine.fineDims.nx, r.refine.fineDims.ny, r.refine.fineDims.nz,
+                r.refine.fineVramGB);
+            if (r.refine.forcesFromFine) {
+                ImGui::TextColored(kColGood, "forces measured on the 2x grid");
+                helpMarker("The patch covers every solid cell, so the "
+                           "momentum-exchange force reduction runs at 2x wall "
+                           "resolution — the patch's whole purpose.");
+            } else {
+                ImGui::TextColored(kColWarn,
+                                   "solids extend past the patch — forces on "
+                                   "base grid");
+                helpMarker("Increase the margins until the foil and every VG "
+                           "sit inside the patch to get 2x-resolution "
+                           "forces.");
+            }
+        } else {
+            ImGui::TextColored(kColWarn, "patch inactive (init failed or "
+                                         "pending re-init)");
         }
-        if (changed) ev.meshRefinementChanged = true;
+
+        // VRAM guard readout: warn when the whole allocation crowds the card.
+        if (r.vramUsedFraction > 0.8f) {
+            ImGui::TextColored(kColBad, "VRAM %.0f%% — consider disabling the "
+                                        "patch or a smaller preset",
+                               r.vramUsedFraction * 100.0f);
+        }
     }
 
+    // ---- startup: mesh-sequencing pre-convergence ----
     ImGui::Spacing();
     ImGui::Separator();
-    // Note that stretching changes the voxelization but NOT the cell count
-    // or VRAM — the UI should make this clear.
-    ImGui::TextDisabled("Cell count / VRAM unchanged by stretching.");
+    ImGui::TextDisabled("STARTUP");
+    ImGui::Checkbox("Pre-converge at 4x coarse", &p.preconvergeCoarse);
+    helpMarker(
+        "Mesh sequencing: every cold start first converges a 4x-coarser "
+        "companion sim (seconds — its grid is 1/64 the cells), then upsamples "
+        "that developed flow onto the full grid and continues. The wake and "
+        "circulation arrive almost immediately instead of convecting in from "
+        "scratch, so the Cl/Cd gate opens much sooner. The settle window "
+        "still applies — readouts stay gated until the fine-grid flow has "
+        "re-adjusted.");
+    if (r.preconvergeProgress >= 0.0f) {
+        ImGui::ProgressBar(r.preconvergeProgress, ImVec2(-1, 0));
+        ImGui::TextDisabled("pre-converging coarse companion...");
+    }
 
     ImGui::End();
 }

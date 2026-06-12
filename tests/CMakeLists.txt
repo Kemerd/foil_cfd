@@ -20,6 +20,7 @@
 # ---------------------------------------------------------------------------
 add_library(foilcfd_test_sim STATIC
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_core.cu
+    ${CMAKE_SOURCE_DIR}/src/sim/lbm_refine.cu
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_solver.cpp)
 target_include_directories(foilcfd_test_sim PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(foilcfd_test_sim PUBLIC CUDA::cudart)
@@ -75,9 +76,9 @@ add_executable(cuda_smoke cuda_smoke.cu)
 target_link_libraries(cuda_smoke PRIVATE CUDA::cudart)
 add_test(NAME cuda_smoke COMMAND cuda_smoke)
 
-# Physics milestones M0-M2 (plan section 10). Host TUs driving the solver's
-# public API; all device work happens inside the sim module.
-foreach(gpu_test IN ITEMS m0_taylor_green m1_cavity m2_cylinder)
+# Physics milestones M0-M3 (plan section 10 + plan M-refine). Host TUs
+# driving the solver's public API; all device work happens in the sim module.
+foreach(gpu_test IN ITEMS m0_taylor_green m1_cavity m2_cylinder m3_refine)
     add_executable(${gpu_test} ${gpu_test}.cpp)
     target_link_libraries(${gpu_test} PRIVATE foilcfd_test_sim)
     add_test(NAME ${gpu_test} COMMAND ${gpu_test})
@@ -85,7 +86,7 @@ endforeach()
 
 # The "gpu" label lets machines without an NVIDIA card (or CI) skip every
 # device-touching test in one flag: ctest -LE gpu.
-set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder
+set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder m3_refine
     PROPERTIES LABELS "gpu")
 
 # Per-test wall-clock budgets (seconds). M0 is specified < 3 min; M2 < 5 min.
@@ -95,3 +96,4 @@ set_tests_properties(cuda_smoke PROPERTIES TIMEOUT 120)
 set_tests_properties(m0_taylor_green PROPERTIES TIMEOUT 180)
 set_tests_properties(m1_cavity PROPERTIES TIMEOUT 300)
 set_tests_properties(m2_cylinder PROPERTIES TIMEOUT 300)
+set_tests_properties(m3_refine PROPERTIES TIMEOUT 180)

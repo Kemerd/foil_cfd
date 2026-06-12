@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -32,7 +33,6 @@
 #include "geom/voxelizer_stl.cuh"
 #include "platform/platform.h"
 #include "render/viz.h"
-#include "sim/grid_stretch.h"
 #include "sim/lbm_solver.h"
 #include "sim/units.h"
 
@@ -95,7 +95,10 @@ struct App {
     std::string geometryId;              ///< "naca:..", "dat:..", "stl:<hash>".
     std::vector<std::uint8_t> cleanFlags;  ///< Clean foil (no VGs) at current AoA.
     std::vector<std::uint8_t> activeFlags; ///< cleanFlags OR VG voxels = live flags.
-    GridStretch stretch;                 ///< Active coordinate map (identity when Off).
+
+    // -- refinement patch state (plan M-refine) --
+    PatchBox patchBox;                   ///< Active patch in coarse cells.
+    std::vector<std::uint8_t> fineFlags; ///< Fine-level flag field (2x, shell stamped).
 
     // NOTE: the plan-8 snapshot warm-start cache (VRAM clean slot + disk LRU)
     // was removed: its capture path could freeze the session right as the
@@ -235,7 +238,19 @@ std::string configSummary(const App& app) {
                   app.readouts.scaling.reEffective, app.readouts.scaling.reTarget,
                   static_cast<int>(app.params.vgs.size()),
                   app.params.highFidelity.enabled ? "on" : "off");
-    return buf;
+    std::string line(buf);
+    // Refinement patch state belongs in every incident report: a coupled
+    // fine level changes which grid the forces came from.
+    if (app.readouts.refine.active) {
+        char rbuf[96];
+        std::snprintf(rbuf, sizeof rbuf, " | refine 2x %dx%dx%d (forces %s)",
+                      app.readouts.refine.fineDims.nx,
+                      app.readouts.refine.fineDims.ny,
+                      app.readouts.refine.fineDims.nz,
+                      app.readouts.refine.forcesFromFine ? "fine" : "coarse");
+        line += rbuf;
+    }
+    return line;
 }
 
 /// Active chord resolution: the HiFi bundle overrides the standard preset.
@@ -425,41 +440,272 @@ bool resolveAirfoil(App& app, std::string* error) {
     return true;
 }
 
-/// Rebuild the GridStretch coordinate map from the current mesh refinement
-/// parameters and domain layout. Called whenever the grid or refinement
-/// settings change; cheap (CPU-only, O(nx+ny) arithmetic).
-void rebuildStretch(App& app) {
-    app.stretch = GridStretch::build(
-        app.params.meshRefinement,
-        app.layout.dims,
-        app.layout.foilAnchorXFrac,
-        app.layout.foilAnchorYFrac,
-        app.layout.chordCells);
-}
-
-/// Auto-update the VG zone centre from the first VG station when tracking
-/// is enabled (called before any flag rebuild so the stretch is current).
-void syncVGZoneToEditor(App& app) {
-    MeshRefinementParams& mr = app.params.meshRefinement;
-    if (!mr.autoTrackVGs || app.params.vgs.empty()) return;
-    // Use the first VG station as the zone centre.
-    mr.vgZoneXc = std::clamp(app.params.vgs[0].x_c, 0.01f, 0.99f);
-}
-
 /// Rebuild clean + active flag fields for the current airfoil/AoA/VG state.
 /// The clean field is kept separately so VG slider ticks never repeat the
-/// O(nx*ny) airfoil parity tests (plan 6.2). Passes the active GridStretch
-/// so geometry stamps at the correct physical location under any stretching.
+/// O(nx*ny) airfoil parity tests (plan 6.2).
 void rebuildFlagFields(App& app) {
-    syncVGZoneToEditor(app);
-    rebuildStretch(app);
-    const GridStretch* gs = app.stretch.isActive() ? &app.stretch : nullptr;
     app.cleanFlags = buildCleanFoilFlags(app.airfoil, app.params.aoaDeg,
-                                         app.layout, gs);
+                                         app.layout);
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
                             app.layout, app.cleanFlags);
+}
+
+/// (Re)build the two-level refinement patch (plan M-refine) for the current
+/// geometry: derive the box from the VG-merged flags (vanes must sit inside),
+/// voxelize foil + VGs at 2x into the fine flag field, stamp the Interface
+/// shell, and hand it to the solver. Disabled/STL/derivation-failure paths
+/// tear the fine level down — the coarse sim continues either way.
+void applyRefinement(App& app) {
+    if (!app.params.refine.enabled || app.stlActive) {
+        app.solver.shutdownRefinement();
+        app.patchBox = PatchBox{};
+        app.fineFlags.clear();
+        return;
+    }
+
+    // Margins from chord fractions to coarse cells (>= 2 so the restriction
+    // band never touches a solid).
+    const int nc = app.layout.chordCells;
+    auto cellsOf = [nc](float chords) {
+        return std::max(2, static_cast<int>(std::lround(
+                               chords * static_cast<float>(nc))));
+    };
+    const PatchBox box = derivePatchBox(
+        app.layout.dims, app.activeFlags,
+        cellsOf(app.params.refine.upstreamC), cellsOf(app.params.refine.wakeC),
+        cellsOf(app.params.refine.belowC), cellsOf(app.params.refine.aboveC));
+    if (!box.valid()) {
+        app.solver.shutdownRefinement();
+        app.patchBox = PatchBox{};
+        app.fineFlags.clear();
+        return;
+    }
+
+    // Fine flag field: foil + every VG voxelized at 2x resolution, the same
+    // TE-closure pass, then the coupling shell. Same machinery as the coarse
+    // build — only the layout (doubled chord cells, patch-local anchor)
+    // differs, so the two levels always agree on where the geometry is.
+    const DomainLayout fineLayout = makeFineLayout(app.layout, box);
+    std::vector<std::uint8_t> fine(
+        static_cast<std::size_t>(fineLayout.dims.cellCount()),
+        static_cast<std::uint8_t>(CellFlag::Fluid));
+    voxelizeAirfoil(app.airfoil, app.params.aoaDeg, fineLayout, fine);
+    for (const VGParams& vg : app.params.vgs)
+        voxelizeVG(vg, app.airfoil, app.params.aoaDeg, fineLayout, fine);
+    closeTrailingEdgeGaps(fineLayout.dims, fine);
+    stampInterfaceShell(fineLayout.dims, fine);
+
+    std::string err;
+    if (!app.solver.initRefinement(box, fine, &err)) {
+        setStatus(app, "refinement patch unavailable: " + err
+                           + " — running base grid only");
+        app.patchBox = PatchBox{};
+        app.fineFlags.clear();
+        return;
+    }
+    app.patchBox  = box;
+    app.fineFlags = std::move(fine);
+    char msg[160];
+    std::snprintf(msg, sizeof msg,
+                  "refinement patch: coarse box [%d,%d)x[%d,%d) -> fine "
+                  "%d x %d x %d",
+                  box.x0, box.x1, box.y0, box.y1, fineLayout.dims.nx,
+                  fineLayout.dims.ny, fineLayout.dims.nz);
+    logLine(msg);
+}
+
+/// Mesh-sequencing pre-convergence (plan M-refine part 2): converge a 4x-
+/// coarser companion sim (~1/64 the cells, seconds of wall time), upsample
+/// its macroscopic field onto the full grid, and continue from a developed
+/// flow. Synchronous by design — the chunked loop syncs the stream between
+/// TDR-safe batches, and the whole pass is shorter than the wake transit it
+/// replaces. Sections only in v1 (STL re-voxelization at 4x is future work).
+void runPreconverge(App& app) {
+    if (!app.params.preconvergeCoarse || app.stlActive || app.cudaFailure)
+        return;
+
+    const int nc = std::max(48, currentChordCells(app.params) / 4);
+    const DomainLayout preLayout = defaultLayout(nc);
+
+    // Voxelize the SAME geometry (foil + VGs) at presolve resolution.
+    std::vector<std::uint8_t> flags =
+        buildCleanFoilFlags(app.airfoil, app.params.aoaDeg, preLayout);
+    if (!app.params.vgs.empty()) {
+        flags = buildFlagsWithVGs(app.params.vgs, app.airfoil,
+                                  app.params.aoaDeg, preLayout, flags);
+    }
+
+    PhysicalParams phys;
+    phys.chord_m     = app.params.chordM;
+    phys.airspeed_ms = app.params.airspeedMs;
+    const LatticeScaling preScaling =
+        computeScaling(phys, nc, currentULat(app.params));
+
+    LBMSolver pre;
+    std::string err;
+    if (!pre.init(preLayout.dims, preScaling, flags, app.stream, &err)) {
+        logLine("preconverge skipped (init failed: " + err + ")");
+        return;
+    }
+
+    // Two flow-throughs — the force-gate convergence criterion — in chunks
+    // small enough that each batch stays far under the TDR budget.
+    const long long totalSteps = static_cast<long long>(
+        kForceGateFlowThroughs * preScaling.flowThroughSteps(preLayout.dims.nx));
+    const double t0 = platform::timerSeconds();
+    long long done = 0;
+    while (done < totalSteps) {
+        const int n = static_cast<int>(
+            std::min<long long>(1024, totalSteps - done));
+        if (pre.stepN(n) != cudaSuccess) {
+            logLine("preconverge aborted (step failed)");
+            return;
+        }
+        cudaStreamSynchronize(app.stream);
+        if (pre.nanDetected()) {
+            logLine("preconverge aborted (coarse companion diverged) — "
+                    "starting cold instead");
+            return;
+        }
+        done += n;
+    }
+
+    if (!app.solver.seedFromCoarse(pre, &err)) {
+        logLine("preconverge seed failed: " + err + " — starting cold");
+        return;
+    }
+    char msg[160];
+    std::snprintf(msg, sizeof msg,
+                  "pre-converged at %d cells/chord (%lld steps, %.1f s) — "
+                  "seeded full grid",
+                  nc, totalSteps, platform::timerSeconds() - t0);
+    setStatus(app, msg);
+}
+
+// ===========================================================================
+// Voxel view (View panel): render the flag fields' Solid cells as exposed-
+// face cube soup — the stair-step walls the lattice actually bounces off,
+// with half-size cubes inside the refinement patch. Pushed through the
+// existing STL mesh pipeline, so the renderer needs zero changes.
+// ===========================================================================
+
+/// Append one cube face (two flat-shaded triangles) to a triangle soup.
+void pushQuad(std::vector<StlTriangle>& out, const Vec3f& a, const Vec3f& b,
+              const Vec3f& c, const Vec3f& d, const Vec3f& n) {
+    out.push_back(StlTriangle{a, b, c, n});
+    out.push_back(StlTriangle{a, c, d, n});
+}
+
+/// Emit the exposed faces of every Solid cell in a flag field. A face is
+/// exposed when the neighbor across it is not Solid (out-of-range counts as
+/// exposed — the spanwise end caps just look like the extruded prism's).
+/// @param dims     Grid the flags cover.
+/// @param flags    Unpadded flag field.
+/// @param cellSize Cube edge length in COARSE lattice units (1.0 coarse,
+///                 0.5 for the 2x fine patch).
+/// @param origin   Lattice-space position of cell (0,0,0)'s low corner.
+/// @param skipXY   Optional coarse-cell box to omit (the fine pass renders
+///                 that region at 2x instead).
+void emitVoxelFaces(const GridDims& dims, const std::vector<std::uint8_t>& flags,
+                    float cellSize, const Vec3f& origin, const PatchBox* skipXY,
+                    std::vector<StlTriangle>& out) {
+    const auto solidFlag = static_cast<std::uint8_t>(CellFlag::Solid);
+    const long long nxny = static_cast<long long>(dims.nx) * dims.ny;
+    auto solidAt = [&](int x, int y, int z) {
+        if (x < 0 || x >= dims.nx || y < 0 || y >= dims.ny || z < 0
+            || z >= dims.nz)
+            return false;
+        return flags[static_cast<std::size_t>(
+                   x + static_cast<long long>(dims.nx) * y + nxny * z)]
+               == solidFlag;
+    };
+
+    for (int z = 0; z < dims.nz; ++z) {
+        for (int y = 0; y < dims.ny; ++y) {
+            for (int x = 0; x < dims.nx; ++x) {
+                if (!solidAt(x, y, z)) continue;
+                if (skipXY && x >= skipXY->x0 && x < skipXY->x1
+                    && y >= skipXY->y0 && y < skipXY->y1)
+                    continue; // fine pass owns this region
+
+                // Cube corner span in lattice space.
+                const float x0 = origin.x + cellSize * static_cast<float>(x);
+                const float y0 = origin.y + cellSize * static_cast<float>(y);
+                const float z0 = origin.z + cellSize * static_cast<float>(z);
+                const float x1 = x0 + cellSize, y1 = y0 + cellSize,
+                            z1 = z0 + cellSize;
+
+                if (!solidAt(x - 1, y, z))
+                    pushQuad(out, {x0, y0, z0}, {x0, y0, z1}, {x0, y1, z1},
+                             {x0, y1, z0}, {-1, 0, 0});
+                if (!solidAt(x + 1, y, z))
+                    pushQuad(out, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1},
+                             {x1, y0, z1}, {1, 0, 0});
+                if (!solidAt(x, y - 1, z))
+                    pushQuad(out, {x0, y0, z0}, {x1, y0, z0}, {x1, y0, z1},
+                             {x0, y0, z1}, {0, -1, 0});
+                if (!solidAt(x, y + 1, z))
+                    pushQuad(out, {x0, y1, z0}, {x0, y1, z1}, {x1, y1, z1},
+                             {x1, y1, z0}, {0, 1, 0});
+                if (!solidAt(x, y, z - 1))
+                    pushQuad(out, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0},
+                             {x1, y0, z0}, {0, 0, -1});
+                if (!solidAt(x, y, z + 1))
+                    pushQuad(out, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1},
+                             {x0, y1, z1}, {0, 0, 1});
+            }
+        }
+    }
+}
+
+/// Build the voxel-view triangle soup from the live flag fields: coarse cells
+/// everywhere except the refinement patch, which contributes its fine cells
+/// at half size — exactly the composite geometry the two-level solver sees.
+/// Toggle-rate cost (one linear scan per level, ~100s of ms at Ultra): never
+/// runs per frame.
+StlMesh buildVoxelMesh(const App& app) {
+    StlMesh m;
+    m.name = "voxel view";
+    const bool fineActive =
+        app.solver.refinementInfo().active && !app.fineFlags.empty();
+    emitVoxelFaces(app.layout.dims, app.activeFlags, 1.0f, Vec3f(0, 0, 0),
+                   fineActive ? &app.patchBox : nullptr, m.triangles);
+    if (fineActive) {
+        const GridDims fineDims = fineDimsFor(app.patchBox, app.layout.dims);
+        emitVoxelFaces(fineDims, app.fineFlags, 0.5f,
+                       Vec3f(static_cast<float>(app.patchBox.x0),
+                             static_cast<float>(app.patchBox.y0), 0.0f),
+                       nullptr, m.triangles);
+    }
+    return m;
+}
+
+/// Upload whichever render mesh the view settings ask for: the voxel soup
+/// (solver's-eye view), the normalized STL solid, or the smooth extruded
+/// foil + VG prism. The ONE place that decides, so every geometry-changing
+/// path stays consistent with the voxel-view toggle.
+void uploadRenderGeometry(App& app) {
+    if (app.params.voxelView) {
+        app.viz.uploadStlMesh(buildVoxelMesh(app));
+        return;
+    }
+    if (app.stlActive) {
+        // Re-derive the normalized STL render mesh from the kept raw import
+        // (the normalized copy is transient — this path re-creates it the
+        // same way initSimulation does).
+        const StlNormalization norm = computeAutoNormalization(
+            app.stlMeshRaw, app.params.stlImport.axisPreset,
+            app.params.stlImport.chordCells, app.layout.anchorX(),
+            app.layout.anchorY(), app.layout.dims.nz);
+        StlMesh mesh = app.stlMeshRaw;
+        applyNormalization(mesh, norm);
+        app.viz.uploadStlMesh(mesh);
+        return;
+    }
+    app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
+                           app.layout);
 }
 
 /// Geometry changed at fixed grid dims (airfoil swap or AoA edit): rebuild
@@ -473,8 +719,10 @@ void applyGeometryCold(App& app) {
     // crossing mid-span would read as the surface (false separation pinned
     // at the VG station — the mission's core readout corrupted).
     app.solver.setSurfaceReference(app.cleanFlags);
-    app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
-                           app.layout);
+    // Fine level first: the voxel view (if active) composites its flags.
+    applyRefinement(app);
+    uploadRenderGeometry(app);
+    runPreconverge(app);
 }
 
 /// Stamp free-slip walls on the z faces of a flag field (STL mode, plan 7.4).
@@ -555,10 +803,12 @@ void applyStlImport(App& app) {
     app.activeFlags = std::move(flags);
     app.solver.setFlags(app.activeFlags);
     app.solver.setSurfaceReference(app.cleanFlags); // STL: clean == active
-    // Hand the normalized triangle soup to the renderer: it replaces the
-    // extruded-foil prism in the shared mesh VBO, so the drawn solid matches
-    // the voxelized one exactly (both consumed the same normalized mesh).
-    app.viz.uploadStlMesh(mesh);
+    // STL mode is base-grid only in v1: the previous section's fine level
+    // (and its patch box) would be nonsense over the new solid.
+    applyRefinement(app); // stlActive is set -> tears the fine level down
+    // Render mesh through the central dispatcher: the normalized triangle
+    // soup normally, the voxel soup when the solver's-eye view is on.
+    uploadRenderGeometry(app);
     app.params.viz.showFoilMesh = true;
 }
 
@@ -652,8 +902,13 @@ void applyVGEdit(App& app) {
     // from the old state produces misleading force transients.
     app.solver.setFlags(app.activeFlags);
     app.solver.setSurfaceReference(app.cleanFlags);
-    app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
-                           app.layout);
+    // The patch box tracks the VG bbox (a vane near the placement limit can
+    // move it), so the fine level rebuilds with the new vanes BEFORE the
+    // render mesh (the voxel view composites the fine flags); the presolve
+    // then refills the developed flow the cold restart just discarded.
+    applyRefinement(app);
+    uploadRenderGeometry(app);
+    runPreconverge(app);
 }
 
 // ===========================================================================
@@ -754,17 +1009,18 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
                       error)) {
         return false;
     }
-    // STL mode renders the imported triangles; section mode the foil prism.
-    if (app.stlActive) {
-        app.viz.uploadStlMesh(stlMeshNormalized);
-    } else {
-        app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
-                               app.layout);
-    }
     app.camera.frameDomain(app.layout.dims.nx, app.layout.dims.ny,
                            app.layout.dims.nz);
     focusCameraOnFoil(app, /*snap=*/true);
     resetSliceDefaults(app);
+    // Fine level + developed-flow seed close out every (re)init. Both are
+    // no-ops/graceful when disabled or in STL mode. The render mesh uploads
+    // AFTER the refinement so the voxel view can composite the fine flags
+    // (uploadRenderGeometry re-derives the normalized STL mesh when needed,
+    // so the stlMeshNormalized local above stays voxelization-only).
+    applyRefinement(app);
+    uploadRenderGeometry(app);
+    runPreconverge(app);
     return true;
 }
 
@@ -814,6 +1070,22 @@ void updateReadouts(App& app) {
     app.readouts.cudaErrorTripped = app.cudaFailure;
     app.readouts.cudaErrorDiagnosis = app.cudaFailureMsg;
     app.readouts.forces = app.solver.forces();
+
+    // Refinement-patch status for the Mesh panel (plan M-refine).
+    {
+        const RefinementInfo ri = app.solver.refinementInfo();
+        auto& rr = app.readouts.refine;
+        rr.active          = ri.active;
+        rr.fineDims        = ri.fineDims;
+        rr.fineVramGB      = ri.vramBytes / (1024.0 * 1024.0 * 1024.0);
+        rr.fineReEffective = ri.fineScaling.reEffective;
+        rr.forcesFromFine  = ri.forcesFromFine;
+        rr.patchX0 = ri.box.x0; rr.patchX1 = ri.box.x1;
+        rr.patchY0 = ri.box.y0; rr.patchY1 = ri.box.y1;
+    }
+    // The presolve runs synchronously inside the apply functions, so there is
+    // never a mid-flight progress value to report between frames.
+    app.readouts.preconvergeProgress = -1.0f;
 
     // VRAM fraction (plan 4.6 warn-above-80%) + GPU load: driver queries, so
     // poll at ~2 Hz instead of every frame.
@@ -976,6 +1248,11 @@ void applyEvents(App& app) {
                 app.params.highFidelity.enabled
                     ? app.params.highFidelity.forceEmaFlowThroughs
                     : StandardPreset{}.forceEmaFlowThroughs);
+            // solver.init() freed the fine level with everything else; the
+            // new scaling also changes the fine tau relation — full rebuild,
+            // then re-seed the developed flow.
+            applyRefinement(app);
+            runPreconverge(app);
             char msg[96];
             std::snprintf(msg, sizeof msg,
                           "airspeed/chord -> %.2f m/s / %.2f m (sim restarted)",
@@ -993,22 +1270,24 @@ void applyEvents(App& app) {
         logLine(msg);
     }
 
-    // ---- Mesh refinement changes: rebuild stretch + re-voxelize + cold restart.
-    // The stretch only affects the coordinate map used during voxelization;
-    // the solver grid is unchanged, so no VRAM realloc is needed.
+    // ---- Refinement patch toggled or margins changed: rebuild the fine
+    // level IN PLACE. The coarse flow is untouched — initRefinement seeds the
+    // new fine state from the live coarse field, so no restart and no
+    // presolve are needed; the sim keeps running through the change.
     if (ev.meshRefinementChanged && !app.stlActive) {
-        applyGeometryCold(app);
-        const char* presetName = "custom";
-        switch (app.params.meshRefinement.preset) {
-            case MeshRefinementPreset::Off:        presetName = "off (uniform)"; break;
-            case MeshRefinementPreset::Balanced:   presetName = "balanced"; break;
-            case MeshRefinementPreset::Aggressive: presetName = "aggressive"; break;
-            case MeshRefinementPreset::Custom:     presetName = "custom"; break;
-        }
-        char msg[80];
-        std::snprintf(msg, sizeof msg, "mesh refinement -> %s (sim restarted)",
-                      presetName);
-        logLine(msg);
+        applyRefinement(app);
+        // A changed patch changes the composite voxel geometry on screen.
+        if (app.params.voxelView) uploadRenderGeometry(app);
+        logLine(app.params.refine.enabled
+                    ? "refinement patch rebuilt (live)"
+                    : "refinement patch disabled");
+    }
+
+    // ---- voxel view toggle: swap the render mesh, nothing else changes ----
+    if (ev.voxelViewToggled) {
+        uploadRenderGeometry(app);
+        logLine(app.params.voxelView ? "voxel view ON (solver cells)"
+                                     : "voxel view off (smooth mesh)");
     }
 
     // ---- STL import flow ----

@@ -120,6 +120,13 @@ enum class CellFlag : std::uint8_t {
     SlipBottom = 5, ///< y=0 plane: free-slip (specular reflection).
     SlipFront  = 6, ///< z=0 plane: free-slip wall (STL mode, plan 7.4).
     SlipBack   = 7, ///< z=nz-1 plane: free-slip wall (STL mode, plan 7.4).
+    Interface  = 8, ///< Fine-level coupling shell (plan M-refine): written by
+                    ///< the coarse-to-fine fill before every fine step. The
+                    ///< fused kernel treats it like Solid/slip markers (no
+                    ///< collide, no write — the existing else branch), while
+                    ///< fluid neighbors PULL from it through the normal path,
+                    ///< which is exactly the interface contract. Only ever
+                    ///< present in fine-level flag fields.
 };
 
 // ===========================================================================
@@ -260,8 +267,14 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
 ///                     (reduced mod the stride internally); pass something
 ///                     derived from the step counter so successive checks
 ///                     sweep different cells.
+/// @param flagBase     Added to the written verdict (base+1 = NaN/Inf,
+///                     base+2 = velocity runaway). The refinement path passes
+///                     2 for the fine buffer so a trip identifies its GRID
+///                     (1/2 = coarse, 3/4 = fine) — racing writers between
+///                     the two launches stay benign (any verdict pauses).
 cudaError_t launchNaNWatchdog(DeviceLatticeView lattice, int* d_nanFlag,
-                              long long sampleOffset, cudaStream_t stream);
+                              long long sampleOffset, cudaStream_t stream,
+                              int flagBase = 0);
 
 /// @brief Fill a device float array with a constant value. Exists because
 /// cudaMemset splats bytes only: the macroscopic density must be primed to

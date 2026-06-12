@@ -104,6 +104,7 @@ add_executable(FoilCFD
     src/render/particles.cu
     src/render/viz.cpp
     src/sim/lbm_core.cu
+    src/sim/lbm_refine.cu
     src/sim/lbm_solver.cpp
     src/sim/snapshot.cpp)
 

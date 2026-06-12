@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 
+#include "lbm_refine.cuh"
+
 namespace foilcfd {
 
 namespace {
@@ -153,6 +155,86 @@ struct LBMSolver::Impl {
     // reference area must use the FLUID span, not the raw nz (a raw-nz
     // normalization reads ~2/nz low on absolute Cl/Cd in that mode).
     bool zSlipWalls = false;
+
+    // ---- two-level refinement patch (plan M-refine) ------------------------
+    // The fine level owns its own ping-pong f pair and (padded) flag field;
+    // it has NO macroscopic arrays — the restriction writes the fine-derived
+    // moments straight into the coarse macro arrays, so every macro consumer
+    // (renderer, particles, delta99 extraction) is fine-aware for free.
+    struct FineLevel {
+        bool           active = false;
+        PatchBox       box;
+        GridDims       dims{};
+        LatticeScaling scaling{};            ///< refinedScaling(coarse, 2).
+        FPop*          f[2] = {nullptr, nullptr};
+        std::uint8_t*  flags = nullptr;      ///< Padded ghost-z layout.
+        int            src = 0;
+        long long      ncells = 0, nxny = 0, ncellsPad = 0;
+        bool           forcesFromFine = false;
+    } fine;
+
+    /// @brief View over one FINE f buffer (padded pointers, fine dims).
+    DeviceLatticeView fineView(int which) const {
+        return DeviceLatticeView{fine.f[which], fine.flags, fine.dims};
+    }
+
+    /// @brief Release only the fine level's device memory.
+    void freeFine() {
+        for (FPop*& p : fine.f) { cudaFree(p); p = nullptr; }
+        cudaFree(fine.flags); fine.flags = nullptr;
+        fine = FineLevel{};
+    }
+
+    /// @brief Seed the fine level from the CURRENT coarse field: full-volume
+    /// coarse-to-fine fill of both fine ping-pong buffers + ghost refresh.
+    /// Valid at any point (cold start, restore, flag edit) — the fill derives
+    /// everything from the coarse populations.
+    cudaError_t seedFineFromCoarse() {
+        if (!fine.active) return cudaSuccess;
+        const float tauC = effectiveTau();
+        const float tauF = fineTauFor(tauC);
+        for (int i = 0; i < 2; ++i) {
+            // Both time levels point at the same buffer (weight 0): seeding
+            // is a snapshot, not a time interpolation.
+            if (auto err = launchCoarseToFineFill(
+                    view(src), f[src], fineView(i), fine.box,
+                    /*timeWeight=*/0.0f, tauC, tauF,
+                    /*fullVolume=*/true, stream);
+                err != cudaSuccess)
+                return err;
+            if (auto err = launchRefreshGhostZ(fine.f[i], fine.dims, stream);
+                err != cudaSuccess)
+                return err;
+        }
+        return cudaSuccess;
+    }
+
+    /// @brief Recompute whether the patch covers every coarse Solid cell
+    /// (excluding the restriction band): when true, the momentum-exchange
+    /// force reduction runs on the fine grid for 2x wall resolution.
+    void updateForcesFromFine() {
+        if (!fine.active) { fine.forcesFromFine = false; return; }
+        const auto solid = static_cast<std::uint8_t>(CellFlag::Solid);
+        const int x0 = fine.box.x0 + kRestrictBandCoarse;
+        const int x1 = fine.box.x1 - kRestrictBandCoarse;
+        const int y0 = fine.box.y0 + kRestrictBandCoarse;
+        const int y1 = fine.box.y1 - kRestrictBandCoarse;
+        for (int z = 0; z < dims.nz; ++z) {
+            const long long zBase = nxny * z;
+            for (int y = 0; y < dims.ny; ++y) {
+                const long long rowBase = zBase + static_cast<long long>(dims.nx) * y;
+                for (int x = 0; x < dims.nx; ++x) {
+                    if (hostFlags[static_cast<std::size_t>(rowBase + x)] != solid)
+                        continue;
+                    if (x < x0 || x >= x1 || y < y0 || y >= y1) {
+                        fine.forcesFromFine = false;
+                        return; // a solid pokes out of the patch: coarse forces
+                    }
+                }
+            }
+        }
+        fine.forcesFromFine = true;
+    }
 
     // ------------------------------------------------------------------
 
@@ -317,6 +399,7 @@ struct LBMSolver::Impl {
 
     /// @brief Release everything; safe to call repeatedly / when empty.
     void freeAll() {
+        freeFine();
         for (FPop*& p : f) { cudaFree(p); p = nullptr; }
         cudaFree(flags); flags = nullptr;
         cudaFree(rho); rho = nullptr;
@@ -490,6 +573,8 @@ void LBMSolver::reset() {
                                    kSpeckAmplitudeFrac * s.scaling.u_lat,
                                    kSpeckSeed, s.stream);
     }
+    // Fine level restarts from the freshly initialized coarse field.
+    s.seedFineFromCoarse();
 }
 
 void LBMSolver::setFlags(const std::vector<std::uint8_t>& flags) {
@@ -589,11 +674,72 @@ cudaError_t LBMSolver::stepN(int n) {
             err2 != cudaSuccess)
             return err2;
 
+        // ---- two-level coupling (plan M-refine): the fine patch advances
+        // two half-dt steps per coarse step. The coarse ping-pong pair
+        // provides both time levels for the interface fill — f[src] still
+        // holds t, f[1-src] just received t+1. ----------------------------
+        if (s.fine.active) {
+            const float tauC = params.tau;
+            const float tauF = fineTauFor(tauC);
+            StepParams fineParams = params;
+            fineParams.tau        = tauF;
+            fineParams.writeMacro = false; // fine level has no macro arrays
+
+            for (int half = 0; half < 2; ++half) {
+                // Interface fill: fine step 1 sees the coarse field at t
+                // (weight 0), step 2 at t + dt_c/2 (weight 0.5).
+                if (auto e = launchCoarseToFineFill(
+                        s.view(s.src), s.f[1 - s.src],
+                        s.fineView(s.fine.src), s.fine.box,
+                        half == 0 ? 0.0f : 0.5f, tauC, tauF,
+                        /*fullVolume=*/false, s.stream);
+                    e != cudaSuccess)
+                    return e;
+                // The fill rewrites shell cells on every z plane; their
+                // ghost images must be re-synced before the pull reads them
+                // across the periodic seam.
+                if (auto e = launchRefreshGhostZ(s.fine.f[s.fine.src],
+                                                 s.fine.dims, s.stream);
+                    e != cudaSuccess)
+                    return e;
+                if (auto e = launchStreamCollide(
+                        s.fineView(s.fine.src), s.fineView(1 - s.fine.src),
+                        fineParams, nullptr, nullptr, nullptr, nullptr,
+                        s.stream);
+                    e != cudaSuccess)
+                    return e;
+                if (auto e = launchRefreshGhostZ(s.fine.f[1 - s.fine.src],
+                                                 s.fine.dims, s.stream);
+                    e != cudaSuccess)
+                    return e;
+                s.fine.src = 1 - s.fine.src;
+            }
+
+            // Restriction: overwrite the coarse overlap with the fine
+            // solution (and the coarse macro arrays on render steps, so
+            // every macro consumer sees fine-derived data for free).
+            if (auto e = launchFineToCoarseRestrict(
+                    s.fineView(s.fine.src), s.view(1 - s.src), s.fine.box,
+                    tauC, tauF,
+                    params.writeMacro ? s.rho : nullptr,
+                    params.writeMacro ? s.u : nullptr,
+                    params.writeMacro ? s.v : nullptr,
+                    params.writeMacro ? s.w : nullptr, s.stream);
+                e != cudaSuccess)
+                return e;
+            // Restriction rewrote real coarse cells on every z plane.
+            if (auto e = launchRefreshGhostZ(s.f[1 - s.src], s.dims, s.stream);
+                e != cudaSuccess)
+                return e;
+        }
+
         s.src = 1 - s.src; // ping-pong swap
         ++s.steps;
 
         // NaN watchdog every 200 steps (plan 4.5): launch the strided check
         // plus an async readback; verdicts are folded in by pollAsync().
+        // With the patch active the fine buffer is sampled too — a fine-level
+        // divergence would otherwise hide until it bled into the overlap.
         if (++s.stepsSinceWatchdog >= kWatchdogPeriodSteps && !s.nanPending) {
             s.stepsSinceWatchdog = 0;
             cudaMemsetAsync(s.nanDev, 0, sizeof(int), s.stream);
@@ -601,6 +747,12 @@ cudaError_t LBMSolver::stepN(int n) {
             // coprime to the watchdog's prime stride), so repeated checks
             // sweep different cells instead of re-probing one fixed set.
             launchNaNWatchdog(s.view(s.src), s.nanDev, s.steps * 977, s.stream);
+            if (s.fine.active) {
+                // flagBase 2: a fine-buffer verdict reads 3/4, so the
+                // diagnosis names the grid that actually went unstable.
+                launchNaNWatchdog(s.fineView(s.fine.src), s.nanDev,
+                                  s.steps * 977, s.stream, /*flagBase=*/2);
+            }
             cudaMemcpyAsync(s.hNan, s.nanDev, sizeof(int),
                             cudaMemcpyDeviceToHost, s.stream);
             cudaEventRecord(s.evNan, s.stream);
@@ -616,10 +768,16 @@ cudaError_t LBMSolver::stepN(int n) {
 
     // One momentum-exchange sample per batch (per frame), folded into the
     // EMA asynchronously. The reduction reads the post-collision buffer the
-    // batch just produced.
+    // batch just produced — on the FINE grid when the patch covers every
+    // solid cell (2x wall resolution is the patch's whole purpose; the
+    // coefficient normalization switches to the fine scaling in forces()).
     if (!s.forcePending) {
         DeviceForceAccumulator acc{s.force};
-        if (launchForceReduction(s.view(s.src), acc, s.stream) == cudaSuccess) {
+        const DeviceLatticeView forceView =
+            (s.fine.active && s.fine.forcesFromFine)
+                ? s.fineView(s.fine.src)
+                : s.view(s.src);
+        if (launchForceReduction(forceView, acc, s.stream) == cudaSuccess) {
             cudaMemcpyAsync(s.hForce, s.force, 3 * sizeof(float),
                             cudaMemcpyDeviceToHost, s.stream);
             cudaEventRecord(s.evForce, s.stream);
@@ -663,9 +821,17 @@ ForceReadout LBMSolver::forces() const {
     // Reference span: with periodic z the geometry truly spans all nz cells;
     // with STL slip-z walls the z=0/nz-1 planes are markers and the body
     // occupies only nz-2 fluid planes (plan 7.4).
-    const int spanCells = s.zSlipWalls ? std::max(1, s.dims.nz - 2) : s.dims.nz;
-    r.cd = s.scaling.forceToCoefficient(s.emaFx, spanCells);
-    r.cl = s.scaling.forceToCoefficient(s.emaFy, spanCells);
+    // When the momentum exchange runs on the FINE grid (plan M-refine), the
+    // raw lattice force is in fine units: normalize with the fine scaling and
+    // the fine span (coefficients are dimensionless per level, so this is the
+    // entire conversion).
+    const bool fineForces = s.fine.active && s.fine.forcesFromFine;
+    const LatticeScaling& fscale = fineForces ? s.fine.scaling : s.scaling;
+    const int spanCells = fineForces
+        ? s.fine.dims.nz
+        : (s.zSlipWalls ? std::max(1, s.dims.nz - 2) : s.dims.nz);
+    r.cd = fscale.forceToCoefficient(s.emaFx, spanCells);
+    r.cl = fscale.forceToCoefficient(s.emaFy, spanCells);
     r.liftToDrag = (std::fabs(r.cd) > 1e-6f) ? r.cl / r.cd : 0.0f;
     r.valid = s.emaSeeded && (s.steps >= s.gateOpenAtSteps);
 
@@ -688,8 +854,10 @@ ForceReadout LBMSolver::forces() const {
             ++count;
         }
         if (count > 0) {
-            r.cdAvg = s.scaling.forceToCoefficient(sumFx / count, spanCells);
-            r.clAvg = s.scaling.forceToCoefficient(sumFy / count, spanCells);
+            // Same normalization source as the EMA pair above (fine when the
+            // patch carries the momentum exchange).
+            r.cdAvg = fscale.forceToCoefficient(sumFx / count, spanCells);
+            r.clAvg = fscale.forceToCoefficient(sumFy / count, spanCells);
         }
     }
 
@@ -810,15 +978,19 @@ std::string LBMSolver::nanDiagnosis() const {
     const Impl& s = *impl_;
     if (!s.nanLatched) return {};
     char buf[512];
+    // Verdict decode: 1/2 = coarse grid, 3/4 = the 2x refinement patch
+    // (watchdog flagBase contract); odd = NaN/Inf, even = velocity runaway.
+    const bool onFine   = s.nanTripKind >= 3;
+    const bool runaway  = (s.nanTripKind % 2) == 0;
     // The two usual suspects (plan 4.5): lattice Mach too high, or the run
     // is pinned at the tau stability clamp (target Re unreachable).
     std::snprintf(buf, sizeof buf,
-        "%s at step %lld. u_lat = %.4f (cap %.2f)%s; tau at trip = "
+        "%s%s at step %lld. u_lat = %.4f (cap %.2f)%s; tau at trip = "
         "%.5f (clamp %.4f)%s. Likely cause: %s. Try a lower airspeed, a finer "
-        "chord resolution, or the Fast preset.",
-        s.nanTripKind == 2 ? "Velocity runaway (field saturated at the "
-                             "stability limiter)"
-                           : "NaN detected",
+        "chord resolution, or the Fast preset%s.",
+        runaway ? "Velocity runaway (field saturated at the stability limiter)"
+                : "NaN detected",
+        onFine ? " on the 2x refinement patch" : "",
         s.steps, s.scaling.u_lat, kMaxULat,
         (s.scaling.u_lat > 0.1f ? " — HIGH" : ""),
         s.tauAtTrip, kMinTau,
@@ -827,7 +999,9 @@ std::string LBMSolver::nanDiagnosis() const {
             ? "lattice velocity too close to the stability cap"
             : (s.scaling.tauClamped
                    ? "viscosity pinned at the stability clamp"
-                   : "a transient too sharp for the current resolution"));
+                   : "a transient too sharp for the current resolution"),
+        onFine ? "; disabling the refinement patch also isolates the issue"
+               : "");
     return buf;
 }
 
@@ -836,8 +1010,13 @@ SolverPerfStats LBMSolver::perfStats() const {
     SolverPerfStats p;
     p.lastStepsPerFrame = s.lastChosenN;
     p.lastStepMs = s.lastStepMs;
-    if (s.lastStepMs > 0.0)
-        p.mlups = static_cast<double>(s.ncells) / (s.lastStepMs * 1000.0);
+    if (s.lastStepMs > 0.0) {
+        // Cell updates per coarse step: every coarse cell once, every fine
+        // cell twice (two half-dt sub-steps per coarse step).
+        const double updates = static_cast<double>(s.ncells)
+            + (s.fine.active ? 2.0 * static_cast<double>(s.fine.ncells) : 0.0);
+        p.mlups = updates / (s.lastStepMs * 1000.0);
+    }
     return p;
 }
 
@@ -933,6 +1112,152 @@ bool LBMSolver::restoreFromMacroscopic(const float* rho, const float* u,
 
 const std::vector<std::uint8_t>& LBMSolver::hostFlags() const {
     return impl_->hostFlags;
+}
+
+// ===========================================================================
+// Two-level refinement patch (plan M-refine).
+// ===========================================================================
+
+bool LBMSolver::initRefinement(const PatchBox& box,
+                               const std::vector<std::uint8_t>& fineFlags,
+                               std::string* error) {
+    Impl& s = *impl_;
+    if (!s.initialized) {
+        if (error) *error = "solver not initialized";
+        return false;
+    }
+    shutdownRefinement(); // replace any previous fine level
+
+    if (!box.valid() || box.x0 < 1 || box.y0 < 1 || box.x1 > s.dims.nx - 1
+        || box.y1 > s.dims.ny - 1) {
+        if (error) *error = "refinement patch box out of range";
+        return false;
+    }
+
+    Impl::FineLevel& fl = s.fine;
+    fl.box  = box;
+    fl.dims = fineDimsFor(box, s.dims);
+    fl.ncells    = fl.dims.cellCount();
+    fl.nxny      = static_cast<long long>(fl.dims.nx) * fl.dims.ny;
+    fl.ncellsPad = fl.dims.paddedCellCount();
+    fl.scaling   = refinedScaling(s.scaling, kRefineFactor);
+    fl.src = 0;
+
+    if (fineFlags.size() != static_cast<std::size_t>(fl.ncells)) {
+        if (error) *error = "fine flag field size does not match the patch";
+        fl = Impl::FineLevel{};
+        return false;
+    }
+
+    auto fail = [&](const char* what, cudaError_t err) {
+        if (error) *error = std::string(what) + ": " + cudaGetErrorString(err);
+        s.freeFine();
+        return false;
+    };
+
+    // Fine f pair + padded flags. OOM here leaves the coarse sim untouched —
+    // the caller reports it and the run continues unrefined.
+    const std::size_t fBytes =
+        static_cast<std::size_t>(kQ) * fl.ncellsPad * sizeof(FPop);
+    for (FPop*& p : fl.f) {
+        if (auto err = cudaMalloc(&p, fBytes); err != cudaSuccess)
+            return fail("fine f buffer allocation failed", err);
+    }
+    if (auto err = cudaMalloc(&fl.flags, static_cast<std::size_t>(fl.ncellsPad));
+        err != cudaSuccess)
+        return fail("fine flag allocation failed", err);
+
+    // Upload flags one ghost plane in, then sync the flag ghosts (periodic z).
+    if (auto err = cudaMemcpyAsync(fl.flags + fl.nxny, fineFlags.data(),
+                                   static_cast<std::size_t>(fl.ncells),
+                                   cudaMemcpyHostToDevice, s.stream);
+        err != cudaSuccess)
+        return fail("fine flag upload failed", err);
+    if (auto err = launchRefreshGhostZFlags(fl.flags, fl.dims, s.stream);
+        err != cudaSuccess)
+        return fail("fine flag ghost refresh failed", err);
+
+    fl.active = true;
+    s.updateForcesFromFine();
+
+    // Seed the fine state from the current coarse field (valid mid-run).
+    if (auto err = s.seedFineFromCoarse(); err != cudaSuccess)
+        return fail("fine level seeding failed", err);
+    return true;
+}
+
+void LBMSolver::shutdownRefinement() {
+    if (impl_) impl_->freeFine();
+}
+
+void LBMSolver::setRefinedFlags(const std::vector<std::uint8_t>& fineFlags) {
+    Impl& s = *impl_;
+    if (!s.initialized || !s.fine.active) return;
+    if (fineFlags.size() != static_cast<std::size_t>(s.fine.ncells)) return;
+    if (cudaMemcpyAsync(s.fine.flags + s.fine.nxny, fineFlags.data(),
+                        static_cast<std::size_t>(s.fine.ncells),
+                        cudaMemcpyHostToDevice, s.stream) != cudaSuccess)
+        return;
+    launchRefreshGhostZFlags(s.fine.flags, s.fine.dims, s.stream);
+    s.updateForcesFromFine();
+    // Geometry changed: re-derive the whole fine state from the (freshly
+    // cold-restarted) coarse field so no stale vane flow survives the edit.
+    s.seedFineFromCoarse();
+}
+
+RefinementInfo LBMSolver::refinementInfo() const {
+    const Impl& s = *impl_;
+    RefinementInfo info;
+    if (!s.fine.active) return info;
+    info.active         = true;
+    info.box            = s.fine.box;
+    info.fineDims       = s.fine.dims;
+    info.fineScaling    = s.fine.scaling;
+    info.forcesFromFine = s.fine.forcesFromFine;
+    info.vramBytes =
+        2.0 * static_cast<double>(kQ) * static_cast<double>(s.fine.ncellsPad)
+            * sizeof(FPop)
+        + static_cast<double>(s.fine.ncellsPad);
+    return info;
+}
+
+bool LBMSolver::seedFromCoarse(const LBMSolver& presolver, std::string* error) {
+    Impl& s = *impl_;
+    const Impl& p = *presolver.impl_;
+    if (!s.initialized || !p.initialized) {
+        if (error) *error = "both solvers must be initialized";
+        return false;
+    }
+    auto fail = [&](const char* what, cudaError_t err) {
+        if (error) *error = std::string(what) + ": " + cudaGetErrorString(err);
+        return false;
+    };
+    // Trilinear upsample of the presolver's macroscopic field straight into
+    // this solver's device arrays (same context — no host round trip), then
+    // the standard compact-restore path: equilibrium re-init + bookkeeping.
+    if (auto err = launchUpsampleMacro(p.rho, p.u, p.v, p.w, p.dims,
+                                       s.rho, s.u, s.v, s.w, s.dims, s.stream);
+        err != cudaSuccess)
+        return fail("macroscopic upsample failed", err);
+    for (int i = 0; i < 2; ++i) {
+        if (auto err = launchInitFromMacroscopic(s.view(i), s.rho, s.u, s.v,
+                                                 s.w, s.stream);
+            err != cudaSuccess)
+            return fail("equilibrium re-init failed", err);
+    }
+    notifySnapshotRestored(false);
+    // CRITICAL difference from a same-grid snapshot restore: an upsampled
+    // 4x-coarser field carries interpolation roughness a tau-clamped grid
+    // cannot absorb cold (observed: velocity runaway at ~0.36 flow-throughs
+    // in deep stall). Re-arm the startup viscosity ramp over the seeded
+    // field — 2*nx steps of elevated viscosity is cheap insurance, and the
+    // fine level follows automatically through fineTauFor(effectiveTau()).
+    s.rampActive    = true;
+    s.rampStartStep = s.steps;
+    // The fine level re-derives from the freshly seeded coarse field.
+    if (auto err = s.seedFineFromCoarse(); err != cudaSuccess)
+        return fail("fine level re-seed failed", err);
+    return true;
 }
 
 void LBMSolver::setForceEmaWindow(float flowThroughs) {

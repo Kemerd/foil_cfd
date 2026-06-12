@@ -13,7 +13,6 @@
 #include "../geom/stl.h"
 #include "../geom/vg.h"
 #include "../render/viz.h"
-#include "../sim/grid_stretch.h"
 #include "../sim/lbm_solver.h"
 #include "../sim/units.h"
 #include "aircraft_manifest.h"
@@ -112,14 +111,37 @@ struct UIParams {
     // -- STL import (plan 7.2/7.4) --
     StlImportUI stlImport;                 ///< Modal state; mesh lives in main.cpp.
 
-    // -- mesh refinement panel --
-    MeshRefinementParams meshRefinement;   ///< Zone stretching parameters.
+    // -- mesh panel: refinement patch + startup pre-convergence --
+    /// Two-level refinement patch settings (plan M-refine). Margins are in
+    /// chord fractions around the solid bbox; the patch derivation clamps
+    /// them against the domain faces. Default ON — the VRAM guard in the
+    /// panel (and the init failure path) protects smaller cards.
+    struct RefinementUIParams {
+        bool  enabled   = true;  ///< Two-level patch active.
+        float upstreamC = 0.20f; ///< Margin ahead of the solid bbox [chords].
+        float wakeC     = 0.50f; ///< Margin behind (near-wake coverage).
+        float aboveC    = 0.20f; ///< Margin above (suction-surface BL + VGs).
+        float belowC    = 0.10f; ///< Margin below (pressure side).
+    };
+    RefinementUIParams refine;
+
+    /// Mesh-sequencing startup (plan M-refine part 2): cold starts first
+    /// converge a 4x-coarser companion sim (~seconds), then upsample its
+    /// macroscopic field onto the full grid — the flow starts developed
+    /// instead of impulsive and the force gate opens much sooner.
+    bool preconvergeCoarse = true;
 
     // -- sim panel --
     bool running = true;                   ///< Run/pause.
 
     // -- view panel --
     VizSettings viz;
+    bool voxelView = false;                ///< Replace the smooth foil/VG mesh
+                                           ///< with the SOLVER'S voxelization:
+                                           ///< coarse stair-step cubes, plus
+                                           ///< half-size cubes inside the
+                                           ///< refinement patch — exactly the
+                                           ///< walls the lattice bounces off.
     bool showVGGuidanceOverlay = true;     ///< Lin-2002 band overlay toggle.
     bool showVelocityLegend = true;        ///< Speed colorbar overlay at the
                                            ///< right edge of the render (on by
@@ -164,6 +186,20 @@ struct UIReadouts {
     float separationXc = -1.0f;            ///< <0 = attached.
     GuidanceBand heightBand;               ///< Lin h-band at the selected station.
     GuidanceBand stationBand;              ///< Lin station band for current h.
+
+    // -- refinement patch status (plan M-refine) --
+    struct RefinementReadout {
+        bool     active = false;       ///< Fine level allocated and stepping.
+        GridDims fineDims;             ///< Fine grid dimensions.
+        double   fineVramGB = 0.0;     ///< Fine-level f-pair + flags estimate.
+        float    fineReEffective = 0.0f; ///< Effective Re at the fine level.
+        bool     forcesFromFine = false; ///< Momentum exchange runs on fine grid.
+        int      patchX0 = 0, patchY0 = 0, patchX1 = 0, patchY1 = 0; ///< Coarse cells (diagram).
+    };
+    RefinementReadout refine;
+
+    // -- pre-convergence status (plan M-refine part 2) --
+    float preconvergeProgress = -1.0f; ///< 0..1 while running; < 0 = idle.
 };
 
 /// @brief One-frame edge-triggered commands the panels raise; main.cpp
@@ -184,6 +220,8 @@ struct UIEvents {
     bool stlImportConfirmed = false; ///< Modal "Import": voxelize the pending STL.
     bool stlImportCancelled = false; ///< Modal "Cancel": drop the pending STL.
     bool screenshot      = false; ///< Screenshot button -> Visualizer::screenshotPNG.
+    bool voxelViewToggled = false; ///< Voxel-view checkbox -> rebuild + upload
+                                   ///< the render mesh (voxel soup or smooth).
     bool highFidelityToggled     = false; ///< HiFi switch flipped -> re-init with preset.
     bool meshRefinementChanged   = false; ///< Zone weights / preset changed -> rebuild stretch + cold restart.
     bool particleCountChanged = false; ///< Pool slider released -> resizeParticlePool.

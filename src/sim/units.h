@@ -224,6 +224,33 @@ inline float maxEffectiveRe(int chordCells, float u_lat = kDefaultULat) {
     return std::min(u_lat, kMaxULat) * static_cast<float>(chordCells) / nuMin;
 }
 
+/// @brief Lattice scaling of a refined level derived from its parent
+/// (plan M-refine, acoustic scaling): dx and dt shrink by the factor, u_lat
+/// is unchanged, and the lattice viscosity GROWS by the factor so the
+/// physical viscosity matches across levels:
+///   nu_phys = nu_lat * dx^2/dt  ->  nu_lat_f = m * nu_lat_c.
+/// Consequently tau_f = 3*m*nu_lat_c + 1/2 = m*(tau_c - 1/2) + 1/2, which is
+/// FARTHER from the stability floor than the parent — a coupled fine level
+/// can never be the stability bottleneck. Both Reynolds numbers are shared
+/// across levels (Re_eff = u_lat * m*N_c / (m*nu_lat) is invariant): the
+/// refined level buys spatial resolution at the same Re, not a higher Re.
+/// @param parent The coarse level's scaling (from computeScaling()).
+/// @param factor Refinement factor m (2 for the v1 patch).
+/// @return Fully-populated fine-level scaling.
+inline LatticeScaling refinedScaling(const LatticeScaling& parent, int factor) {
+    LatticeScaling f = parent;
+    const float m = static_cast<float>(factor);
+    f.chordCells    = parent.chordCells * factor;
+    f.dx            = parent.dx / m;
+    f.dt            = parent.dt / m;
+    f.nu_lat_target = parent.nu_lat_target * m;
+    f.nu_lat        = parent.nu_lat * m;
+    f.tau           = 3.0f * f.nu_lat + 0.5f;
+    // reTarget/reEffective are level-invariant; tauClamped describes the
+    // PARENT's clamp state (the fine tau is derived, never clamped itself).
+    return f;
+}
+
 // ---------------------------------------------------------------------------
 // Startup viscosity ramp (plan section 4.3): fresh runs start at 4x the target
 // viscosity and ramp linearly to target over the first 2*nx steps, killing the

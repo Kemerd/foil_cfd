@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "lbm_core.cuh"
+#include "lbm_refine.cuh"
 #include "units.h"
 
 namespace foilcfd {
@@ -55,7 +56,22 @@ struct Delta99Sample {
 struct SolverPerfStats {
     int    lastStepsPerFrame = 0;   ///< N chosen by the adaptive pacer last frame.
     double lastStepMs        = 0.0; ///< Measured wall time per single step [ms].
-    double mlups             = 0.0; ///< Million lattice updates per second.
+    double mlups             = 0.0; ///< Million lattice updates per second
+                                    ///< (counts coarse + 2x fine when the
+                                    ///< refinement patch is active).
+};
+
+/// @brief Status of the two-level refinement patch (plan M-refine), for the
+/// UI Mesh panel. All fields are derived at initRefinement() time.
+struct RefinementInfo {
+    bool           active = false;    ///< Fine level allocated and stepping.
+    PatchBox       box;               ///< Patch in coarse cells.
+    GridDims       fineDims;          ///< Fine grid dimensions.
+    LatticeScaling fineScaling;       ///< Fine-level scaling (refinedScaling).
+    double         vramBytes = 0.0;   ///< Fine f-pair + flag allocation.
+    bool           forcesFromFine = false; ///< Momentum exchange runs on the
+                                      ///< fine grid (true when the patch
+                                      ///< covers every coarse solid cell).
 };
 
 /// @brief Host orchestrator for the D3Q19 TRT-Smagorinsky solver.
@@ -106,6 +122,49 @@ public:
     /// restart; this path skips the viscosity ramp and may produce transients.
     /// @param flags New host flag field (clean foil mask OR'd with VG voxels).
     void applyEditedFlags(const std::vector<std::uint8_t>& flags);
+
+    // ------ two-level refinement patch (plan M-refine) ------
+
+    /// @brief Allocate and seed the 2x fine level over the given patch box.
+    /// Call after init()/setFlags() with the matching fine flag field (from
+    /// buildFinePatchFlags + VG stamping). The fine state is seeded from the
+    /// current coarse field via the full-volume coarse-to-fine fill, so this
+    /// is valid at any point of a run. Replaces any previous fine level.
+    /// Fails gracefully on OOM — the coarse-only sim keeps running.
+    /// @param box       Patch in coarse cells (derivePatchBox output).
+    /// @param fineFlags Fine flag field, fineDimsFor(box, dims()).cellCount()
+    ///                  bytes, with the Interface shell stamped.
+    /// @param error     On failure, receives a human-readable reason.
+    /// @return True on success.
+    bool initRefinement(const PatchBox& box,
+                        const std::vector<std::uint8_t>& fineFlags,
+                        std::string* error);
+
+    /// @brief Release the fine level (no-op when inactive). The coarse sim
+    /// continues unaffected — the overlap region simply stops receiving
+    /// fine-grid restrictions.
+    void shutdownRefinement();
+
+    /// @brief Replace the fine-level flag field (geometry/VG edits at fixed
+    /// patch box) and re-seed the fine state from the coarse field. Callers
+    /// run setFlags() (coarse, cold restart) first, then this.
+    /// @param fineFlags New fine flag field (must match the active fine dims).
+    void setRefinedFlags(const std::vector<std::uint8_t>& fineFlags);
+
+    /// @brief Refinement status for the UI (zeroed RefinementInfo when off).
+    RefinementInfo refinementInfo() const;
+
+    /// @brief Mesh-sequencing seed (plan M-refine part 2): trilinearly
+    /// upsample the @p presolver's macroscopic field onto this solver's grid,
+    /// equilibrium re-init both ping-pong buffers from it, and run the
+    /// compact-restore bookkeeping (no viscosity ramp, settle-transient force
+    /// gate). When the refinement patch is active its state is re-seeded from
+    /// the freshly restored coarse field. Both solvers must share the CUDA
+    /// context/stream (they do — the app runs a single stream).
+    /// @param presolver Converged coarse companion sim (any smaller grid).
+    /// @param error     On failure, receives a human-readable reason.
+    /// @return True on success.
+    bool seedFromCoarse(const LBMSolver& presolver, std::string* error);
 
     /// @brief Provide the CLEAN-FOIL (VG-free) flag field the suction-surface
     /// extraction (extractSuctionDelta99 / separationOnsetXc) measures from.

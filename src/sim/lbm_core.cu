@@ -460,7 +460,7 @@ constexpr long long kWatchdogStride = 4093;
 __global__ void nanWatchdogKernel(const FPop* __restrict__ f,
                                   long long ncells, long long ncellsPad,
                                   long long nxny, long long offset,
-                                  int* __restrict__ d_flag) {
+                                  int* __restrict__ d_flag, int flagBase) {
     const long long t =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     const long long cell = t * kWatchdogStride + offset;
@@ -484,11 +484,11 @@ __global__ void nanWatchdogKernel(const FPop* __restrict__ f,
     //       every number in it is still finite (the "whole domain turns red"
     //       state). 0.95x: catch cells the limiter clamped EXACTLY to the cap.
     if (!isfinite(s)) {
-        *d_flag = 1;
+        *d_flag = flagBase + 1;
     } else {
         const float speed2 = (jx * jx + jy * jy + jz * jz) / fmaxf(s * s, 1e-12f);
         const float cap = 0.95f * kMaxSimSpeed;
-        if (speed2 > cap * cap) *d_flag = 2;
+        if (speed2 > cap * cap) *d_flag = flagBase + 2;
     }
 }
 
@@ -751,7 +751,8 @@ cudaError_t launchApplyFlagEdits(DeviceLatticeView lattice, FPop* fOther,
 }
 
 cudaError_t launchNaNWatchdog(DeviceLatticeView lattice, int* d_nanFlag,
-                              long long sampleOffset, cudaStream_t stream) {
+                              long long sampleOffset, cudaStream_t stream,
+                              int flagBase) {
     const long long ncells = lattice.dims.cellCount();
     if (ncells <= 0 || !lattice.f || !d_nanFlag) return cudaErrorInvalidValue;
     const long long nxny = static_cast<long long>(lattice.dims.nx) * lattice.dims.ny;
@@ -762,7 +763,7 @@ cudaError_t launchNaNWatchdog(DeviceLatticeView lattice, int* d_nanFlag,
     const long long samples = (ncells + kWatchdogStride - 1) / kWatchdogStride;
     nanWatchdogKernel<<<gridFor(samples), kBlock, 0, stream>>>(
         lattice.f, ncells, lattice.dims.paddedCellCount(), nxny, offset,
-        d_nanFlag);
+        d_nanFlag, flagBase);
     return cudaGetLastError();
 }
 
