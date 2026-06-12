@@ -77,9 +77,9 @@ bool readWholeFile(const std::filesystem::path& path, std::vector<char>& out,
     if (static_cast<std::uint64_t>(size) > kMaxStlFileBytes) {
         char buf[96];
         std::snprintf(buf, sizeof(buf),
-                      "file is %.1f GB — too large for any %s-triangle STL",
-                      static_cast<double>(size) / (1024.0 * 1024.0 * 1024.0),
-                      humanCount(kMaxStlTriangles).c_str());
+                      "file is %.1f GB — no STL under the 2M-triangle limit "
+                      "is this large",
+                      static_cast<double>(size) / (1024.0 * 1024.0 * 1024.0));
         err = buf;
         return false;
     }
