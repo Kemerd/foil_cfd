@@ -208,14 +208,16 @@ float runPlate(const GridDims& dims, const LatticeScaling& scaling,
                                     nullptr, &err);
     TCHECK_MSG(initOk, "solver init failed: %s", err.c_str());
     if (!initOk) return -1.0f;
+    // Wall-model development is measured on the settled plate BL; instant start
+    // so the fixed march window isn't eaten by the from-rest velocity ramp.
+    solver.setStartupRampEnabled(false);
+    solver.reset();
     solver.setWallModelEnabled(wallModel);
 
-    // 3.6 flow-throughs: the force gate opens at 2.0 and the trailing average
-    // then covers a fully developed window. The extra flow-through (was 2.6)
-    // absorbs the startup inlet-velocity ramp — the field accelerates from rest
-    // now, so the boundary layer needs longer to develop and thicken downstream.
+    // 2.6 flow-throughs: the force gate opens at 2.0 and the trailing
+    // average then covers a fully developed window.
     const float ftSteps = scaling.flowThroughSteps(kNx);
-    const int totalSteps = static_cast<int>(3.6f * ftSteps);
+    const int totalSteps = static_cast<int>(2.6f * ftSteps);
     const int chunk = 512;
 
     std::vector<float> yplusHist;

@@ -94,6 +94,9 @@ struct LBMSolver::Impl {
     // restores and warm flag edits disable it — their fields are developed.
     bool      rampActive    = true;
     long long rampStartStep = 0;
+    // Master switch for the startup ramps + rest-init (setStartupRampEnabled).
+    // Off restores the legacy instant start for steady-state tests.
+    bool      rampEnabled   = true;
 
     // Force EMA + convergence gate (plan 4.4 / 13).
     long long gateOpenAtSteps     = 0;     ///< forces().valid once steps pass this.
@@ -511,16 +514,18 @@ struct LBMSolver::Impl {
 
     /// @brief tau for the step about to run, honoring the ramp state.
     float effectiveTau() const {
-        return rampActive ? rampedTau(scaling, steps - rampStartStep, dims.nx)
-                          : scaling.tau;
+        return (rampActive && rampEnabled)
+                   ? rampedTau(scaling, steps - rampStartStep, dims.nx)
+                   : scaling.tau;
     }
 
     /// @brief Inlet/freestream velocity for the step about to run, honoring the
     /// startup velocity ramp (eases from rest so the impulsive-start pressure
-    /// shock never forms). Outside the ramp it is the full target u_lat.
+    /// shock never forms). Outside the ramp (or when disabled) it is u_lat.
     float effectiveU() const {
-        return rampActive ? rampedU(scaling, steps - rampStartStep, dims.nx)
-                          : scaling.u_lat;
+        return (rampActive && rampEnabled)
+                   ? rampedU(scaling, steps - rampStartStep, dims.nx)
+                   : scaling.u_lat;
     }
 
     /// @brief Poll an event, absorbing ONLY the expected cudaErrorNotReady
@@ -846,8 +851,12 @@ void LBMSolver::reset() {
     // strength is unchanged once the flow is up to speed). The init kernels run
     // over the padded domain with z-periodic formulas, so the ghost planes are
     // consistent by construction — no refresh needed here.
+    // Rest-init only when the ramp is enabled; otherwise legacy instant start
+    // at full freestream (the inlet drives u_lat from step 1 too, via the
+    // effectiveU gate below).
+    const float initU = s.rampEnabled ? 0.0f : s.scaling.u_lat;
     for (int i = 0; i < 2; ++i) {
-        launchInitEquilibrium(s.view(i), /*uInlet=*/0.0f, s.stream);
+        launchInitEquilibrium(s.view(i), initU, s.stream);
         launchSpanwisePerturbation(s.view(i),
                                    kSpeckAmplitudeFrac * s.scaling.u_lat,
                                    kSpeckSeed, s.stream);
@@ -1916,6 +1925,10 @@ bool LBMSolver::seedFromCoarse(const LBMSolver& presolver, std::string* error) {
 
 void LBMSolver::setForceEmaWindow(float flowThroughs) {
     impl_->emaWindowFlowThroughs = std::max(0.05f, flowThroughs);
+}
+
+void LBMSolver::setStartupRampEnabled(bool enabled) {
+    impl_->rampEnabled = enabled;
 }
 
 // ===========================================================================

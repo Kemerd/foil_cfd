@@ -235,6 +235,17 @@ public:
     /// @return True on success.
     bool seedFromCoarse(const LBMSolver& presolver, std::string* error);
 
+    /// @brief Enable/disable the startup ramps (viscosity + inlet velocity) and
+    /// the rest-initialization that goes with them. ON (default) is the app
+    /// behavior: a fresh field starts at REST and the inlet eases up to u_lat,
+    /// so no impulsive pressure shock rings off the body. OFF restores the
+    /// legacy instant start (field initialized to full freestream, inlet at
+    /// u_lat from step 1) — used by the steady-state interface/physics tests,
+    /// which validate the converged coupling, not the startup transient, and
+    /// would otherwise have to march many extra flow-throughs for the ramp to
+    /// flush. Takes effect on the next reset()/setFlags().
+    void setStartupRampEnabled(bool enabled);
+
     /// @brief Provide the CLEAN-FOIL (VG-free) flag field the suction-surface
     /// extraction (extractSuctionDelta99 / separationOnsetXc) measures from.
     /// The live flags may carry VG voxels, and a vane crossing the mid-span

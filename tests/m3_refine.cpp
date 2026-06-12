@@ -83,6 +83,10 @@ int main() {
     const bool initOk = solver.init(dims, scaling, flags, nullptr, &err);
     TCHECK_MSG(initOk, "solver init failed: %s", err.c_str());
     if (!initOk) return finish("m3_refine");
+    // Steady-state interface test: instant start (no from-rest velocity ramp),
+    // then re-init so the freestream is uniform from step 1.
+    solver.setStartupRampEnabled(false);
+    solver.reset();
 
     // Patch in the middle of the domain, clear of every boundary face.
     PatchBox box;
@@ -102,20 +106,11 @@ int main() {
     // grid (vacuously, all zero solids are "covered" by the patch).
     TCHECK(solver.refinementInfo().forcesFromFine);
 
-    // The freestream reference. The field now initializes AT REST and the inlet
-    // ramps up (no impulsive shock), so u = u_lat is the SETTLED state, not the
-    // t=0 state. March one flow-through past the velocity ramp so the domain is
-    // uniformly at u_lat before we assert the interface holds it. nx/u_lat ~=
-    // 3840 steps for one flow-through; 4500 leaves margin.
+    // The freestream reference: instant-start init drives u = u_lat everywhere.
+    // (This test validates the steady-state interface, not the startup, so it
+    // runs with the startup ramp disabled — see setStartupRampEnabled below.)
     const float u0 = scaling.u_lat;
     const float tol = 0.01f * u0; // 1% of freestream
-    {
-        const cudaError_t werr = solver.stepN(4500);
-        TCHECK_MSG(werr == cudaSuccess, "warm-up stepN failed: %s",
-                   cudaGetErrorString(werr));
-        TCHECK_MSG(!solver.nanDetected(), "watchdog tripped during warm-up: %s",
-                   solver.nanDiagnosis().c_str());
-    }
 
     bool clean = true;
     for (int step = kSampleEvery; step <= kTotalSteps; step += kSampleEvery) {

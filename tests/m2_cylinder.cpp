@@ -37,9 +37,7 @@ constexpr float kRe      = 150.0f;
 
 // Transient long enough for the street to lock in (~9 shedding periods,
 // ~3.5 flow-throughs), then ~17 periods of lift sampled for the spectrum.
-// Bumped to absorb the startup INLET-VELOCITY ramp (the field now accelerates
-// from rest, so shedding locks in later than under the old impulsive start).
-constexpr int kTransientSteps = 40000;
+constexpr int kTransientSteps = 25000;
 constexpr int kSampleEvery    = 16;    // steps between lift samples
 constexpr int kSampleCount    = 3000;  // -> 48000 sampled steps
 
@@ -105,6 +103,10 @@ int main() {
     const bool initOk = solver.init(dims, scaling, flags, nullptr, &err);
     TCHECK_MSG(initOk, "solver init failed: %s", err.c_str());
     if (!initOk) return finish("m2_cylinder");
+    // Strouhal is a steady-shedding property: instant start so the transient
+    // window measures locked-in shedding, not the from-rest velocity ramp.
+    solver.setStartupRampEnabled(false);
+    solver.reset();
 
     // Impulsive uniform start plus a deliberate mirror-asymmetric v ripple:
     // at Re 150 the street self-starts from noise eventually, but seeding the

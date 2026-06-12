@@ -105,6 +105,8 @@ bool runSlabStability() {
         std::printf("slab: solver init failed: %s\n", err.c_str());
         return false;
     }
+    solver.setStartupRampEnabled(false); // instant start; stability-only check
+    solver.reset();
 
     PatchBox box;
     box.x0 = 60; box.x1 = 130;
@@ -161,6 +163,9 @@ int main() {
     const bool initOk = solver.init(dims, scaling, flags, nullptr, &err);
     TCHECK_MSG(initOk, "solver init failed: %s", err.c_str());
     if (!initOk) return finish("m4_finer");
+    // Steady-state interface test: instant start, uniform freestream from step 1.
+    solver.setStartupRampEnabled(false);
+    solver.reset();
 
     // Fine patch in the middle of the domain, clear of every boundary face.
     PatchBox box;
@@ -199,19 +204,10 @@ int main() {
     // Effective resolution vs coarse is 2x (fine) * 2x (finer) = 4x.
     TCHECK(ri.factor * ri.finerFactor == 4);
 
-    // The freestream reference. The field now initializes AT REST and the inlet
-    // ramps up (no impulsive shock), so u = u_lat is the SETTLED state. March one
-    // flow-through past the velocity ramp so the domain is uniformly at u_lat
-    // before asserting the nested interface holds it. ~3840 steps/flow-through.
+    // The freestream reference: instant-start init drives u = u_lat everywhere
+    // (the startup ramp is disabled for this steady-state interface test).
     const float u0 = scaling.u_lat;
     const float tol = 0.01f * u0; // 1% of freestream
-    {
-        const cudaError_t werr = solver.stepN(4500);
-        TCHECK_MSG(werr == cudaSuccess, "warm-up stepN failed: %s",
-                   cudaGetErrorString(werr));
-        TCHECK_MSG(!solver.nanDetected(), "watchdog tripped during warm-up: %s",
-                   solver.nanDiagnosis().c_str());
-    }
 
     bool clean = true;
     for (int step = kSampleEvery; step <= kTotalSteps; step += kSampleEvery) {
