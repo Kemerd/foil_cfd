@@ -1261,12 +1261,14 @@ void drawReadoutsPanel(UIContext& ctx) {
             r.forces.flowThroughs / kForceGateFlowThroughs, 0.0f, 1.0f);
         ImGui::ProgressBar(frac, ImVec2(-1, 0), "");
     } else {
+        // Step count shown alongside flow-throughs so progress is always visible.
+        ImGui::TextDisabled("step %lld  |  %.2f flow-throughs",
+                            r.stepCount, r.forces.flowThroughs);
+
         // Smoothed display values so the numbers glide rather than flicker.
         const float cl  = smoothValue(ImGui::GetID("cl"),  r.forces.cl);
         const float cd  = smoothValue(ImGui::GetID("cd"),  r.forces.cd);
         const float ld  = smoothValue(ImGui::GetID("ld"),  r.forces.liftToDrag);
-        const float cla = smoothValue(ImGui::GetID("cla"), r.forces.clAvg);
-        const float cda = smoothValue(ImGui::GetID("cda"), r.forces.cdAvg);
 
         // Large-type readout: 1.6x font scale on the three hero numbers.
         ImGui::SetWindowFontScale(1.6f);
@@ -1295,18 +1297,39 @@ void drawReadoutsPanel(UIContext& ctx) {
                    "efficient. A VG that raises L/D means it recovered more lift "
                    "than it added drag — the key homebuilder metric.");
 
-        // --- Trailing averages over the last 1.0 flow-through ---
-        // These settle faster than the EMA and show the mean over a physically
-        // complete cycle, giving a cleaner comparison point across restarts.
-        ImGui::Spacing();
-        ImGui::TextDisabled("2-flow-through avg");
-        helpMarker("Mean Cl and Cd computed over the most recent 2 complete "
-                   "flow-throughs (2 x domain length / freestream speed). "
-                   "Less noisy than the live EMA for comparing runs.");
-        ImGui::SetWindowFontScale(1.3f);
-        ImGui::Text("Cl(a) %+.4f", cla);
-        ImGui::Text("Cd(a) %.5f",  cda);
-        ImGui::SetWindowFontScale(1.0f);
+        // --- Overall averages: all samples after the first flow-through ---
+        // Discards the startup transient; accumulates as the run continues.
+        // Only shown once enough samples exist (avgAvg fields will be zero otherwise).
+        const bool haveAvg = (r.forces.clAvg != 0.0f || r.forces.cdAvg != 0.0f);
+        if (haveAvg) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("overall avg  (post 1 FT)");
+            helpMarker("Statistics over every force sample collected after the "
+                       "first flow-through — the startup transient is excluded. "
+                       "Accumulates as the simulation runs; compare mean values "
+                       "between VG-on and VG-off runs for engineering guidance.");
+
+            // --- Cl(a) row ---
+            ImGui::SetWindowFontScale(1.3f);
+            ImGui::Text("Cl(a) %+.4f", r.forces.clAvg);
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::TextDisabled("  min %+.4f   max %+.4f   med %+.4f",
+                                r.forces.clMin, r.forces.clMax, r.forces.clMedian);
+
+            // --- Cd(a) row ---
+            ImGui::SetWindowFontScale(1.3f);
+            ImGui::Text("Cd(a) %.5f", r.forces.cdAvg);
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::TextDisabled("  min %.5f   max %.5f   med %.5f",
+                                r.forces.cdMin, r.forces.cdMax, r.forces.cdMedian);
+
+            // --- L/D(a) row ---
+            ImGui::SetWindowFontScale(1.3f);
+            ImGui::Text("L/D(a) %.2f", r.forces.ldAvg);
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::TextDisabled("  min %.2f   max %.2f   med %.2f",
+                                r.forces.ldMin, r.forces.ldMax, r.forces.ldMedian);
+        }
     }
 
     // ---- performance + progress block -------------------------------------

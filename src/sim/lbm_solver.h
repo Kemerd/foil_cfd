@@ -33,10 +33,22 @@ struct ForceReadout {
                               ///< since the last cold start (UI greys readout).
     float flowThroughs = 0.0f;///< Flow-throughs completed since last cold start.
 
-    /// Average Cl/Cd over the most recent 1.0 flow-through window.
-    /// Only valid when valid == true; zero otherwise.
-    float clAvg = 0.0f;
-    float cdAvg = 0.0f;
+    /// Overall mean Cl/Cd/L/D accumulated after the first 1.0 flow-through,
+    /// with the noisy startup transient discarded.  Only valid when valid==true.
+    float clAvg    = 0.0f;
+    float clMin    = 0.0f;
+    float clMax    = 0.0f;
+    float clMedian = 0.0f;
+
+    float cdAvg    = 0.0f;
+    float cdMin    = 0.0f;
+    float cdMax    = 0.0f;
+    float cdMedian = 0.0f;
+
+    float ldAvg    = 0.0f;   ///< L/D derived from the averaged samples.
+    float ldMin    = 0.0f;
+    float ldMax    = 0.0f;
+    float ldMedian = 0.0f;
 };
 
 /// @brief One station of the suction-surface boundary-layer profile used by

@@ -1301,29 +1301,72 @@ ForceReadout LBMSolver::forces() const {
     r.liftToDrag = (std::fabs(r.cd) > 1e-6f) ? r.cl / r.cd : 0.0f;
     r.valid = s.emaSeeded && (s.steps >= s.gateOpenAtSteps);
 
-    // Trailing average over the last 2.0 flow-throughs: walk the ring backwards
-    // collecting samples whose step falls within [steps - windowSteps, steps],
-    // then average their raw forces through forceToCoefficient.
+    // Overall average Cl/Cd/L/D: collect every ring sample after the first
+    // 1.0 flow-through (the startup transient is discarded), then compute
+    // mean, min, max, and median over the surviving set.  The ring is cleared
+    // on every cold start, so all entries belong to the current run.
     if (r.valid && s.avgRingCount > 0) {
-        const float windowSteps = 2.0f * s.flowThroughSteps(); // exactly 2.0 FT
-        const long long cutoff  = s.steps - static_cast<long long>(windowSteps);
-        float sumFx = 0.0f, sumFy = 0.0f;
-        int   count = 0;
-        // Traverse from newest to oldest, stopping once we fall outside window.
+        // Samples at step < 1 FT are pure startup transient — skip them.
+        const long long oneFTSteps =
+            static_cast<long long>(s.flowThroughSteps());
+
+        // Collect converted coefficients into temporary arrays for statistics.
+        std::vector<float> clVec, cdVec, ldVec;
+        clVec.reserve(static_cast<std::size_t>(s.avgRingCount));
+        cdVec.reserve(static_cast<std::size_t>(s.avgRingCount));
+        ldVec.reserve(static_cast<std::size_t>(s.avgRingCount));
+
+        // Walk the entire valid portion of the ring (newest to oldest) so we
+        // capture ALL post-1FT samples, not just the most recent window.
         for (int i = 0; i < s.avgRingCount; ++i) {
             const int idx = (s.avgRingHead - 1 - i + Impl::kAvgRingSize)
                             % Impl::kAvgRingSize;
             const Impl::ForceSample& smp = s.avgRing[idx];
-            if (smp.step < cutoff) break; // samples are time-ordered in ring
-            sumFx += smp.fx;
-            sumFy += smp.fy;
-            ++count;
+
+            // Discard samples from the first flow-through (startup transient).
+            if (smp.step < oneFTSteps) continue;
+
+            const float clSmp = fscale.forceToCoefficient(smp.fy, spanCells);
+            const float cdSmp = fscale.forceToCoefficient(smp.fx, spanCells);
+            const float ldSmp = (std::fabs(cdSmp) > 1e-6f)
+                                    ? clSmp / cdSmp : 0.0f;
+            clVec.push_back(clSmp);
+            cdVec.push_back(cdSmp);
+            ldVec.push_back(ldSmp);
         }
-        if (count > 0) {
-            // Same normalization source as the EMA pair above (fine when the
-            // patch carries the momentum exchange).
-            r.cdAvg = fscale.forceToCoefficient(sumFx / count, spanCells);
-            r.clAvg = fscale.forceToCoefficient(sumFy / count, spanCells);
+
+        if (!clVec.empty()) {
+            // --- Mean ---
+            float sumCl = 0.0f, sumCd = 0.0f, sumLd = 0.0f;
+            for (std::size_t k = 0; k < clVec.size(); ++k) {
+                sumCl += clVec[k];
+                sumCd += cdVec[k];
+                sumLd += ldVec[k];
+            }
+            const float n  = static_cast<float>(clVec.size());
+            r.clAvg = sumCl / n;
+            r.cdAvg = sumCd / n;
+            r.ldAvg = sumLd / n;
+
+            // --- Min / Max ---
+            r.clMin = *std::min_element(clVec.begin(), clVec.end());
+            r.clMax = *std::max_element(clVec.begin(), clVec.end());
+            r.cdMin = *std::min_element(cdVec.begin(), cdVec.end());
+            r.cdMax = *std::max_element(cdVec.begin(), cdVec.end());
+            r.ldMin = *std::min_element(ldVec.begin(), ldVec.end());
+            r.ldMax = *std::max_element(ldVec.begin(), ldVec.end());
+
+            // --- Median (sort copies in-place; data is small, ~tens of items) ---
+            auto medianOf = [](std::vector<float> v) -> float {
+                std::sort(v.begin(), v.end());
+                const std::size_t m = v.size() / 2;
+                return (v.size() % 2 == 0)
+                           ? 0.5f * (v[m - 1] + v[m])
+                           : v[m];
+            };
+            r.clMedian = medianOf(clVec);
+            r.cdMedian = medianOf(cdVec);
+            r.ldMedian = medianOf(ldVec);
         }
     }
 
