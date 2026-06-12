@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../sim/grid_stretch.h"
 #include "../sim/lbm_core.cuh"
 #include "airfoil.h"
 
@@ -50,15 +51,22 @@ std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims);
 /// (x,y) column, parity-test the cell center against the polygon and mark
 /// SOLID; (4) extrude the identical 2D mask across all z. O(nx*ny) tests.
 ///
+/// When @p stretch is non-null the polygon is transformed into LOGICAL cell
+/// space via the inverse coordinate map (GridStretch::fromPhys*) before
+/// rasterization, so geometry stamps at the correct physical location under
+/// any stretching profile.
+///
 /// Does NOT run TE closure — call closeTrailingEdgeGaps() after all solid
 /// stamping (foil + VGs) so vane roots also benefit from the pass.
-/// @param airfoil Normalized section to voxelize.
-/// @param aoa_deg Angle of attack in degrees (UI range -5..20).
-/// @param layout  Foil placement and scale inside the grid.
-/// @param flags   Flag field to mark (from buildBoundaryFlags or a copy of a
-///                cached clean-foil mask). Only writes CellFlag::Solid.
+/// @param airfoil  Normalized section to voxelize.
+/// @param aoa_deg  Angle of attack in degrees (UI range -5..20).
+/// @param layout   Foil placement and scale inside the grid.
+/// @param flags    Flag field to mark (from buildBoundaryFlags or a copy of a
+///                 cached clean-foil mask). Only writes CellFlag::Solid.
+/// @param stretch  Optional coordinate map (null = uniform, no change).
 void voxelizeAirfoil(const AirfoilGeometry& airfoil, float aoa_deg,
-                     const DomainLayout& layout, std::vector<std::uint8_t>& flags);
+                     const DomainLayout& layout, std::vector<std::uint8_t>& flags,
+                     const GridStretch* stretch = nullptr);
 
 /// @brief Trailing-edge single-cell-gap closure (plan section 13): voxelized
 /// TEs thinner than one cell leave leaky one-cell channels; one pass converts
@@ -73,12 +81,14 @@ int closeTrailingEdgeGaps(const GridDims& dims, std::vector<std::uint8_t>& flags
 /// voxelizeAirfoil + closeTrailingEdgeGaps. VG editing re-runs only the VG
 /// stamping on a kept copy of this result (plan 6.2), so the airfoil parity
 /// tests don't repeat per VG slider tick.
-/// @param airfoil Normalized section.
-/// @param aoa_deg Angle of attack in degrees.
-/// @param layout  Placement/scale description.
+/// @param airfoil  Normalized section.
+/// @param aoa_deg  Angle of attack in degrees.
+/// @param layout   Placement/scale description.
+/// @param stretch  Optional coordinate map (null = uniform).
 /// @return Complete flag field ready for LBMSolver::init / setFlags.
 std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
                                               float aoa_deg,
-                                              const DomainLayout& layout);
+                                              const DomainLayout& layout,
+                                              const GridStretch* stretch = nullptr);
 
 } // namespace foilcfd

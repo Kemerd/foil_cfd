@@ -99,6 +99,21 @@ struct LBMSolver::Impl {
     long long stepsAtForceLaunch   = 0;
     long long stepsAtLastForceFold = 0;
 
+    /// @brief One sample stored in the rolling average ring buffer.
+    struct ForceSample {
+        long long step = 0;   ///< Solver step at which this sample was folded.
+        float     fx   = 0.0f; ///< Raw lattice Fx at this sample.
+        float     fy   = 0.0f; ///< Raw lattice Fy at this sample.
+    };
+
+    /// Ring buffer holding the most recent force samples for the 1-flow-through
+    /// trailing average (Cl(a)/Cd(a)).  256 slots is far more than one flow-
+    /// through ever produces (force readbacks fire at most once per frame).
+    static constexpr int kAvgRingSize = 256;
+    ForceSample avgRing[kAvgRingSize]{};
+    int  avgRingHead = 0;   ///< Next write index (mod kAvgRingSize).
+    int  avgRingCount = 0;  ///< Valid entries (capped at kAvgRingSize).
+
     // Adaptive pacing (plan 4.5/9.3).
     bool   timingPending = false;
     int    timingBatchN  = 0;
@@ -198,6 +213,12 @@ struct LBMSolver::Impl {
                 emaFx += alpha * (hForce[0] - emaFx);
                 emaFy += alpha * (hForce[1] - emaFy);
             }
+
+            // Push this raw sample into the trailing-average ring buffer.
+            avgRing[avgRingHead] = {stepsAtForceLaunch, hForce[0], hForce[1]};
+            avgRingHead  = (avgRingHead + 1) % kAvgRingSize;
+            if (avgRingCount < kAvgRingSize) ++avgRingCount;
+
             stepsAtLastForceFold = stepsAtForceLaunch;
             forcePending = false;
         }
@@ -448,6 +469,10 @@ void LBMSolver::reset() {
     s.emaSeeded = false;
     s.forcePending = false;
     s.stepsAtForceLaunch = s.stepsAtLastForceFold = 0;
+    // Clear the trailing-average ring on every cold start so Cl(a)/Cd(a)
+    // don't bleed samples from the previous run into the new one.
+    s.avgRingHead  = 0;
+    s.avgRingCount = 0;
     s.nanLatched = false;
     s.nanPending = false;
     s.nanTripKind = 0;
@@ -643,6 +668,31 @@ ForceReadout LBMSolver::forces() const {
     r.cl = s.scaling.forceToCoefficient(s.emaFy, spanCells);
     r.liftToDrag = (std::fabs(r.cd) > 1e-6f) ? r.cl / r.cd : 0.0f;
     r.valid = s.emaSeeded && (s.steps >= s.gateOpenAtSteps);
+
+    // Trailing average over the last 2.0 flow-throughs: walk the ring backwards
+    // collecting samples whose step falls within [steps - windowSteps, steps],
+    // then average their raw forces through forceToCoefficient.
+    if (r.valid && s.avgRingCount > 0) {
+        const float windowSteps = 2.0f * s.flowThroughSteps(); // exactly 2.0 FT
+        const long long cutoff  = s.steps - static_cast<long long>(windowSteps);
+        float sumFx = 0.0f, sumFy = 0.0f;
+        int   count = 0;
+        // Traverse from newest to oldest, stopping once we fall outside window.
+        for (int i = 0; i < s.avgRingCount; ++i) {
+            const int idx = (s.avgRingHead - 1 - i + Impl::kAvgRingSize)
+                            % Impl::kAvgRingSize;
+            const Impl::ForceSample& smp = s.avgRing[idx];
+            if (smp.step < cutoff) break; // samples are time-ordered in ring
+            sumFx += smp.fx;
+            sumFy += smp.fy;
+            ++count;
+        }
+        if (count > 0) {
+            r.cdAvg = s.scaling.forceToCoefficient(sumFx / count, spanCells);
+            r.clAvg = s.scaling.forceToCoefficient(sumFy / count, spanCells);
+        }
+    }
+
     return r;
 }
 

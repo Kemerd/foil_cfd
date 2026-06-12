@@ -192,6 +192,7 @@ void buildDefaultDockLayout(ImGuiID dockspaceId) {
     ImGui::DockBuilderDockWindow("VG Guidance", leftBottom); // tabbed with editor
     ImGui::DockBuilderDockWindow("Simulation", right);
     ImGui::DockBuilderDockWindow("View", right);             // tabbed with sim
+    ImGui::DockBuilderDockWindow("Mesh", right);             // tabbed with sim/view
     ImGui::DockBuilderDockWindow("Readouts", rightBottom);
     ImGui::DockBuilderFinish(dockspaceId);
 }
@@ -258,6 +259,8 @@ void handleHotkeys(UIContext& ctx) {
     if (ImGui::IsKeyPressed(ImGuiKey_5, false)) p.viz.showVelocityVolume = !p.viz.showVelocityVolume;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) p.running = !p.running;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) ctx.events->frameFoilView = true;
+    // R key: cold-restart the sim (zero field, re-run viscosity ramp).
+    if (ImGui::IsKeyPressed(ImGuiKey_R, false)) ctx.events->resetCold = true;
 }
 
 // ===========================================================================
@@ -646,8 +649,11 @@ void drawAirfoilPanel(UIContext& ctx) {
 
 /// @brief Draw the parameter widgets for one VG entry; returns true when a
 /// sim-affecting edit was committed this frame.
-bool drawVGEntry(VGParams& vg, int chordCells) {
+/// @param xcMin  Lower x/c bound for the Station slider (user-configured range).
+/// @param xcMax  Upper x/c bound for the Station slider.
+bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
     bool edited = false;
+
     // Type combo — discrete, commits immediately.
     static const char* kTypeNames[] = {"Single vane", "Counter-rotating pair",
                                        "Co-rotating array", "Ramp"};
@@ -657,34 +663,79 @@ bool drawVGEntry(VGParams& vg, int chordCells) {
         edited = true;
     }
 
-    // Continuous params: commit on release only (plan 13 slider rule).
+    // Helper: slider that fires on release, followed by a tooltip marker.
     auto releaseSlider = [&edited](const char* label, float* v, float lo,
-                                   float hi, const char* fmt) {
+                                   float hi, const char* fmt,
+                                   const char* tooltip) {
         ImGui::SliderFloat(label, v, lo, hi, fmt);
         if (ImGui::IsItemDeactivatedAfterEdit()) edited = true;
+        ImGui::SameLine();
+        helpMarker(tooltip);
     };
-    releaseSlider("Station x/c", &vg.x_c, 0.01f, 0.40f, "%.3f");
-    releaseSlider("Height h/c", &vg.height_c, 0.002f, 0.030f, "%.4f");
-    releaseSlider("Length (h)", &vg.length_h, 1.0f, 6.0f, "%.1f");
-    releaseSlider("Incidence", &vg.beta_deg, -30.0f, 30.0f, "%.1f deg");
+
+    // Station x/c slider uses the user-configured chord range.
+    // Clamp the current value into the allowed range first so it can't
+    // sit outside the window when the range is tightened.
+    vg.x_c = std::clamp(vg.x_c, xcMin, xcMax);
+    releaseSlider("Station x/c", &vg.x_c, xcMin, xcMax, "%.3f",
+                  "Chordwise position of the VG leading edge as a fraction of "
+                  "chord (0 = leading edge, 1 = trailing edge). Lin (2002) "
+                  "recommends placing VGs 5–10 device heights upstream of the "
+                  "separation onset shown in the Guidance panel. "
+                  "The allowed range is set by the Min/Max controls above.");
+
+    releaseSlider("Height h/c", &vg.height_c, 0.002f, 0.030f, "%.4f",
+                  "VG device height as a fraction of chord. "
+                  "h sets the length of the streamwise vortex — taller vanes "
+                  "energise deeper into the boundary layer but add more drag. "
+                  "Lin (2002) nominal: h ~ delta99 at the placement station "
+                  "(shown in the Guidance panel). Typical range: 0.005–0.020 c.");
+
+    releaseSlider("Length (h)", &vg.length_h, 1.0f, 6.0f, "%.1f",
+                  "Vane chord length expressed as multiples of device height h. "
+                  "Longer vanes generate stronger vortices but increase drag. "
+                  "Strausak flight-proven value: 3 h. Typical range: 2–4 h.");
+
+    releaseSlider("Incidence", &vg.beta_deg, -30.0f, 30.0f, "%.1f deg",
+                  "Vane incidence angle relative to the freestream [degrees]. "
+                  "Positive = swept toward +z (right). Counter-rotating pairs "
+                  "use +/- symmetric angles. Strausak: ~16 deg. "
+                  "Higher angles produce stronger vortices with more drag penalty.");
+
     const bool multiUnit = (vg.type == VGType::CounterRotatingPair
                             || vg.type == VGType::CoRotatingArray);
     if (multiUnit) {
-        releaseSlider("Pitch (c)", &vg.pitch_c, 0.01f, 0.20f, "%.3f");
+        releaseSlider("Pitch (c)", &vg.pitch_c, 0.01f, 0.20f, "%.3f",
+                      "Spanwise spacing between adjacent VG units as a fraction "
+                      "of chord. Tighter pitches give more uniform spanwise "
+                      "re-energisation; too tight and vortices merge. "
+                      "Typical: 3–6 h (expressed here in chord units).");
     }
     if (vg.type == VGType::CounterRotatingPair) {
-        releaseSlider("Gap (h)", &vg.gap_h, 1.0f, 6.0f, "%.1f");
+        releaseSlider("Gap (h)", &vg.gap_h, 1.0f, 6.0f, "%.1f",
+                      "Lateral gap between the two vanes in a counter-rotating "
+                      "pair, in multiples of h. Controls the proximity of the "
+                      "two vortex cores. Strausak: ~2 h.");
         bool cfd = vg.commonFlowDown;
         if (ImGui::Checkbox("Common-flow-down", &cfd)) {
             vg.commonFlowDown = cfd;
             edited = true;
         }
+        ImGui::SameLine();
+        helpMarker("When checked the two vanes are angled so their common-flow "
+                   "region points DOWN toward the surface (common-flow-down / "
+                   "inboard-pointing arrangement). This is the typical high-lift "
+                   "configuration. Uncheck for common-flow-up.");
     }
     if (multiUnit) {
         int count = vg.count;
         if (ImGui::SliderInt("Units", &count, 1, 16)) { /* drag preview */ }
         if (ImGui::IsItemDeactivatedAfterEdit()) edited = true;
         vg.count = count;
+        ImGui::SameLine();
+        helpMarker("Number of VG units in the spanwise array. Each unit is one "
+                   "full device (or pair) separated by Pitch from its neighbour. "
+                   "The sim runs all units simultaneously.");
     }
 
     // Under-resolution guard (plan 6.1): warn instead of rendering noise.
@@ -716,7 +767,47 @@ void drawVGEditorPanel(UIContext& ctx) {
         return;
     }
 
-    ImGui::TextDisabled("Edits apply warm onto the live flow field.");
+    ImGui::TextDisabled("Each edit restarts the sim from cold.");
+
+    // --- Station x/c placement range controls --------------------------------
+    // Let the user restrict which chord region VGs can be placed in.  Editing
+    // the range immediately clamps any out-of-bounds VG stations and restarts.
+    ImGui::Separator();
+    ImGui::TextDisabled("Placement range (x/c %)");
+    helpMarker("Restricts the Station slider to a chord-percentage window.  "
+               "Useful when you know separation occurs in a specific band and "
+               "want to prevent accidental placement outside it.");
+    float xcMinPct = p.vgXcMin * 100.0f;
+    float xcMaxPct = p.vgXcMax * 100.0f;
+    ImGui::SetNextItemWidth(80.0f);
+    if (ImGui::InputFloat("Min %", &xcMinPct, 1.0f, 5.0f, "%.0f")) {
+        // Clamp and enforce min < max - 1%.
+        xcMinPct = std::clamp(xcMinPct, 0.5f, xcMaxPct - 1.0f);
+        p.vgXcMin = xcMinPct / 100.0f;
+        // Clamp any existing VG stations into the new range.
+        bool anyOutside = false;
+        for (auto& vg : p.vgs) {
+            const float prev = vg.x_c;
+            vg.x_c = std::clamp(vg.x_c, p.vgXcMin, p.vgXcMax);
+            if (vg.x_c != prev) anyOutside = true;
+        }
+        if (anyOutside) ev.vgEdited = true;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.0f);
+    if (ImGui::InputFloat("Max %", &xcMaxPct, 1.0f, 5.0f, "%.0f")) {
+        xcMaxPct = std::clamp(xcMaxPct, xcMinPct + 1.0f, 70.0f);
+        p.vgXcMax = xcMaxPct / 100.0f;
+        bool anyOutside = false;
+        for (auto& vg : p.vgs) {
+            const float prev = vg.x_c;
+            vg.x_c = std::clamp(vg.x_c, p.vgXcMin, p.vgXcMax);
+            if (vg.x_c != prev) anyOutside = true;
+        }
+        if (anyOutside) ev.vgEdited = true;
+    }
+    ImGui::Separator();
+
     if (ImGui::Button("+ Add VG")) {
         p.vgs.push_back(defaultVGParams());
         p.selectedVG = static_cast<int>(p.vgs.size()) - 1;
@@ -746,7 +837,7 @@ void drawVGEditorPanel(UIContext& ctx) {
         if (ImGui::IsItemClicked()) p.selectedVG = i; // guidance panel anchor
         if (open) {
             ImGui::Indent();
-            if (drawVGEntry(p.vgs[static_cast<size_t>(i)], chordCells)) {
+            if (drawVGEntry(p.vgs[static_cast<size_t>(i)], chordCells, p.vgXcMin, p.vgXcMax)) {
                 p.selectedVG = i;
                 ev.vgEdited = true;
             }
@@ -1046,14 +1137,50 @@ void drawReadoutsPanel(UIContext& ctx) {
         ImGui::ProgressBar(frac, ImVec2(-1, 0), "");
     } else {
         // Smoothed display values so the numbers glide rather than flicker.
-        const float cl = smoothValue(ImGui::GetID("cl"), r.forces.cl);
-        const float cd = smoothValue(ImGui::GetID("cd"), r.forces.cd);
-        const float ld = smoothValue(ImGui::GetID("ld"), r.forces.liftToDrag);
-        // Large-type readout: 2x font scale on the three hero numbers.
+        const float cl  = smoothValue(ImGui::GetID("cl"),  r.forces.cl);
+        const float cd  = smoothValue(ImGui::GetID("cd"),  r.forces.cd);
+        const float ld  = smoothValue(ImGui::GetID("ld"),  r.forces.liftToDrag);
+        const float cla = smoothValue(ImGui::GetID("cla"), r.forces.clAvg);
+        const float cda = smoothValue(ImGui::GetID("cda"), r.forces.cdAvg);
+
+        // Large-type readout: 1.6x font scale on the three hero numbers.
         ImGui::SetWindowFontScale(1.6f);
         ImGui::Text("Cl  %+.4f", cl);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine();
+        helpMarker("Lift coefficient: dimensionless vertical force normalised by "
+                   "0.5 * rho * V^2 * chord * span. Positive = upward lift. "
+                   "This is the live EMA — compare VG-on vs VG-off deltas; "
+                   "absolute values carry LBM fidelity uncertainty.");
+
+        ImGui::SetWindowFontScale(1.6f);
         ImGui::Text("Cd  %.5f", cd);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine();
+        helpMarker("Drag coefficient: dimensionless streamwise force normalised "
+                   "by 0.5 * rho * V^2 * chord * span. Includes pressure drag "
+                   "and resolved skin friction at this grid resolution. "
+                   "Use deltas (VG-on minus VG-off) for engineering guidance.");
+
+        ImGui::SetWindowFontScale(1.6f);
         ImGui::Text("L/D %.2f", ld);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::SameLine();
+        helpMarker("Lift-to-drag ratio: Cl / Cd. Higher is more aerodynamically "
+                   "efficient. A VG that raises L/D means it recovered more lift "
+                   "than it added drag — the key homebuilder metric.");
+
+        // --- Trailing averages over the last 1.0 flow-through ---
+        // These settle faster than the EMA and show the mean over a physically
+        // complete cycle, giving a cleaner comparison point across restarts.
+        ImGui::Spacing();
+        ImGui::TextDisabled("2-flow-through avg");
+        helpMarker("Mean Cl and Cd computed over the most recent 2 complete "
+                   "flow-throughs (2 x domain length / freestream speed). "
+                   "Less noisy than the live EMA for comparing runs.");
+        ImGui::SetWindowFontScale(1.3f);
+        ImGui::Text("Cl(a) %+.4f", cla);
+        ImGui::Text("Cd(a) %.5f",  cda);
         ImGui::SetWindowFontScale(1.0f);
     }
 
@@ -1103,6 +1230,9 @@ void drawReadoutsPanel(UIContext& ctx) {
     } else {
         ImGui::TextDisabled("ETA      --");
     }
+
+    // Frame rate: ImGui tracks a smoothed FPS from its own delta-time EMA.
+    ImGui::Text("FPS      %.0f", ImGui::GetIO().Framerate);
 
     ImGui::End();
 }
@@ -1255,6 +1385,292 @@ void drawViewPanel(UIContext& ctx) {
     ImGui::Spacing();
     ImGui::Separator();
     if (ImGui::Button("Screenshot (PNG)", ImVec2(-1, 0))) ev.screenshot = true;
+    ImGui::End();
+}
+
+// ===========================================================================
+// Panel: Mesh Refinement — non-uniform coordinate stretching.
+//
+// The LBM solver uses a uniform logical grid; this panel configures a tanh-
+// based coordinate map that packs more cells into aerodynamically critical
+// regions (leading edge, suction-surface BL, VG zone, near wake) without
+// changing the cell count or VRAM budget. Four presets cover most use cases;
+// Custom unlocks all seven zone-weight sliders. A live domain diagram
+// (drawn with ImDrawList) shows the relative cell density across the domain
+// so the user can see the stretching effect before committing.
+// ===========================================================================
+
+/// @brief Draw a mini top-view of the stretched domain density map using
+/// ImDrawList. The domain is shown as a horizontal bar; darker fill indicates
+/// higher cell density (more refinement). The foil silhouette is overlaid as
+/// a simple teardrop outline for reference.
+static void drawDomainDiagram(const MeshRefinementParams& params,
+                               const ImVec2& canvasPos, const ImVec2& canvasSize) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const float W  = canvasSize.x;
+    const float H  = canvasSize.y;
+    const float px = canvasPos.x;
+    const float py = canvasPos.y;
+
+    // Background frame.
+    dl->AddRectFilled(ImVec2(px, py), ImVec2(px + W, py + H),
+                      IM_COL32(18, 20, 25, 255), 4.0f);
+    dl->AddRect(ImVec2(px, py), ImVec2(px + W, py + H),
+                IM_COL32(50, 55, 65, 200), 4.0f);
+
+    if (params.preset == MeshRefinementPreset::Off) {
+        // Uniform density — single mid-grey fill, label.
+        dl->AddRectFilled(ImVec2(px + 2, py + 2),
+                          ImVec2(px + W - 2, py + H - 2),
+                          IM_COL32(55, 60, 72, 200), 3.0f);
+        const char* lbl = "Uniform (Off)";
+        const ImVec2 ts  = ImGui::CalcTextSize(lbl);
+        dl->AddText(ImVec2(px + (W - ts.x) * 0.5f, py + (H - ts.y) * 0.5f),
+                    IM_COL32(120, 125, 135, 200), lbl);
+        return;
+    }
+
+    // Approximate domain proportions: foil at 30% from left, chord = 33% of W.
+    const float domChord = W * 0.33f;
+    const float domAncX  = W * 0.30f; // quarter-chord x in diagram space
+
+    // Zone layout mirrors GridStretch::build() proportions.
+    const float leStart  = domAncX - 0.05f * domChord;
+    const float leEnd    = domAncX + 0.15f * domChord;
+    const float nuStart  = domAncX - 0.80f * domChord;
+    const float wakeNear = domAncX + 0.75f * domChord;
+    const float wakeFar  = domAncX + 1.50f * domChord;
+    const float vgCtr    = domAncX + (params.vgZoneXc - 0.25f) * domChord;
+    const float vgHalf   = params.vgZoneHalfWidth * domChord;
+    const float vgStart  = vgCtr - vgHalf;
+    const float vgEnd    = vgCtr + vgHalf;
+    const float trans    = 0.04f * domChord;
+
+    // For each pixel column, compute an approximate density weight.
+    const float* w = params.zoneWeight;
+    const int    nCols = static_cast<int>(W - 4);
+
+    auto smoothStep = [](float x) -> float {
+        x = std::clamp(x, 0.0f, 1.0f);
+        return x * x * (3.0f - 2.0f * x);
+    };
+    auto blendW = [&](float x, float s, float e, float wi, float wo) {
+        const float t0 = smoothStep((x - s) / trans);
+        const float t1 = smoothStep((e - x) / trans);
+        return wo + (wi - wo) * std::min(t0, t1);
+    };
+
+    // Find the max weight to normalise the colour brightness.
+    float maxW = 0.01f;
+    for (int k = 0; k < kNumMeshZones; ++k)
+        maxW = std::max(maxW, w[k]);
+
+    for (int col = 0; col < nCols; ++col) {
+        const float xDiag  = static_cast<float>(col) + 2.0f;
+        const float x      = xDiag; // diagram x == domain fraction
+
+        float weight = (x < nuStart) ? w[0] : w[6];
+        weight = blendW(x, nuStart, leStart, w[1], weight);
+        weight = blendW(x, leStart, leEnd,   w[2], weight);
+        weight = blendW(x, wakeNear, wakeFar, w[5], weight);
+        if (x > vgStart - trans && x < vgEnd + trans) {
+            const float vw = blendW(x, vgStart, vgEnd, w[4], weight);
+            weight = std::max(weight, vw);
+        }
+        weight = std::max(0.01f, weight);
+
+        // Map weight to a blue-accent colour: low density = dark, high = bright.
+        const float t = std::clamp(weight / maxW, 0.0f, 1.0f);
+        const ImU32 col32 = IM_COL32(
+            static_cast<int>(20  + t * 40),
+            static_cast<int>(60  + t * 100),
+            static_cast<int>(120 + t * 120),
+            static_cast<int>(140 + t * 100));
+        dl->AddLine(ImVec2(px + xDiag, py + 2),
+                    ImVec2(px + xDiag, py + H - 2),
+                    col32, 1.0f);
+    }
+
+    // Foil silhouette: simple ellipse-ish teardrop outline as a visual anchor.
+    {
+        const float foilX0 = px + domAncX - 0.25f * domChord; // LE x
+        const float foilX1 = px + domAncX + 0.75f * domChord; // TE x
+        const float foilMY = py + H * 0.5f;
+        const float camber = H * 0.08f;   // camber offset (upward)
+        const float thick  = H * 0.13f;   // max half-thickness
+
+        const int segs = 32;
+        std::vector<ImVec2> upper, lower;
+        upper.reserve(segs + 1);
+        lower.reserve(segs + 1);
+        for (int s = 0; s <= segs; ++s) {
+            const float t   = static_cast<float>(s) / static_cast<float>(segs);
+            const float xpt = foilX0 + t * (foilX1 - foilX0);
+            // NACA-like thickness distribution (simplified).
+            const float tck = thick * std::sqrt(t) * (1.0f - t) * 2.5f;
+            const float cam = camber * (4.0f * t * (1.0f - t));
+            upper.push_back(ImVec2(xpt, foilMY - cam - tck));
+            lower.push_back(ImVec2(xpt, foilMY - cam + tck));
+        }
+        dl->AddPolyline(upper.data(), segs + 1, IM_COL32(230, 80, 80, 200), 0, 1.5f);
+        dl->AddPolyline(lower.data(), segs + 1, IM_COL32(230, 80, 80, 200), 0, 1.5f);
+    }
+
+    // VG zone indicator: thin vertical band marker with label.
+    {
+        const float vgX0 = px + vgStart;
+        const float vgX1 = px + vgEnd;
+        dl->AddRectFilled(ImVec2(vgX0, py + 2), ImVec2(vgX1, py + H - 2),
+                          IM_COL32(255, 200, 60, 30));
+        dl->AddRect(ImVec2(vgX0, py + 2), ImVec2(vgX1, py + H - 2),
+                    IM_COL32(255, 200, 60, 140), 1.0f);
+    }
+
+    // Zone boundary tick marks.
+    const float tickCol = IM_COL32(90, 95, 110, 180);
+    auto tick = [&](float xAbs) {
+        if (xAbs < 0 || xAbs > W) return;
+        const float sx = px + xAbs;
+        dl->AddLine(ImVec2(sx, py + H - 8), ImVec2(sx, py + H - 2), tickCol, 1.0f);
+    };
+    tick(nuStart); tick(leStart); tick(leEnd);
+    tick(wakeNear); tick(wakeFar);
+}
+
+/// @brief Draw the Mesh Refinement panel.
+void drawMeshPanel(UIContext& ctx) {
+    UIParams&  p  = *ctx.params;
+    UIEvents&  ev = *ctx.events;
+    MeshRefinementParams& mr = p.meshRefinement;
+
+    if (!ImGui::Begin("Mesh")) { ImGui::End(); return; }
+
+    ImGui::TextDisabled("MESH REFINEMENT");
+    helpMarker(
+        "Non-uniform coordinate stretching packs more logical cells into "
+        "aerodynamically critical regions — the leading edge, suction-surface "
+        "boundary layer, VG zone, and near wake — without increasing the "
+        "total cell count or VRAM. The solver runs on the same uniform logical "
+        "grid; only the physical spacing distribution changes. Stretching "
+        "introduces a metric correction of order (ratio-1)*Ma^2, which is "
+        "within the existing LBM compressibility error for ratios up to ~8:1.");
+
+    // ---- Preset selector ----
+    ImGui::Spacing();
+    static const char* kPresetNames[] = {
+        "Off  (uniform grid)",
+        "Balanced  (2x LE, 4x VG)",
+        "Aggressive  (4x LE, 8x VG)",
+        "Custom"
+    };
+    int presetIdx = static_cast<int>(mr.preset);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##meshpreset", &presetIdx, kPresetNames, 4)) {
+        const auto newPreset = static_cast<MeshRefinementPreset>(presetIdx);
+        // Apply canonical weights when switching to a named preset.
+        if (newPreset != MeshRefinementPreset::Custom || mr.preset == MeshRefinementPreset::Off) {
+            mr.applyPreset(newPreset);
+        } else {
+            mr.preset = newPreset; // Custom: keep existing weights
+        }
+        ev.meshRefinementChanged = true;
+    }
+
+    // ---- Live domain diagram ----
+    ImGui::Spacing();
+    {
+        const ImVec2 cpos = ImGui::GetCursorScreenPos();
+        // Reserve a fixed-height canvas; width fills the panel.
+        const float W = ImGui::GetContentRegionAvail().x;
+        constexpr float H = 56.0f;
+        drawDomainDiagram(mr, cpos, ImVec2(W, H));
+        // Advance the cursor past the canvas so subsequent widgets flow below.
+        ImGui::Dummy(ImVec2(W, H));
+    }
+    ImGui::TextDisabled("darker = coarser  |  brighter = finer  |  red = foil  |  yellow = VG zone");
+
+    if (mr.preset == MeshRefinementPreset::Off) {
+        ImGui::End();
+        return;
+    }
+
+    // ---- VG zone tracking ----
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("VG ZONE");
+    {
+        bool autoTrack = mr.autoTrackVGs;
+        if (ImGui::Checkbox("Auto-track VG stations", &autoTrack)) {
+            mr.autoTrackVGs = autoTrack;
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker(
+            "When enabled, the VG refinement zone centre follows the first "
+            "VG station automatically. Disable to position it manually.");
+
+        ImGui::BeginDisabled(mr.autoTrackVGs);
+        float vgPct = mr.vgZoneXc * 100.0f;
+        ImGui::SliderFloat("Zone centre (x/c %)", &vgPct, 1.0f, 70.0f, "%.1f%%");
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            mr.vgZoneXc = vgPct / 100.0f;
+            ev.meshRefinementChanged = true;
+        }
+        ImGui::EndDisabled();
+
+        float hwPct = mr.vgZoneHalfWidth * 100.0f;
+        ImGui::SliderFloat("Zone half-width (x/c %)", &hwPct, 1.0f, 20.0f, "%.1f%%");
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            mr.vgZoneHalfWidth = hwPct / 100.0f;
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("Physical half-width of the VG ultra-refinement band in "
+                   "chord fractions. Wider = more cells around the vane roots "
+                   "and shed vortex path.");
+    }
+
+    // ---- Custom zone weight sliders (Custom mode only) ----
+    if (mr.preset == MeshRefinementPreset::Custom) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextDisabled("ZONE WEIGHTS  (1.0 = neutral)");
+        helpMarker(
+            "Relative cell density per zone. 2.0 = twice as many cells per "
+            "metre in that region. The total cell count stays constant — "
+            "finer zones borrow from coarser ones automatically.");
+
+        // Zone names and their indices in zoneWeight[].
+        static const char* kZoneLabels[kNumMeshZones] = {
+            "Far upstream",
+            "Near upstream",
+            "Leading edge",
+            "Top surface BL",
+            "VG zone (ultra)",
+            "Near wake",
+            "Far wake",
+        };
+        // Accent colour for the VG zone slider to visually distinguish it.
+        bool changed = false;
+        for (int i = 0; i < kNumMeshZones; ++i) {
+            const bool isVG = (i == static_cast<int>(MeshZone::VGZone));
+            if (isVG) ImGui::PushStyleColor(ImGuiCol_SliderGrab,
+                                            ImVec4(0.95f, 0.78f, 0.20f, 1.0f));
+            ImGui::PushID(i);
+            ImGui::SliderFloat(kZoneLabels[i], &mr.zoneWeight[i], 0.1f, 10.0f,
+                               "%.2f", ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            ImGui::PopID();
+            if (isVG) ImGui::PopStyleColor();
+        }
+        if (changed) ev.meshRefinementChanged = true;
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    // Note that stretching changes the voxelization but NOT the cell count
+    // or VRAM — the UI should make this clear.
+    ImGui::TextDisabled("Cell count / VRAM unchanged by stretching.");
+
     ImGui::End();
 }
 
@@ -1592,6 +2008,7 @@ void drawUI(UIContext& ctx) {
     drawSimPanel(ctx);
     drawReadoutsPanel(ctx);
     drawViewPanel(ctx);
+    drawMeshPanel(ctx);
     drawStlImportModal(ctx);
     drawDivergenceModal(ctx);
     drawVelocityLegend(ctx);

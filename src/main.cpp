@@ -32,6 +32,7 @@
 #include "geom/voxelizer_stl.cuh"
 #include "platform/platform.h"
 #include "render/viz.h"
+#include "sim/grid_stretch.h"
 #include "sim/lbm_solver.h"
 #include "sim/units.h"
 
@@ -94,6 +95,7 @@ struct App {
     std::string geometryId;              ///< "naca:..", "dat:..", "stl:<hash>".
     std::vector<std::uint8_t> cleanFlags;  ///< Clean foil (no VGs) at current AoA.
     std::vector<std::uint8_t> activeFlags; ///< cleanFlags OR VG voxels = live flags.
+    GridStretch stretch;                 ///< Active coordinate map (identity when Off).
 
     // NOTE: the plan-8 snapshot warm-start cache (VRAM clean slot + disk LRU)
     // was removed: its capture path could freeze the session right as the
@@ -423,12 +425,37 @@ bool resolveAirfoil(App& app, std::string* error) {
     return true;
 }
 
+/// Rebuild the GridStretch coordinate map from the current mesh refinement
+/// parameters and domain layout. Called whenever the grid or refinement
+/// settings change; cheap (CPU-only, O(nx+ny) arithmetic).
+void rebuildStretch(App& app) {
+    app.stretch = GridStretch::build(
+        app.params.meshRefinement,
+        app.layout.dims,
+        app.layout.foilAnchorXFrac,
+        app.layout.foilAnchorYFrac,
+        app.layout.chordCells);
+}
+
+/// Auto-update the VG zone centre from the first VG station when tracking
+/// is enabled (called before any flag rebuild so the stretch is current).
+void syncVGZoneToEditor(App& app) {
+    MeshRefinementParams& mr = app.params.meshRefinement;
+    if (!mr.autoTrackVGs || app.params.vgs.empty()) return;
+    // Use the first VG station as the zone centre.
+    mr.vgZoneXc = std::clamp(app.params.vgs[0].x_c, 0.01f, 0.99f);
+}
+
 /// Rebuild clean + active flag fields for the current airfoil/AoA/VG state.
 /// The clean field is kept separately so VG slider ticks never repeat the
-/// O(nx*ny) airfoil parity tests (plan 6.2).
+/// O(nx*ny) airfoil parity tests (plan 6.2). Passes the active GridStretch
+/// so geometry stamps at the correct physical location under any stretching.
 void rebuildFlagFields(App& app) {
+    syncVGZoneToEditor(app);
+    rebuildStretch(app);
+    const GridStretch* gs = app.stretch.isActive() ? &app.stretch : nullptr;
     app.cleanFlags = buildCleanFoilFlags(app.airfoil, app.params.aoaDeg,
-                                         app.layout);
+                                         app.layout, gs);
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
@@ -611,20 +638,20 @@ void tryLoadDefaultAirfoil(App& app) {
 }
 
 // ===========================================================================
-// Snapshot capture (plan 8): the VRAM clean slot for instant VG restarts and
-// the compact disk variant persisted on a worker thread.
+// VG geometry application.
 // ===========================================================================
 
-/// VG edit flow (plan 6.2): apply the edited flags warm onto the live field —
-/// correct everywhere except near the edited vanes, which is exactly where
-/// the solver re-converges first. (The snapshot-restore fast path went with
-/// the cache removal; warm flag application alone keeps VG edits cheap.)
+/// VG edit: rebuild the flag field and perform a full cold restart so the
+/// force history is clean and not contaminated by the pre-edit flow state.
 void applyVGEdit(App& app) {
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
                             app.layout, app.cleanFlags);
-    app.solver.applyEditedFlags(app.activeFlags);
+    // Cold restart — VG geometry changes the flow field enough that continuing
+    // from the old state produces misleading force transients.
+    app.solver.setFlags(app.activeFlags);
+    app.solver.setSurfaceReference(app.cleanFlags);
     app.viz.uploadGeometry(app.airfoil, app.params.vgs, app.params.aoaDeg,
                            app.layout);
 }
@@ -957,12 +984,30 @@ void applyEvents(App& app) {
         }
     }
 
-    // ---- VG edits: ALWAYS warm (plan 6.2) ----
+    // ---- VG edits: cold restart (VG geometry changes invalidate the field) ----
     if (ev.vgEdited && !app.stlActive) {
         applyVGEdit(app);
         char msg[64];
-        std::snprintf(msg, sizeof msg, "VG edit applied (%d VG entries)",
+        std::snprintf(msg, sizeof msg, "VG edit — cold restart (%d VG entries)",
                       static_cast<int>(app.params.vgs.size()));
+        logLine(msg);
+    }
+
+    // ---- Mesh refinement changes: rebuild stretch + re-voxelize + cold restart.
+    // The stretch only affects the coordinate map used during voxelization;
+    // the solver grid is unchanged, so no VRAM realloc is needed.
+    if (ev.meshRefinementChanged && !app.stlActive) {
+        applyGeometryCold(app);
+        const char* presetName = "custom";
+        switch (app.params.meshRefinement.preset) {
+            case MeshRefinementPreset::Off:        presetName = "off (uniform)"; break;
+            case MeshRefinementPreset::Balanced:   presetName = "balanced"; break;
+            case MeshRefinementPreset::Aggressive: presetName = "aggressive"; break;
+            case MeshRefinementPreset::Custom:     presetName = "custom"; break;
+        }
+        char msg[80];
+        std::snprintf(msg, sizeof msg, "mesh refinement -> %s (sim restarted)",
+                      presetName);
         logLine(msg);
     }
 

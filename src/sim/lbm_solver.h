@@ -31,6 +31,11 @@ struct ForceReadout {
     bool  valid = false;      ///< False until kForceGateFlowThroughs completed
                               ///< since the last cold start (UI greys readout).
     float flowThroughs = 0.0f;///< Flow-throughs completed since last cold start.
+
+    /// Average Cl/Cd over the most recent 1.0 flow-through window.
+    /// Only valid when valid == true; zero otherwise.
+    float clAvg = 0.0f;
+    float cdAvg = 0.0f;
 };
 
 /// @brief One station of the suction-surface boundary-layer profile used by
@@ -56,8 +61,8 @@ struct SolverPerfStats {
 /// @brief Host orchestrator for the D3Q19 TRT-Smagorinsky solver.
 ///
 /// Lifecycle: construct -> init() -> [reset()] -> stepN() in the frame loop.
-/// Geometry edits flow through setFlags() (full cold restart) or
-/// applyEditedFlags() (warm restart from a snapshot-restored field, plan §8).
+/// All geometry edits (airfoil, AoA, VG add/remove/move) flow through
+/// setFlags() which always does a full cold restart.
 /// All GPU work runs on the single stream passed to init (plan 9.3).
 class LBMSolver {
 public:
@@ -91,16 +96,14 @@ public:
     /// step counter, and invalidate the force EMA gate.
     void reset();
 
-    /// @brief Replace the flag field and cold-restart (airfoil/AoA changes).
-    /// For VG edits prefer snapshot restore + applyEditedFlags() (plan 6.2).
+    /// @brief Replace the flag field and cold-restart.
+    /// Used for all geometry changes: airfoil, AoA, and VG edits.
     /// @param flags New host flag field (must match init dims).
     void setFlags(const std::vector<std::uint8_t>& flags);
 
-    /// @brief Warm-restart flag swap (plan section 8): assumes the f field was
-    /// just restored from a clean-foil snapshot. Uploads the new flags, zeroes
-    /// populations in newly-SOLID cells, fills newly-FLUID cells with the
-    /// equilibrium of their fluid neighbors, restarts the force gate, and
-    /// skips the viscosity ramp (the field is already developed).
+    /// @brief Internal warm-restart flag swap (kept for potential snapshot
+    /// restore flows). External callers should use setFlags() for a clean cold
+    /// restart; this path skips the viscosity ramp and may produce transients.
     /// @param flags New host flag field (clean foil mask OR'd with VG voxels).
     void applyEditedFlags(const std::vector<std::uint8_t>& flags);
 
@@ -134,11 +137,10 @@ public:
 
     // ------ readouts ------
 
-    /// @brief EMA-smoothed Cl/Cd/L-over-D. `valid` stays false until
-    /// kForceGateFlowThroughs flow-throughs have completed since the last
-    /// cold start (warm restarts inherit a shorter gate — the field is mostly
-    /// converged already). EMA window comes from the active preset's
-    /// forceEmaFlowThroughs (units.h).
+    /// @brief EMA-smoothed Cl/Cd/L-over-D plus 1-flow-through trailing averages
+    /// (clAvg/cdAvg). `valid` stays false until kForceGateFlowThroughs
+    /// flow-throughs have completed since the last cold start.
+    /// EMA window comes from the active preset's forceEmaFlowThroughs (units.h).
     ForceReadout forces() const;
 
     /// @brief Extract the suction-surface boundary-layer thickness profile
@@ -230,7 +232,7 @@ public:
 
     /// @brief Host-side copy of the current flag field (unpadded, cellCount()
     /// bytes). Snapshot capture hashes this; the UI may inspect it. Valid
-    /// after init(); updated by setFlags()/applyEditedFlags().
+    /// after init(); updated by setFlags().
     const std::vector<std::uint8_t>& hostFlags() const;
 
     /// @brief Set the force EMA window in flow-through times (plan 4.4 /

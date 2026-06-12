@@ -13,6 +13,7 @@
 #include "../geom/stl.h"
 #include "../geom/vg.h"
 #include "../render/viz.h"
+#include "../sim/grid_stretch.h"
 #include "../sim/lbm_solver.h"
 #include "../sim/units.h"
 #include "aircraft_manifest.h"
@@ -102,8 +103,17 @@ struct UIParams {
     std::vector<VGParams> vgs;             ///< Add/duplicate/delete list.
     int selectedVG = -1;                   ///< Entry the guidance panel anchors to.
 
+    /// Allowed x/c range for VG placement (clamped when sliders move).
+    /// Lets the user restrict VG stations to a sensible chord region, e.g.
+    /// 5–40 % by default. Exposed as percentage inputs in the VG editor header.
+    float vgXcMin = 0.01f;   ///< Lower bound, 0..1 (default 1 %).
+    float vgXcMax = 0.70f;   ///< Upper bound, 0..1 (default 70 %).
+
     // -- STL import (plan 7.2/7.4) --
     StlImportUI stlImport;                 ///< Modal state; mesh lives in main.cpp.
+
+    // -- mesh refinement panel --
+    MeshRefinementParams meshRefinement;   ///< Zone stretching parameters.
 
     // -- sim panel --
     bool running = true;                   ///< Run/pause.
@@ -174,7 +184,8 @@ struct UIEvents {
     bool stlImportConfirmed = false; ///< Modal "Import": voxelize the pending STL.
     bool stlImportCancelled = false; ///< Modal "Cancel": drop the pending STL.
     bool screenshot      = false; ///< Screenshot button -> Visualizer::screenshotPNG.
-    bool highFidelityToggled = false; ///< HiFi switch flipped -> re-init with preset.
+    bool highFidelityToggled     = false; ///< HiFi switch flipped -> re-init with preset.
+    bool meshRefinementChanged   = false; ///< Zone weights / preset changed -> rebuild stretch + cold restart.
     bool particleCountChanged = false; ///< Pool slider released -> resizeParticlePool.
     bool frameFoilView   = false; ///< "Focus foil" -> camera.frameRegion on the foil.
 

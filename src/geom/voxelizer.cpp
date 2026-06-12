@@ -10,6 +10,8 @@
 #include <cmath>
 #include <limits>
 
+// grid_stretch.h is included via voxelizer.h (it pulls in GridStretch).
+
 namespace foilcfd {
 namespace {
 
@@ -58,7 +60,8 @@ std::vector<std::uint8_t> buildBoundaryFlags(const GridDims& dims) {
 
 void voxelizeAirfoil(const AirfoilGeometry& airfoil, float aoa_deg,
                      const DomainLayout& layout,
-                     std::vector<std::uint8_t>& flags) {
+                     std::vector<std::uint8_t>& flags,
+                     const GridStretch* stretch) {
     if (!airfoil.isValid()) return;
     const GridDims& dims = layout.dims;
     if (dims.nx < 3 || dims.ny < 3 || dims.nz < 1) return;
@@ -68,6 +71,15 @@ void voxelizeAirfoil(const AirfoilGeometry& airfoil, float aoa_deg,
     // pitches the nose UP while the inflow stays axis-aligned (plan 4.2 —
     // rotating geometry instead of inflow keeps warm-cache keying simple).
     // Then scale chord units to cells and translate to the layout anchor.
+    //
+    // When a GridStretch is active, the anchor (ax, ay) is expressed in
+    // PHYSICAL cell units (the stretched coordinate). The rasterization
+    // scanline loop iterates over LOGICAL cell indices, so after computing
+    // the physical polygon we also need the physical -> logical inverse for
+    // the scanline Y loop bounds. The polygon crossing math stays in physical
+    // coordinates; the final (x,y) comparison is against the cell centre's
+    // PHYSICAL position (stretch->toPhysX(i)+0.5 etc.), which keeps the
+    // parity rule correct under stretching.
     const float aoaRad = aoa_deg * kPi / 180.0f;
     const float chord = static_cast<float>(layout.chordCells);
     const float ax = layout.anchorX();
@@ -77,55 +89,85 @@ void voxelizeAirfoil(const AirfoilGeometry& airfoil, float aoa_deg,
     const std::size_t n = airfoil.points.size();
     std::vector<Vec2f> poly;
     poly.reserve(n);
-    float minY = std::numeric_limits<float>::max();
-    float maxY = std::numeric_limits<float>::lowest();
+    float minYPhys = std::numeric_limits<float>::max();
+    float maxYPhys = std::numeric_limits<float>::lowest();
     for (const Vec2f& p : airfoil.points) {
         const Vec2f q = rotated(p - quarterChord, -aoaRad);
+        // Physical lattice coordinate: same formula as the uniform case.
+        // Under stretching, ax/ay are physical positions (fromPhys* inverts
+        // them to logical later); the polygon itself is in physical coords.
         const Vec2f lat(ax + q.x * chord, ay + q.y * chord);
-        minY = std::min(minY, lat.y);
-        maxY = std::max(maxY, lat.y);
+        minYPhys = std::min(minYPhys, lat.y);
+        maxYPhys = std::max(maxYPhys, lat.y);
         poly.push_back(lat);
     }
 
     // ---- Step 2: scanline parity rasterization of one (x,y) slice. --------
-    // For each lattice row, intersect the row's cell-center line y = y+0.5
-    // with every polygon edge; the strict half-open rule (a.y > yc) !=
-    // (b.y > yc) counts each vertex in exactly one of its two edges, so a
-    // closed loop always yields an even crossing count, and zero-length edges
-    // (duplicated closing TE point) contribute nothing. Cells whose centers
-    // fall between odd/even crossing pairs are inside — the parity test of
-    // plan 5.3, organized per row (O(rows * edges) instead of per cell).
-    const int y0 = std::clamp(static_cast<int>(std::floor(minY - 0.5f)), 1,
-                              dims.ny - 2);
-    const int y1 = std::clamp(static_cast<int>(std::ceil(maxY - 0.5f)), 1,
-                              dims.ny - 2);
+    // For each lattice row, intersect the row's cell-center line (in PHYSICAL
+    // coordinates) with every polygon edge; the strict half-open rule
+    // (a.y > yc) != (b.y > yc) counts each vertex in exactly one edge, so a
+    // closed loop yields an even crossing count.
+    //
+    // When a GridStretch is active, the polygon is in PHYSICAL space. For
+    // each logical row j we compute its physical centre (stretch->toPhysY(j)
+    // + half_cell_phys) and intersect; x crossings (physical) are inverted
+    // back to logical with fromPhysX. Without stretching both toPhys*
+    // return identity (float(index)), so the code path is identical.
+    //
+    // Y loop bounds derived from the physical polygon bbox mapped back to
+    // logical via fromPhysY (conservative: +/-1 cell margin).
+    int y0, y1;
+    if (stretch && stretch->isActive()) {
+        y0 = std::clamp(stretch->fromPhysY(minYPhys) - 1, 1, dims.ny - 2);
+        y1 = std::clamp(stretch->fromPhysY(maxYPhys) + 1, 1, dims.ny - 2);
+    } else {
+        y0 = std::clamp(static_cast<int>(std::floor(minYPhys - 0.5f)), 1, dims.ny - 2);
+        y1 = std::clamp(static_cast<int>(std::ceil (maxYPhys - 0.5f)), 1, dims.ny - 2);
+    }
+
     std::vector<std::uint8_t> mask(
         static_cast<std::size_t>(dims.nx) * static_cast<std::size_t>(dims.ny), 0);
     std::vector<float> crossings;
     crossings.reserve(8); // a simple foil section crosses each row 2-4 times
 
     for (int y = y0; y <= y1; ++y) {
-        const float yc = static_cast<float>(y) + 0.5f;
+        // Physical y of this logical row's cell centre.
+        float yc;
+        if (stretch && stretch->isActive()) {
+            // Physical centre = midpoint between physY[y] and physY[y+1].
+            yc = (stretch->toPhysY(y) + stretch->toPhysY(y + 1)) * 0.5f;
+        } else {
+            yc = static_cast<float>(y) + 0.5f;
+        }
+
         crossings.clear();
         for (std::size_t i = 0; i < n; ++i) {
             const Vec2f& pa = poly[i];
             const Vec2f& pb = poly[(i + 1) % n];
             if ((pa.y > yc) != (pb.y > yc)) {
-                // Edge straddles the row: record the x of the intersection.
+                // Edge straddles the row: record the physical x of the crossing.
                 const float t = (yc - pa.y) / (pb.y - pa.y);
                 crossings.push_back(pa.x + t * (pb.x - pa.x));
             }
         }
         std::sort(crossings.begin(), crossings.end());
-        // Fill between successive crossing pairs: cell centers x+0.5 strictly
-        // inside (cross[k], cross[k+1]) are interior by the parity rule.
+
+        // Fill between successive crossing pairs. With stretching, convert
+        // physical x crossings to logical cell indices via fromPhysX.
         const std::size_t rowBase = static_cast<std::size_t>(y)
                                   * static_cast<std::size_t>(dims.nx);
         for (std::size_t k = 0; k + 1 < crossings.size(); k += 2) {
-            const int xa = std::max(1, static_cast<int>(
-                                           std::ceil(crossings[k] - 0.5f)));
-            const int xb = std::min(dims.nx - 2, static_cast<int>(
-                                           std::floor(crossings[k + 1] - 0.5f)));
+            int xa, xb;
+            if (stretch && stretch->isActive()) {
+                // Convert physical crossing coords to logical cell indices.
+                xa = std::max(1, stretch->fromPhysX(crossings[k]));
+                xb = std::min(dims.nx - 2, stretch->fromPhysX(crossings[k + 1]));
+            } else {
+                xa = std::max(1, static_cast<int>(
+                                     std::ceil(crossings[k] - 0.5f)));
+                xb = std::min(dims.nx - 2, static_cast<int>(
+                                     std::floor(crossings[k + 1] - 0.5f)));
+            }
             for (int x = xa; x <= xb; ++x) mask[rowBase + x] = 1;
         }
     }
@@ -181,11 +223,12 @@ int closeTrailingEdgeGaps(const GridDims& dims,
 
 std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
                                               float aoa_deg,
-                                              const DomainLayout& layout) {
+                                              const DomainLayout& layout,
+                                              const GridStretch* stretch) {
     // Composition order matters: boundary faces first, foil solids OR'd over
     // fluid, TE closure last so it sees the final solid set (plan 5.3 / 13).
     std::vector<std::uint8_t> flags = buildBoundaryFlags(layout.dims);
-    voxelizeAirfoil(airfoil, aoa_deg, layout, flags);
+    voxelizeAirfoil(airfoil, aoa_deg, layout, flags, stretch);
     closeTrailingEdgeGaps(layout.dims, flags);
     return flags;
 }
