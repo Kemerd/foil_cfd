@@ -91,6 +91,7 @@ target_link_libraries(imgui_lib PUBLIC glfw)
 # ---------------------------------------------------------------------------
 add_executable(FoilCFD
     src/main.cpp
+    src/app/aircraft_manifest.cpp
     src/app/camera.cpp
     src/app/ui.cpp
     src/geom/airfoil.cpp
@@ -122,11 +123,11 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# Tests (CTest). Seven real tests: three host-only (units math, .dat parsing,
-# voxelizer parity) and four labelled "gpu" (cuda_smoke toolchain canary plus
-# the M0 Taylor-Green / M1 Ghia cavity / M2 cylinder-Strouhal physics
-# milestones, plan section 10). `ctest -LE gpu` skips the device-bound set on
-# machines without a CUDA card.
+# Tests (CTest). Eight real tests: four host-only (units math, .dat parsing,
+# voxelizer parity, aircraft manifest) and four labelled "gpu" (cuda_smoke
+# toolchain canary plus the M0 Taylor-Green / M1 Ghia cavity / M2 cylinder-
+# Strouhal physics milestones, plan section 10). `ctest -LE gpu` skips the
+# device-bound set on machines without a CUDA card.
 # ---------------------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests)

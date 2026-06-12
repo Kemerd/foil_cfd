@@ -15,6 +15,7 @@
 #include "../render/viz.h"
 #include "../sim/lbm_solver.h"
 #include "../sim/units.h"
+#include "aircraft_manifest.h"
 
 struct GLFWwindow; // forward-declared; only init/shutdown touch the window.
 
@@ -51,6 +52,11 @@ struct UIParams {
     std::string nacaDigits = "2412";       ///< NACA text box contents.
     int   selectedDatIndex = -1;           ///< Index into the scanned catalog.
     std::string airfoilFilter;             ///< Filter box over the ~1600-file catalog.
+    std::string aircraftFilter;            ///< Aircraft search box (manufacturer+model).
+    int   selectedAircraftIndex = -1;      ///< Manifest row highlighted in the
+                                           ///< Aircraft section (anchors the
+                                           ///< root/tip selector); reset by
+                                           ///< main.cpp on manifest reload.
     float aoaDeg = 4.0f;                   ///< AoA slider, -5..20 deg (plan 9.2).
     float airspeedMs = 30.0f;              ///< Physical airspeed [m/s].
     float chordM = 1.2f;                   ///< Physical chord [m].
@@ -139,6 +145,9 @@ struct UIContext {
     UIReadouts* readouts = nullptr; ///< Read-only display values.
     UIEvents*   events   = nullptr; ///< Raised by the panels this frame.
     const std::vector<AirfoilCatalogEntry>* airfoilCatalog = nullptr; ///< Dropdown contents.
+    const std::vector<AircraftEntry>* aircraftManifest = nullptr; ///< Plan 15.5
+                                    ///< Aircraft section rows (resolved +
+                                    ///< catalog-linked); null/empty hides it.
     std::string statusMessage;      ///< Transient status line (load errors etc.).
 };
 
@@ -155,7 +164,9 @@ void uiShutdown();
 void uiBeginFrame();
 
 /// @brief Draw every panel (plan 9.2): Airfoil (filtered catalog list + NACA
-/// box + Load STL + AoA/airspeed/resolution + High Fidelity), VG editor (list
+/// box + the plan-15.5 searchable Aircraft section that loads a plane's
+/// airfoil through the catalog path + Load STL + AoA/airspeed/resolution +
+/// High Fidelity), VG editor (list
 /// with section 6.1 params, add/duplicate/delete, under-resolution warnings),
 /// VG Guidance (sim-derived delta99 at the selected station, the Lin-2002
 /// recommended h band, Strausak flight-proven preset button — Mission

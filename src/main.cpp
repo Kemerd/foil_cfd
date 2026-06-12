@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "app/aircraft_manifest.h"
 #include "app/camera.h"
 #include "app/ui.h"
 #include "geom/airfoil.h"
@@ -86,6 +87,7 @@ struct App {
     AirfoilGeometry airfoil;
     DomainLayout layout;
     std::vector<AirfoilCatalogEntry> catalog;
+    AircraftManifest aircraft;           ///< Plan 15.5 aircraft -> airfoil rows.
     std::filesystem::path airfoilsDir;   ///< Scanned recursively (incl. uiuc/).
 
     // -- geometry/flag state the cache flow keys against (plan 8) --
@@ -285,6 +287,18 @@ std::filesystem::path findAirfoilsDirectory() {
         if (fs::is_directory(c, ec)) return fs::weakly_canonical(c, ec);
     }
     return exeDir / "airfoils"; // scan will just return empty
+}
+
+/// (Re)load the plan-15.5 aircraft manifest and link its resolved dat files
+/// into the current catalog. Called at startup and from the airfoil Rescan
+/// button (the CSV is user-editable, so refresh re-reads it) — always AFTER
+/// scanAirfoilDirectory, since the linkage maps onto catalog indices.
+void reloadAircraftManifest(App& app) {
+    app.aircraft = loadAircraftManifest(app.airfoilsDir);
+    linkManifestToCatalog(app.aircraft.entries, app.catalog);
+    // Manifest indices may have shifted across the reload; a stale selection
+    // would anchor the Aircraft section's root/tip selector to the wrong row.
+    app.params.selectedAircraftIndex = -1;
 }
 
 /// Geometry/cache id for a .dat file: "dat:" + the canonicalized FULL path
@@ -794,11 +808,14 @@ void applyEvents(App& app) {
     UIEvents& ev = app.events;
     std::string err;
 
-    // ---- catalog ----
+    // ---- catalog + aircraft manifest (plan 15.5: re-read on refresh) ----
     if (ev.refreshAirfoils) {
         app.catalog = scanAirfoilDirectory(app.airfoilsDir);
+        reloadAircraftManifest(app);
         setStatus(app, "scanned " + std::to_string(app.catalog.size())
-                           + " .dat files");
+                           + " .dat files, "
+                           + std::to_string(app.aircraft.entries.size())
+                           + " aircraft");
     }
 
     // ---- full re-init (grid dims change): resolution preset, HiFi, chord ----
@@ -1051,6 +1068,7 @@ int runInteractive(App& app) {
         ctx.readouts = &app.readouts;
         ctx.events = &app.events;
         ctx.airfoilCatalog = &app.catalog;
+        ctx.aircraftManifest = &app.aircraft.entries;
         ctx.statusMessage = app.status;
         drawUI(ctx);
         uiEndFrame();
@@ -1152,6 +1170,7 @@ int main(int argc, char** argv) {
     // (plan 8) — created first so even the first cold start can warm-restore.
     app.airfoilsDir = findAirfoilsDirectory();
     app.catalog = scanAirfoilDirectory(app.airfoilsDir);
+    reloadAircraftManifest(app); // plan 15.5: aircraft rows link into the catalog
     app.diskCache = std::make_unique<DiskSnapshotCache>(
         platform::executableDirectory() / "cache");
 

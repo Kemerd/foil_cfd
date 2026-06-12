@@ -1,6 +1,7 @@
 // ImGui panel implementation: backend init/teardown, the FoilCFD dark style,
-// the default docking layout, and every plan-9.2 panel (Airfoil / VG editor /
-// VG guidance / Sim / Readouts / View) plus the plan-7.2 STL import modal.
+// the default docking layout, and every plan-9.2 panel (Airfoil — including
+// the plan-15.5 searchable Aircraft section — / VG editor / VG guidance /
+// Sim / Readouts / View) plus the plan-7.2 STL import modal.
 // All edits land in UIParams; all sim-affecting actions raise UIEvents that
 // main.cpp applies after rendering — the panels never touch the solver.
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
@@ -149,6 +150,18 @@ bool matchesFilter(const std::string& haystack, const std::string& needle) {
     return h.find(n) != std::string::npos;
 }
 
+/// @brief Case-insensitive lexicographic less-than, used to sort the Aircraft
+/// list by manufacturer regardless of how the CSV capitalizes names.
+bool lessCaseInsensitive(const std::string& a, const std::string& b) {
+    const std::size_t n = std::min(a.size(), b.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const int ca = std::tolower(static_cast<unsigned char>(a[i]));
+        const int cb = std::tolower(static_cast<unsigned char>(b[i]));
+        if (ca != cb) return ca < cb;
+    }
+    return a.size() < b.size();
+}
+
 // ===========================================================================
 // Default docking layout (plan 9.2): edit panels on the left, status panels
 // on the right, the 3D scene visible through the passthrough central node.
@@ -228,6 +241,176 @@ void handleHotkeys(UIContext& ctx) {
     if (ImGui::IsKeyPressed(ImGuiKey_4, false)) p.viz.showFoilMesh  = !p.viz.showFoilMesh;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) p.running = !p.running;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) ctx.events->frameFoilView = true;
+}
+
+// ===========================================================================
+// Aircraft section (plan 15.5): a searchable manufacturer/model list mapping
+// popular aircraft to their wing sections. Selecting a row with on-disk
+// coordinates loads it through the EXACT same path as clicking the .dat list
+// (selectedDatIndex + reloadAirfoil) — loading logic lives in one place.
+// ===========================================================================
+
+/// @brief Commit one scanned-catalog entry exactly like clicking it in the
+/// .dat list box: same params, same event, same main.cpp handler.
+void selectCatalogEntry(UIParams& p, UIEvents& ev, int catalogIndex) {
+    p.selectedDatIndex = catalogIndex;
+    p.source = AirfoilSource::DatFile;
+    ev.reloadAirfoil = true;
+}
+
+void drawAircraftSection(UIContext& ctx) {
+    UIParams& p = *ctx.params;
+    UIEvents& ev = *ctx.events;
+
+    const bool open = ImGui::CollapsingHeader("Aircraft");
+    // Standing disclaimer ON THE HEADER (plan 15.5: same trust-deltas spirit
+    // as the Mission statement) — visible whether or not the list is open.
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+        ImGui::TextUnformatted("Manufacturers modify sections - verify "
+                               "against your actual wing before trusting.");
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+    if (!open) return;
+
+    if (!ctx.aircraftManifest || ctx.aircraftManifest->empty()) {
+        // Missing/empty manifest degrades to a pointer at the docs, never an
+        // error: the CSV is an optional, user-editable data file.
+        ImGui::TextDisabled("no aircraft manifest loaded —\n"
+                            "see airfoils/MANIFEST_README.md");
+        return;
+    }
+    const std::vector<AircraftEntry>& fleet = *ctx.aircraftManifest;
+
+    // ---- search box: case-insensitive substring over manufacturer+model ----
+    {
+        char abuf[64] = {};
+        std::snprintf(abuf, sizeof(abuf), "%s", p.aircraftFilter.c_str());
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##aircraftfilter", "search aircraft...",
+                                     abuf, sizeof(abuf))) {
+            p.aircraftFilter = abuf;
+        }
+    }
+
+    // Filter then stable-sort by manufacturer so the list reads as grouped
+    // blocks per maker (CSV row order preserved inside each block). 75 rows:
+    // rebuilding this every frame costs microseconds.
+    std::vector<int> rows;
+    rows.reserve(fleet.size());
+    for (int i = 0; i < static_cast<int>(fleet.size()); ++i) {
+        const AircraftEntry& e = fleet[static_cast<size_t>(i)];
+        if (matchesFilter(e.manufacturer + " " + e.model, p.aircraftFilter)) {
+            rows.push_back(i);
+        }
+    }
+    std::stable_sort(rows.begin(), rows.end(), [&fleet](int a, int b) {
+        return lessCaseInsensitive(fleet[static_cast<size_t>(a)].manufacturer,
+                                   fleet[static_cast<size_t>(b)].manufacturer);
+    });
+    ImGui::TextDisabled("%d / %d aircraft", static_cast<int>(rows.size()),
+                        static_cast<int>(fleet.size()));
+
+    ImGui::BeginChild("##aircraftlist",
+                      ImVec2(-1, 11.0f * ImGui::GetTextLineHeightWithSpacing()),
+                      ImGuiChildFlags_Borders);
+    const std::string* prevMaker = nullptr;
+    for (const int idx : rows) {
+        const AircraftEntry& e = fleet[static_cast<size_t>(idx)];
+        ImGui::PushID(idx);
+
+        // Manufacturer group header whenever the maker changes (the list is
+        // sorted, so each manufacturer appears exactly once).
+        if (!prevMaker || lessCaseInsensitive(*prevMaker, e.manufacturer)
+                       || lessCaseInsensitive(e.manufacturer, *prevMaker)) {
+            ImGui::TextColored(kColAccent, "%s", e.manufacturer.c_str());
+            prevMaker = &e.manufacturer;
+        }
+
+        // A row is loadable only when a resolved section is linked into the
+        // scanned catalog (the load path REQUIRES a catalog index). When root
+        // and tip link to DIFFERENT files, clicking arms the selector below
+        // instead of loading immediately (plan 15.5 root/tip toggle).
+        const bool loadable = e.catalogIndexRoot >= 0 || e.catalogIndexTip >= 0;
+        const bool needsChoice = e.catalogIndexRoot >= 0
+                              && e.catalogIndexTip >= 0
+                              && e.catalogIndexRoot != e.catalogIndexTip;
+        if (ImGui::Selectable(e.model.c_str(), p.selectedAircraftIndex == idx,
+                              loadable ? 0 : ImGuiSelectableFlags_Disabled)) {
+            p.selectedAircraftIndex = idx;
+            if (!needsChoice) {
+                // One section on disk (or root == tip): load it right away,
+                // preferring the root per the plan's "loads dat_root".
+                selectCatalogEntry(p, ev, e.catalogIndexRoot >= 0
+                                              ? e.catalogIndexRoot
+                                              : e.catalogIndexTip);
+            }
+        }
+        // Hover state captured NOW — the badge drawn next is its own item.
+        const bool hovered =
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+
+        // Category badge, right-aligned dim text on the selectable's row.
+        if (!e.category.empty()) {
+            const float w = ImGui::CalcTextSize(e.category.c_str()).x;
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - w
+                            - ImGui::GetStyle().FramePadding.x);
+            ImGui::TextDisabled("%s", e.category.c_str());
+        }
+
+        // Row tooltip: the documented sections plus the notes column.
+        if (hovered) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+            ImGui::Text("Root: %s", e.airfoilRoot.empty()
+                                        ? "(unknown)" : e.airfoilRoot.c_str());
+            if (!e.airfoilTip.empty() && e.airfoilTip != e.airfoilRoot) {
+                ImGui::Text("Tip:  %s", e.airfoilTip.c_str());
+            }
+            if (!e.notes.empty()) ImGui::TextDisabled("%s", e.notes.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+
+        if (!loadable) {
+            // Greyed row: surface WHY inline (the notes column), plus the
+            // nearest-section hint for the NACA 23013/23014 Van's RV fleet
+            // (23012 and 23015 bracket those half-designations on disk).
+            ImGui::Indent();
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%s", e.notes.empty()
+                                         ? "coordinates not in database"
+                                         : e.notes.c_str());
+            ImGui::PopStyleColor();
+            if (e.airfoilRoot.find("23013") != std::string::npos
+                || e.airfoilRoot.find("23014") != std::string::npos) {
+                ImGui::TextColored(kColAccent,
+                                   "closest in database: naca23012 / naca23015");
+            }
+            ImGui::Unindent();
+        } else if (p.selectedAircraftIndex == idx && needsChoice) {
+            // Root/tip selector: distinct sections at root and tip — the
+            // user picks WHICH station to simulate before anything loads.
+            ImGui::Indent();
+            ImGui::TextDisabled("root and tip differ — load which section?");
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "Root (%s)", e.datRoot.c_str());
+            if (ImGui::SmallButton(lbl)) {
+                selectCatalogEntry(p, ev, e.catalogIndexRoot);
+            }
+            ImGui::SameLine();
+            std::snprintf(lbl, sizeof(lbl), "Tip (%s)", e.datTip.c_str());
+            if (ImGui::SmallButton(lbl)) {
+                selectCatalogEntry(p, ev, e.catalogIndexTip);
+            }
+            ImGui::Unindent();
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
 }
 
 // ===========================================================================
@@ -319,6 +502,11 @@ void drawAirfoilPanel(UIContext& ctx) {
             ImGui::EndListBox();
         }
     }
+
+    // ---- Aircraft search (plan 15.5): pick the plane, get its airfoil ----
+    ImGui::Spacing();
+    drawAircraftSection(ctx);
+    ImGui::Spacing();
 
     if (ImGui::Button("Load STL...", ImVec2(-1, 0))) ev.loadStlRequested = true;
     helpMarker("Import a watertight solid (binary or ASCII STL, up to 2M "

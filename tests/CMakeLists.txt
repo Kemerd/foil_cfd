@@ -4,6 +4,8 @@
 #   test_units     - units.h scaling/round-trip/clamp/ramp contract
 #   test_airfoil   - .dat loader (Lednicer ls413 + Selig a18), NACA generator
 #   test_voxelizer - boundary flags, diamond parity voxelization, TE closure
+#   test_manifest  - aircraft_manifest.csv parse/resolve (plan 15.5), quoted
+#                    commas, malformed-row skip-with-reason
 # GPU tests (labeled "gpu" so CI-less machines exclude them: ctest -LE gpu):
 #   cuda_smoke      - toolchain canary (real kernel on the installed card)
 #   m0_taylor_green - 64^3 TG decay: monotone KE, no NaN over 50k steps
@@ -52,6 +54,18 @@ target_include_directories(test_voxelizer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_voxelizer PRIVATE CUDA::cudart)
 add_test(NAME test_voxelizer COMMAND test_voxelizer)
 
+# Aircraft manifest (plan 15.5): CSV parse + case-insensitive dat resolution
+# against the REAL airfoils/ tree, so the same path injection as test_airfoil.
+# aircraft_manifest.cpp only needs headers from geom/ and platform/ (both
+# inline at the symbols it uses), so no further module sources are linked.
+add_executable(test_manifest
+    test_manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/app/aircraft_manifest.cpp)
+target_include_directories(test_manifest PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_manifest PRIVATE
+    FOILCFD_AIRFOIL_DIR="${CMAKE_SOURCE_DIR}/airfoils")
+add_test(NAME test_manifest COMMAND test_manifest)
+
 # ---------------------------------------------------------------------------
 # GPU tests.
 # ---------------------------------------------------------------------------
@@ -75,7 +89,8 @@ set_tests_properties(cuda_smoke m0_taylor_green m1_cavity m2_cylinder
     PROPERTIES LABELS "gpu")
 
 # Per-test wall-clock budgets (seconds). M0 is specified < 3 min; M2 < 5 min.
-set_tests_properties(test_units test_airfoil test_voxelizer PROPERTIES TIMEOUT 60)
+set_tests_properties(test_units test_airfoil test_voxelizer test_manifest
+    PROPERTIES TIMEOUT 60)
 set_tests_properties(cuda_smoke PROPERTIES TIMEOUT 120)
 set_tests_properties(m0_taylor_green PROPERTIES TIMEOUT 180)
 set_tests_properties(m1_cavity PROPERTIES TIMEOUT 300)
