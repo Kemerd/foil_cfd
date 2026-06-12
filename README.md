@@ -78,10 +78,12 @@ FoilCFD closes that gap with an **iMEM slip-velocity wall function** (Asmuth et 
 see [docs/CITATIONS.md](docs/CITATIONS.md)): every surface cell continuously solves the
 Reichardt law of the wall for its local friction velocity and prescribes exactly the wall
 shear stress a real turbulent boundary layer would exert — on the stair-step voxel surface,
-on both grid levels of the refinement patch, with the modeled stress carried into the Cl/Cd
+on every grid level of the refinement patch, with the modeled stress carried into the Cl/Cd
 readouts. The 45° stair facets get true 45° normals. VG vanes keep exact no-slip walls (a
-vortex generator's job is to BE an obstacle). The Sim panel shows the live y+ telemetry so
-you always know what the model is doing.
+vortex generator's job is to BE an obstacle) — and get their *own* sub-cell surface
+treatment so the slanted edge isn't a staircase (see
+[Sub-cell vane surfaces](#sub-cell-vane-surfaces-the-vgs-get-special-treatment)). The Sim
+panel shows the live y+ telemetry so you always know what the model is doing.
 
 **As far as we can tell, nothing else publicly available does this in real time** — wall-
 modeled LBM-LES exists in cluster-class commercial codes (overnight turnaround, five-figure
@@ -178,6 +180,33 @@ boundary-layer thickness. Green means the voxelized vane sheds what real hardwar
 the placement deltas are worth believing; red means buy more resolution before trusting the
 number. No other VG tool tells you when it's guessing. This one does.
 
+### Sub-cell vane surfaces (the VGs get special treatment)
+
+A vortex generator is a thin slanted plate, and the whole point of it is the vortex its
+*edge* sheds. But a uniform lattice wants to chop that slanted edge into a Lego staircase —
+every cell is all-solid or all-fluid, so a 16°-yawed vane becomes a flight of voxel steps,
+and the shed vortex inherits the staircase. Throwing more cells at it (the
+[nested 4× patch](#mesh-refinement-nested-grids) below) makes the steps smaller but never
+makes them go away.
+
+So FoilCFD does something better, *only* for the vanes: **interpolated bounce-back**
+(q-LIBB, Bouzidi–Firdaouss–Lallemand 2001). When voxelizing a vane we keep its true analytic
+side-plane, and for every lattice link that crosses it we store the exact fraction `q ∈ [0,1]`
+of where the real surface cuts the link — then place the bounced-back wall at *that* sub-cell
+position instead of snapping it to the cell boundary. It's the fluid-dynamics version of the
+sub-pixel trick a font renderer uses to make smooth diagonals on a square pixel grid: the
+grid doesn't get finer, the *edge* just stops lying about where it is. The result is a
+second-order-accurate slanted wall on the same cells — a crisp vane face where there used to
+be a staircase.
+
+The details that make it safe to ship: it runs on the levels where vanes are actually
+resolved (the fine and nested patches), the solver's TRT magic parameter (Λ = 3/16) pins the
+wall location independent of viscosity, the moving-wall slip term of the
+[wall model](#the-wall-model-why-this-one-is-different) composes on top unchanged, and a vane
+too thin to have a fluid neighbour on both sides of a link falls back to plain bounce-back on
+that link rather than guessing. The Mesh panel reports how many vane links it sub-cell
+resolved. Toggle it with **"Sub-cell vane surfaces (q-LIBB)"**; on by default.
+
 ## Custom STL import
 
 Drag a watertight STL onto the window. You get axis remap, scaling to a chosen chord, GPU
@@ -191,7 +220,7 @@ ray-parity voxelization, and the same force readouts. Caveats (by design, v1):
   the z-boundaries to free-slip walls in STL mode.
 - Triangle cap: 2M.
 
-## Mesh refinement (two-level grid)
+## Mesh refinement (nested grids)
 
 The LBM lattice is intrinsically uniform — you can't stretch it without changing the
 physics it solves. So FoilCFD refines the honest way: a **2–4× finer nested lattice patch**
