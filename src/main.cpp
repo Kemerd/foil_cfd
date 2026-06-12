@@ -1091,6 +1091,10 @@ int runInteractive(App& app) {
         // -- particles + slices: interop map/unmap inside updateFields.
         // Skipped entirely once a CUDA failure is latched: the interop
         // map/unmap calls would fail the same way every frame. --
+        // Keep the volume's freestream baseline in lockstep with the active
+        // inflow (HiFi lowers u_lat), so the "calm air" haze threshold tracks
+        // the real freestream rather than a stale default.
+        app.params.viz.freestreamLatticeSpeed = currentULat(app.params);
         if (!app.cudaFailure) {
             if (const cudaError_t err = app.viz.updateFields(
                     app.solver.velocityField(), app.solver.deviceRho(),
@@ -1179,6 +1183,7 @@ int runSelftest(App& app) {
     // One full render pass so the screenshot has defined contents. The
     // selftest exists to prove the GL + CUDA + interop plumbing — a dropped
     // updateFields failure here would defeat its whole purpose.
+    app.params.viz.freestreamLatticeSpeed = currentULat(app.params);
     if (cudaError_t err = app.viz.updateFields(
             app.solver.velocityField(), app.solver.deviceRho(),
             app.solver.deviceFlags(), 200.0f, app.params.viz);

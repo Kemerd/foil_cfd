@@ -1442,6 +1442,12 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glUniform1i(im.uVColormap, static_cast<int>(settings.volumeColormap));
         glUniform1f(im.uVSlowOpacity, std::clamp(settings.slowAirOpacity, 0.0f, 1.0f));
         glUniform1f(im.uVDensity, std::clamp(settings.volumeDensity, 0.0f, 1.0f));
+        // Freestream baseline in the SAME normalized units the volume stores
+        // (speed / speedScale), so the shader's disturbance is measured from
+        // the actual inflow rather than a hardcoded level.
+        glUniform1f(im.uVFreestream,
+                    std::max(settings.freestreamLatticeSpeed, 1e-4f)
+                        / std::max(settings.velocitySpeedScale, 1e-6f));
         // Unit 0: speed volume, unit 1: scene depth.
         glUniform1i(im.uVVol, 0);
         glUniform1i(im.uVDepth, 1);
