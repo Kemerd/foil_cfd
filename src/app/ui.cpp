@@ -546,12 +546,15 @@ void drawAirfoilPanel(UIContext& ctx) {
     ImGui::SliderFloat("AoA", &p.aoaDeg, -5.0f, 25.0f, "%.1f deg");
     if (ImGui::IsItemDeactivatedAfterEdit()) ev.aoaChanged = true;
     if (p.aoaDeg > 20.0f) {
-        // The domain is 1.25 chords tall: past ~20 deg the projected foil
-        // blocks a third of it and the slip walls squeeze the streamtube,
-        // inflating absolute Cl. Deltas on identical settings stay honest.
+        // Past ~20 deg the projected foil blocks a large share of the box
+        // height and the slip walls squeeze the streamtube, inflating absolute
+        // Cl. The effect worsens as the Domain Size margins are tightened, so
+        // surface the current box height to make the trade-off explicit.
+        // Deltas on identical settings stay honest regardless.
         ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f),
-                           "high AoA: domain blockage inflates absolutes —\n"
-                           "trust VG-on/VG-off deltas, not raw Cl/Cd.");
+                           "high AoA: blockage inflates absolutes (box %.2f c\n"
+                           "tall) — trust VG-on/VG-off deltas, not raw Cl/Cd.",
+                           p.domain.spanYc());
     }
     ImGui::EndDisabled();
     if (stlMode) {
@@ -636,19 +639,68 @@ void drawAirfoilPanel(UIContext& ctx) {
                "compressibility error), and force averaging over 8 flow-"
                "throughs. Use it for the final VG-on vs VG-off comparison.");
 
-    // Show what the active preset means in cells and memory so the user can
-    // anticipate the VRAM bill before committing (plan 4.6 sanity numbers).
+    // Show what the active preset + domain margins mean in cells and memory so
+    // the user can anticipate the VRAM bill before committing. The nx/ny math
+    // MUST mirror defaultLayout() in main.cpp so this readout matches the real
+    // allocation (margins drive the box volume, which drives the VRAM bill).
     {
         const int nc = p.highFidelity.enabled
                            ? chordCellsFor(p.highFidelity.resolution)
                            : chordCellsFor(p.resolution);
-        const long long nx = 3LL * nc, ny = (5LL * nc) / 4, nz = (3LL * nc) / 8;
+        const float ncf = static_cast<float>(nc);
+        const long long nx =
+            static_cast<long long>(std::lround(p.domain.spanXc() * ncf)) + 1;
+        const long long ny =
+            static_cast<long long>(std::lround(p.domain.spanYc() * ncf)) + 1;
+        const long long nz = (3LL * nc) / 8;
         const double cells = static_cast<double>(nx * ny * nz);
         // 152 B f-pair + 16 B macroscopic + 1 B flags + clean snapshot share.
         const double gb = cells * (152.0 + 16.0 + 1.0) / (1024.0 * 1024.0 * 1024.0);
         ImGui::TextDisabled("grid %lld x %lld x %lld  (~%.1f GB VRAM)",
                             nx, ny, nz, gb);
     }
+
+    // ---- domain sizing: how tightly the box hugs the foil ----
+    // Each margin is the fluid gap on one side in chords. Shrinking them cuts
+    // the cell count (and the VRAM/throughput cost) directly; growing them adds
+    // far-field room (lower blockage, truer pressure recovery). Like the
+    // resolution preset, every change moves the grid dimensions, so it is a
+    // full re-init committed on slider RELEASE (not live drag).
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("DOMAIN SIZE (fluid margins around the foil)");
+    {
+        auto domSlider = [&ev](const char* label, float* v, float lo, float hi,
+                               const char* tip) {
+            ImGui::SliderFloat(label, v, lo, hi, "%.2f c");
+            // Re-init on release: the box dimensions change, so the whole grid
+            // is rebuilt — same gate the resolution preset uses.
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ev.resolutionChanged = true;
+            helpMarker(tip);
+        };
+        domSlider("Upstream##dom", &p.domain.upstreamC, 0.15f, 1.50f,
+                  "Fluid ahead of the leading edge. The inlet must sit far "
+                  "enough upstream that the stagnation field has settled — "
+                  "0.3-0.5 c is usually plenty for a single section.");
+        domSlider("Wake##dom", &p.domain.wakeC, 0.30f, 3.00f,
+                  "Fluid behind the trailing edge. The wake needs the most "
+                  "room of any side so the outlet doesn't clip the still-"
+                  "developing near-wake — keep this the largest margin.");
+        domSlider("Above##dom", &p.domain.aboveC, 0.15f, 1.50f,
+                  "Fluid above the suction surface. Too tight raises blockage "
+                  "and inflates the suction peak; 0.4-0.5 c keeps the top slip "
+                  "wall from interfering.");
+        domSlider("Below##dom", &p.domain.belowC, 0.15f, 1.50f,
+                  "Fluid below the pressure surface. Can usually match or "
+                  "slightly trail the Above margin.");
+        ImGui::TextDisabled("box ~ %.2f x %.2f chords (z fixed at 0.375 c)",
+                            p.domain.spanXc(), p.domain.spanYc());
+        helpMarker("Tighter margins = fewer cells = faster, less VRAM. Loosen "
+                   "them if you see the result change as you shrink the box "
+                   "(that means the walls were still influencing the flow).");
+    }
+
     ImGui::End();
 }
 

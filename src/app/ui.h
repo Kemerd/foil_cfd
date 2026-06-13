@@ -122,6 +122,33 @@ struct UIParams {
     // -- STL import (plan 7.2/7.4) --
     StlImportUI stlImport;                 ///< Modal state; mesh lives in main.cpp.
 
+    // -- domain sizing (compute box relative to the foil) --
+    /// How much empty fluid surrounds the foil, expressed in CHORDS on each
+    /// side. The whole lattice is sized from these margins instead of the old
+    /// fixed 3x-chord box, so the domain can hug the section tightly and skip
+    /// the wasted cells (cost scales with the cell count -> directly with the
+    /// box volume). Larger margins = more far-field room (less blockage), at
+    /// the price of more cells. defaultLayout() turns these into nx/ny/nz and
+    /// an absolute quarter-chord anchor. Any change is a full re-init (the grid
+    /// dimensions move), so the panel commits on slider RELEASE like the
+    /// resolution preset.
+    struct DomainMargins {
+        float upstreamC = 0.35f; ///< Fluid ahead of the leading edge [chords].
+        float wakeC     = 1.00f; ///< Fluid behind the trailing edge [chords]
+                                 ///< (the wake needs the most room of any side).
+        float aboveC    = 0.45f; ///< Fluid above the foil (suction side) [chords].
+        float belowC    = 0.45f; ///< Fluid below the foil (pressure side) [chords].
+
+        /// @brief Total streamwise box length in chords (LE margin + the unit
+        /// chord + TE margin). Keeps the nx math in one place.
+        float spanXc() const { return upstreamC + 1.0f + wakeC; }
+        /// @brief Total vertical box height in chords (both side margins +
+        /// a nominal allowance for foil thickness, ~12 % chord, so a thick
+        /// section never touches the slip walls).
+        float spanYc() const { return belowC + aboveC + 0.12f; }
+    };
+    DomainMargins domain;
+
     // -- mesh panel: refinement patch + startup pre-convergence --
     /// Two-level refinement patch settings (plan M-refine). Margins are in
     /// chord fractions around the solid bbox; the patch derivation clamps

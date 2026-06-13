@@ -63,15 +63,40 @@ constexpr std::uint8_t kCellFlagSlipFront =
 constexpr std::uint8_t kCellFlagSlipBack =
     static_cast<std::uint8_t>(CellFlag::SlipBack);  ///< z = nz-1 plane.
 
-/// Build the default domain layout for a chord resolution: the plan 4.6
-/// proportions (nx = 3*N_c, ny = 1.25*N_c, nz = 0.375*N_c) reproduce
-/// 768 x 320 x 96 at the default 256-cell chord.
-DomainLayout defaultLayout(int chordCells) {
+/// Build the default domain layout for a chord resolution and a set of domain
+/// margins. The in-plane box is sized DIRECTLY from the margins so it hugs the
+/// foil instead of using the old fixed 3x-chord proportions — fewer empty
+/// cells, less wasted compute (cost scales with the cell count). The spanwise
+/// (z) extent stays proportional to the chord: z is periodic and exists to
+/// resolve 3D vortex structure, not far-field, so it does not follow the
+/// in-plane margins. The quarter-chord anchor is set ABSOLUTELY from the
+/// upstream margin (LE sits `upstreamC` chords from the inlet; quarter-chord
+/// is 0.25 chord aft of the LE), and vertically centered between the side
+/// margins — this is what keeps the foil pinned correctly when the box shrinks
+/// rather than drifting with a fixed nx-fraction.
+/// @param chordCells Chord length N_c in cells.
+/// @param m          Per-side fluid margins in chords (see UIParams::domain).
+DomainLayout defaultLayout(int chordCells, const UIParams::DomainMargins& m) {
     DomainLayout layout;
     layout.chordCells = chordCells;
-    layout.dims.nx = 3 * chordCells;
-    layout.dims.ny = (5 * chordCells) / 4;
+
+    const float nc = static_cast<float>(chordCells);
+
+    // In-plane dimensions come straight from the margin spans (rounded to whole
+    // cells, +1 so the boundary flag planes never clip the fluid region).
+    layout.dims.nx = static_cast<int>(std::lround(m.spanXc() * nc)) + 1;
+    layout.dims.ny = static_cast<int>(std::lround(m.spanYc() * nc)) + 1;
+    // Spanwise extent unchanged from the original 0.375*N_c proportion.
     layout.dims.nz = (3 * chordCells) / 8;
+
+    // Pin the foil with an ABSOLUTE anchor instead of an nx-fraction so the
+    // upstream gap stays exactly `upstreamC` chords regardless of box size.
+    // Quarter-chord = LE + 0.25c; LE = upstream margin from the inlet.
+    layout.anchorAbsolute = true;
+    layout.anchorXCells = (m.upstreamC + 0.25f) * nc;
+    // Vertically center the section in the available height (below margin from
+    // the bottom slip wall, + half the thickness allowance).
+    layout.anchorYCells = (m.belowC + 0.06f) * nc;
     return layout;
 }
 
@@ -733,7 +758,8 @@ void runPreconverge(App& app) {
         return;
 
     const int nc = std::max(48, currentChordCells(app.params) / 4);
-    const DomainLayout preLayout = defaultLayout(nc);
+    // Same margins as the live domain so the companion field upsamples cleanly.
+    const DomainLayout preLayout = defaultLayout(nc, app.params.domain);
 
     // Voxelize the SAME geometry (foil + VGs) at presolve resolution.
     std::vector<std::uint8_t> flags =
@@ -1205,7 +1231,7 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
     }
 
     const int chordCells = currentChordCells(app.params);
-    app.layout = defaultLayout(chordCells);
+    app.layout = defaultLayout(chordCells, app.params.domain);
 
     // Geometry + flags: STL keeps its imported mesh through grid changes;
     // sections re-voxelize from their polygon.

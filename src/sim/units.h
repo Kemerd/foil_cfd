@@ -62,7 +62,9 @@ struct PhysicalParams {
 
 /// @brief Chord-resolution presets exposed in the UI (plan section 9.2).
 /// Grid dimensions scale proportionally with chord cells so the domain keeps
-/// the same physical extent (default layout: 3*N_c x 1.25*N_c x 0.375*N_c).
+/// the same physical extent. The in-plane box size is set by the user's domain
+/// margins (UIParams::domain, consumed by defaultLayout); the spanwise extent
+/// stays at the original 0.375*N_c proportion.
 enum class ResolutionPreset {
     Fast,     ///< 192 cells/chord — interactive exploration.
     Default,  ///< 256 cells/chord — the standard grid (768 x 320 x 96).
