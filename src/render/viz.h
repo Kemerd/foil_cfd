@@ -121,13 +121,32 @@ struct VizSettings {
     int             particleCount = kDefaultParticleCount;
     ParticleColorBy particleColorBy = ParticleColorBy::VorticityMag;
     Colormap        particleColormap = Colormap::Viridis;
-    float           particlePointSize = 1.5f;
-    float           particleOpacity   = 1.0f; ///< User opacity multiplier (0 = invisible, 2 = extra bright).
+    float           particlePointSize = 4.2f;
+    float           particleOpacity   = 1.67f; ///< User opacity multiplier (0 = invisible, 2 = extra bright).
     // Normalization scales for the particle color scalar (full-palette value).
     // Speed is in lattice units (u_lat ~ 0.05-0.12, wake peaks higher);
     // vorticity magnitude is in lattice 1/step units (shear-layer scale).
     float particleSpeedColorScale     = 0.15f;
     float particleVorticityColorScale = 0.05f;
+
+    // -- cotton tufts (the surface stall-line survey) --
+    // A grid of short flexible strands taped to the suction surface, dragged
+    // by the local flow like a real wind-tunnel / flight-test tuft survey: a
+    // tuft that streams flat and steady is in attached flow, one that flutters
+    // and reverses marks separation. Colored green (attached) -> red
+    // (separated) so the stall line reads at a glance — and creeps forward as
+    // the AoA climbs, exactly what a VG study needs to SEE.
+    bool  showCottonTufts = false;  ///< Mode 6 (off by default).
+    int   tuftChordCount  = 16;     ///< Strands along the chord (LE -> TE).
+    int   tuftSpanCount   = 9;      ///< Rows across the span.
+    float tuftStartXC     = 0.05f;  ///< First strand station x/c (near the LE).
+    float tuftEndXC       = 0.95f;  ///< Last strand station x/c (near the TE).
+    float tuftLengthC     = 0.04f;  ///< Strand length in chord fractions (the
+                                    ///< whole strand, root -> tip).
+    float tuftOpacity     = 1.0f;   ///< Line alpha multiplier [0,2].
+    float tuftThickness   = 2.0f;   ///< Line width in pixels.
+    float tuftSepScale    = 0.5f;   ///< Reversal fraction mapped to fully-red
+                                    ///< (separated). Lower = more sensitive.
 
     // -- slices (up to one per axis is plenty for v1; see SliceConfig note) --
     // Defaults: one slot pre-armed per axis so toggling a slice on shows
@@ -208,6 +227,23 @@ public:
     /// uploadGeometry() afterwards to restore the airfoil prism.
     /// @param mesh Normalized mesh from the import flow (plan 7.2).
     void uploadStlMesh(const StlMesh& mesh);
+
+    /// @brief Stash the section geometry the cotton-tuft seeder anchors
+    /// against and flag a from-scratch re-seed. uploadGeometry() calls this
+    /// internally; the app must also call it on geometry edits that DON'T
+    /// route through uploadGeometry (the voxel-view render path), or the tuft
+    /// anchors keep tracking a stale AoA/section.
+    /// @param airfoil Section outline (chord units).
+    /// @param aoa_deg Angle of attack (voxelizer rotation convention).
+    /// @param layout  Foil placement/scale inside the grid.
+    void setTuftGeometry(const AirfoilGeometry& airfoil, float aoa_deg,
+                         const DomainLayout& layout);
+
+    /// @brief Reset every cotton tuft to its upright rest pose on the next
+    /// update (anchors re-derived from the stashed geometry + current
+    /// settings). Call on ANY sim restart — a from-rest flow with old bent
+    /// strands lingering over it would read as nonsense.
+    void reseedTufts();
 
     /// @brief Per-frame GPU update: map the interop resources (map/unmap
     /// brackets ONLY the GL-touching kernels, plan 9.3), run particle

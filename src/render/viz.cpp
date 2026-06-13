@@ -25,6 +25,7 @@
 #include "../geom/stl.h"
 #include "../platform/platform.h"
 #include "particles.cuh"
+#include "tufts.cuh"
 
 namespace foilcfd {
 
@@ -552,6 +553,36 @@ struct Visualizer::Impl {
     cudaGraphicsResource* posRes = nullptr; ///< Registered ONCE per pool lifetime.
     cudaGraphicsResource* keyRes = nullptr;
 
+    // -- cotton tufts (surface stall-line survey) --
+    // One float4-per-node VBO drawn as a GL_LINE_STRIP per strand, plus a
+    // persistent DEVICE anchor buffer the advection kernel relaxes toward. The
+    // VBO + anchors are (re)built by seedTufts() whenever the geometry or the
+    // grid density changes — re-registration only happens there, never per
+    // frame (the plan-13 contract, mirrored from the particle pool).
+    GLuint tuftVAO = 0, tuftVBO = 0;
+    cudaGraphicsResource* tuftRes = nullptr; ///< Registered per (re)seed.
+    TuftAnchor* tuftAnchors = nullptr;       ///< Device buffer, tuftCount entries.
+    int tuftCount = 0;                        ///< Strands currently allocated.
+    int tuftGridChord = 0, tuftGridSpan = 0; ///< Grid the current pool was built
+                                             ///< for (re-seed when these change).
+    // Remaining seed-relevant settings the pool was last built with: ANY tuft
+    // setting change re-seeds from scratch (length/start/end reshape the
+    // anchors, so a live re-seed is the only honest response to the sliders).
+    float tuftSeedLenC = -1.0f, tuftSeedStartXC = -1.0f, tuftSeedEndXC = -1.0f;
+    std::vector<GLint>   tuftFirst;          ///< glMultiDrawArrays slice starts.
+    std::vector<GLsizei> tuftSizes;          ///< glMultiDrawArrays slice lengths.
+    GLuint progTufts = 0;
+    GLint uTViewProj = -1, uTAlpha = -1;
+    bool tuftSeedPending = false;            ///< Geometry changed: reset strands
+                                             ///< to rest pose on the next update.
+    // Stashed geometry the tuft seeder anchors against (copied at uploadGeometry
+    // so the lazy re-seed in updateFields — where the grid-density settings live
+    // — can rebuild anchors without the app re-supplying the section).
+    AirfoilGeometry tuftAirfoil;
+    float tuftAoaDeg = 0.0f;
+    DomainLayout tuftLayout;
+    bool tuftHaveGeometry = false;           ///< False until first uploadGeometry.
+
     // -- foil + VG mesh --
     GLuint meshVAO = 0, meshVBO = 0;
     GLsizei meshVertexCount = 0;
@@ -661,6 +692,175 @@ struct Visualizer::Impl {
         if (keyVBO) { glDeleteBuffers(1, &keyVBO); keyVBO = 0; }
         if (particleVAO) { glDeleteVertexArrays(1, &particleVAO); particleVAO = 0; }
         particleCount = 0;
+    }
+
+    /// Tear down the tuft pool: unregister the interop handle BEFORE deleting
+    /// the GL buffer, then free the device anchor buffer. Safe to call when no
+    /// pool exists (idempotent — used by both re-seed and shutdown).
+    void destroyTufts() {
+        if (tuftRes) { cudaGraphicsUnregisterResource(tuftRes); tuftRes = nullptr; }
+        if (tuftVBO) { glDeleteBuffers(1, &tuftVBO); tuftVBO = 0; }
+        if (tuftVAO) { glDeleteVertexArrays(1, &tuftVAO); tuftVAO = 0; }
+        if (tuftAnchors) { cudaFree(tuftAnchors); tuftAnchors = nullptr; }
+        tuftCount = 0;
+        tuftGridChord = 0;
+        tuftGridSpan = 0;
+        tuftSeedLenC = tuftSeedStartXC = tuftSeedEndXC = -1.0f;
+        tuftFirst.clear();
+        tuftSizes.clear();
+    }
+
+    /// (Re)build the cotton-tuft pool against the stashed geometry and the
+    /// current grid-density settings: lay out a chordwise x span grid of root
+    /// anchors on the suction surface (reusing the SAME SectionTransform +
+    /// surfaceFrameAt math the VG seating uses, so tufts and vanes sit on the
+    /// identical skin), (re)allocate + register the node VBO and the device
+    /// anchor buffer, and reset every strand to its straight rest pose. Called
+    /// lazily from updateFields when the geometry or the grid changed.
+    /// @return cudaSuccess, or the first interop/kernel error encountered.
+    cudaError_t seedTufts(const VizSettings& settings) {
+        // No (valid) section to anchor on — e.g. STL mode cleared the stash:
+        // retire any existing strands instead of leaving them floating over
+        // geometry they no longer belong to.
+        if (!tuftHaveGeometry || !tuftAirfoil.isValid()) {
+            destroyTufts();
+            return cudaSuccess;
+        }
+
+        // ---- grid dimensions (clamped to sane bounds the UI also enforces) --
+        const int chordN = std::clamp(settings.tuftChordCount, 1, 64);
+        const int spanN  = std::clamp(settings.tuftSpanCount, 1, 64);
+        const int newCount = chordN * spanN;
+
+        // ---- build the host anchor list on the suction surface --------------
+        const SectionTransform xf =
+            SectionTransform::make(tuftAoaDeg, tuftLayout);
+        const float spanZ = static_cast<float>(tuftLayout.dims.nz);
+        // Strand length in cells (whole strand) split across the free segments.
+        const float strandLen = std::max(settings.tuftLengthC, 1e-3f)
+                              * static_cast<float>(tuftLayout.chordCells);
+        const float segLen = strandLen / static_cast<float>(kTuftNodes - 1);
+
+        std::vector<TuftAnchor> host;
+        host.reserve(static_cast<std::size_t>(newCount));
+        for (int ci = 0; ci < chordN; ++ci) {
+            // Chord station x/c, linearly from start -> end (LE-ish to TE-ish).
+            const float frac = (chordN == 1) ? 0.5f
+                             : static_cast<float>(ci) / static_cast<float>(chordN - 1);
+            const float xc = settings.tuftStartXC
+                           + (settings.tuftEndXC - settings.tuftStartXC) * frac;
+
+            // Suction-surface frame at this station (same query VG roots use).
+            const SurfaceFrame frame = surfaceFrameAt(tuftAirfoil, xc, /*upper=*/true);
+            if (!frame.valid) continue;
+
+            // Section-plane point + tangent rotated into lattice space (AoA).
+            const Vec2f p2 = xf.point(frame.point);
+            const Vec2f t2 = xf.direction(normalized(frame.tangent));
+            const Vec2f n2 = xf.direction(normalized(frame.normal));
+
+            // Lift the root a touch off the skin along the outward normal so the
+            // strand sits ON the surface rather than buried in the first solid
+            // voxel (half a cell is enough to clear the stair-step).
+            const float lift = 0.5f;
+
+            for (int si = 0; si < spanN; ++si) {
+                // Distribute span rows across the periodic span, inset half a
+                // step from each face so no row lands exactly on the z seam.
+                const float sfrac = (static_cast<float>(si) + 0.5f)
+                                  / static_cast<float>(spanN);
+                const float z = sfrac * spanZ;
+
+                // Aggregate-init the float3s: make_float3() is a CUDA device
+                // helper not exposed to plain host TUs (this is .cpp).
+                TuftAnchor a;
+                a.root = float3{p2.x + n2.x * lift, p2.y + n2.y * lift, z};
+                a.normal = float3{n2.x, n2.y, 0.0f};   // stand-up direction
+                a.tangent = float3{t2.x, t2.y, 0.0f};  // attached-flow direction
+                a.segLen = segLen;
+                host.push_back(a);
+            }
+        }
+        if (host.empty()) { destroyTufts(); return cudaSuccess; }
+        const int count = static_cast<int>(host.size());
+
+        // ---- (re)allocate GL VBO + device anchors when the pool size changed -
+        if (count != tuftCount || !tuftVBO || !tuftAnchors) {
+            destroyTufts();
+
+            glGenVertexArrays(1, &tuftVAO);
+            glBindVertexArray(tuftVAO);
+            glGenBuffers(1, &tuftVBO);
+            glBindBuffer(GL_ARRAY_BUFFER, tuftVBO);
+            glBufferData(GL_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(count) * kTuftNodes * 4
+                             * sizeof(float),
+                         nullptr, GL_DYNAMIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                                  nullptr);
+            glBindVertexArray(0);
+
+            if (auto err = cudaGraphicsGLRegisterBuffer(
+                    &tuftRes, tuftVBO, cudaGraphicsRegisterFlagsNone);
+                err != cudaSuccess) {
+                std::fprintf(stderr, "[viz] tuft VBO registration failed: %s\n",
+                             cudaGetErrorString(err));
+                destroyTufts();
+                return err;
+            }
+            if (auto err = cudaMalloc(reinterpret_cast<void**>(&tuftAnchors),
+                                      static_cast<std::size_t>(count)
+                                          * sizeof(TuftAnchor));
+                err != cudaSuccess) {
+                std::fprintf(stderr, "[viz] tuft anchor alloc failed: %s\n",
+                             cudaGetErrorString(err));
+                destroyTufts();
+                return err;
+            }
+
+            // Precompute the per-strand GL_LINE_STRIP draw slices once (they
+            // depend only on the count, not the per-frame node positions).
+            tuftFirst.resize(static_cast<std::size_t>(count));
+            tuftSizes.resize(static_cast<std::size_t>(count));
+            for (int t = 0; t < count; ++t) {
+                tuftFirst[t] = t * kTuftNodes;
+                tuftSizes[t] = kTuftNodes;
+            }
+        }
+
+        tuftCount = count;
+        tuftGridChord = chordN;
+        tuftGridSpan = spanN;
+        // Record the full seed signature so updateFields can detect ANY tuft
+        // setting change (not just grid density) and re-seed live.
+        tuftSeedLenC = settings.tuftLengthC;
+        tuftSeedStartXC = settings.tuftStartXC;
+        tuftSeedEndXC = settings.tuftEndXC;
+
+        // ---- upload anchors, then reset the strands to rest pose ------------
+        if (auto err = cudaMemcpyAsync(tuftAnchors, host.data(),
+                                       static_cast<std::size_t>(count)
+                                           * sizeof(TuftAnchor),
+                                       cudaMemcpyHostToDevice, stream);
+            err != cudaSuccess) {
+            return err;
+        }
+
+        cudaError_t firstErr = cudaGraphicsMapResources(1, &tuftRes, stream);
+        if (firstErr != cudaSuccess) return firstErr;
+        float4* nodes = nullptr;
+        std::size_t bytes = 0;
+        cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&nodes),
+                                             &bytes, tuftRes);
+        if (nodes) {
+            const cudaError_t e =
+                launchTuftReset(nodes, tuftAnchors, count, stream);
+            if (e != cudaSuccess) firstErr = e;
+        }
+        const cudaError_t ue = cudaGraphicsUnmapResources(1, &tuftRes, stream);
+        if (firstErr == cudaSuccess) firstErr = ue;
+        return firstErr;
     }
 
     /// Allocate the per-axis slice textures and register each exactly once.
@@ -835,6 +1035,15 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
         std::fprintf(stderr, "[viz] velocity volume disabled: %s\n",
                      volErr.c_str());
     }
+    // Cotton tufts (surface stall-line survey) — soft-fail optional stage like
+    // the Q/volume modes: a shader miss disables the mode, never the renderer.
+    std::string tuftErr;
+    impl_->progTufts =
+        buildProgram(impl_->shaderDir, "tufts.vert", "tufts.frag", &tuftErr);
+    if (!impl_->progTufts) {
+        std::fprintf(stderr, "[viz] cotton tufts disabled: %s\n",
+                     tuftErr.c_str());
+    }
 
     // Uniform locations resolved once; -1 silently no-ops in glUniform*.
     impl_->uPViewProj  = glGetUniformLocation(impl_->progParticles, "uViewProj");
@@ -869,6 +1078,10 @@ bool Visualizer::init(const GridDims& dims, int particleCount,
         impl_->uVDensity    = glGetUniformLocation(impl_->progVol, "uDensity");
         impl_->uVFreestream = glGetUniformLocation(impl_->progVol, "uFreestream");
         impl_->uVLowSpeedFade = glGetUniformLocation(impl_->progVol, "uLowSpeedFade");
+    }
+    if (impl_->progTufts) {
+        impl_->uTViewProj = glGetUniformLocation(impl_->progTufts, "uViewProj");
+        impl_->uTAlpha    = glGetUniformLocation(impl_->progTufts, "uAlpha");
     }
 
     // ---- particle pool (the two interop buffer registrations) -------------
@@ -927,6 +1140,7 @@ void Visualizer::shutdown() {
     // CUDA side first: surface objects + unregistrations must precede GL
     // object deletion (a registered buffer/texture must outlive its handle).
     im.destroyParticlePool();
+    im.destroyTufts(); // unregisters the tuft VBO + frees the anchor buffer
     for (auto& s : im.slice) s.release(im.stream);
     im.qVol.release(im.stream);
     im.velVol.release(im.stream);
@@ -953,6 +1167,7 @@ void Visualizer::shutdown() {
     delProg(im.progMesh);
     delProg(im.progQ);
     delProg(im.progVol);
+    delProg(im.progTufts);
 
     im.meshVertexCount = 0;
     im.qAvailable = false;
@@ -1116,6 +1331,27 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
                  verts.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     impl_->meshVertexCount = static_cast<GLsizei>(verts.size());
+
+    // Keep the tuft anchors glued to the current skin: any geometry edit that
+    // redraws the prism (airfoil, AoA, VG layout) re-seeds the strands.
+    setTuftGeometry(airfoil, aoa_deg, layout);
+}
+
+void Visualizer::setTuftGeometry(const AirfoilGeometry& airfoil, float aoa_deg,
+                                 const DomainLayout& layout) {
+    if (!impl_) return;
+    // Stash the section so the lazy seeder in updateFields (where the
+    // grid-density settings live) can rebuild anchors on the suction surface
+    // without the app re-supplying the geometry every frame.
+    impl_->tuftAirfoil = airfoil;
+    impl_->tuftAoaDeg = aoa_deg;
+    impl_->tuftLayout = layout;
+    impl_->tuftHaveGeometry = true;
+    impl_->tuftSeedPending = true;
+}
+
+void Visualizer::reseedTufts() {
+    if (impl_) impl_->tuftSeedPending = true;
 }
 
 void Visualizer::uploadStlMesh(const StlMesh& mesh) {
@@ -1204,6 +1440,53 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
     const bool doVel = wantVel && im.velTex
                     && ((im.frame - 1) % static_cast<unsigned long long>(volEvery) == 0);
 
+    // ---- cotton tufts (surface stall-line survey) ---------------------------
+    // Self-contained map/unmap bracket (the tuft VBO is independent of the
+    // particle/slice/volume resources gathered below, and seedTufts does its
+    // own mapping). Lazily (re)seed when the geometry or grid changed, then
+    // advance the strands. Runs before the early-out below so the tufts work
+    // even when no other mode is active.
+    cudaError_t tuftErr = cudaSuccess;
+    if (settings.showCottonTufts && im.progTufts) {
+        // Re-seed on a pending geometry edit / sim restart, or when ANY
+        // seed-relevant tuft setting moved (grid density, strand length,
+        // chord-range): the anchors bake all of these in, so a from-scratch
+        // re-seed is the only honest response.
+        const bool settingsChanged =
+            std::clamp(settings.tuftChordCount, 1, 64) != im.tuftGridChord
+            || std::clamp(settings.tuftSpanCount, 1, 64) != im.tuftGridSpan
+            || settings.tuftLengthC != im.tuftSeedLenC
+            || settings.tuftStartXC != im.tuftSeedStartXC
+            || settings.tuftEndXC != im.tuftSeedEndXC;
+        if (im.tuftSeedPending || settingsChanged || im.tuftCount == 0) {
+            tuftErr = im.seedTufts(settings);
+            im.tuftSeedPending = false;
+        }
+        // Advect the (now-seeded) strands through the live velocity field.
+        if (tuftErr == cudaSuccess && im.tuftCount > 0 && im.tuftRes) {
+            cudaError_t e = cudaGraphicsMapResources(1, &im.tuftRes, im.stream);
+            if (e == cudaSuccess) {
+                float4* nodes = nullptr;
+                std::size_t bytes = 0;
+                cudaGraphicsResourceGetMappedPointer(
+                    reinterpret_cast<void**>(&nodes), &bytes, im.tuftRes);
+                if (nodes) {
+                    TuftAdvectParams tp;
+                    // Cap the advection time like the particles do: a long
+                    // stepN burst would otherwise fling the strands in one frame.
+                    tp.dtSteps = std::min(dtSteps, 8.0f);
+                    tp.sepScale = std::clamp(settings.tuftSepScale, 0.1f, 1.0f);
+                    e = launchTuftAdvect(nodes, im.tuftAnchors, im.tuftCount,
+                                         vel, tp, im.stream);
+                }
+                const cudaError_t ue =
+                    cudaGraphicsUnmapResources(1, &im.tuftRes, im.stream);
+                if (e == cudaSuccess) e = ue;
+            }
+            tuftErr = e;
+        }
+    }
+
     // ---- gather the resources this frame actually touches -------------------
     cudaGraphicsResource* resources[7];
     int nRes = 0;
@@ -1216,7 +1499,7 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
     }
     if (doQ) resources[nRes++] = im.qVol.res;
     if (doVel) resources[nRes++] = im.velVol.res;
-    if (nRes == 0) return cudaSuccess;
+    if (nRes == 0) return tuftErr; // tufts may still have run above
 
     cudaError_t firstErr = cudaGraphicsMapResources(nRes, resources, im.stream);
     if (firstErr != cudaSuccess) return firstErr;
@@ -1295,6 +1578,8 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
     }
 
     note(cudaGraphicsUnmapResources(nRes, resources, im.stream));
+    // Surface the tuft pass error too (it ran in its own bracket above).
+    if (firstErr == cudaSuccess) firstErr = tuftErr;
     return firstErr;
 }
 
@@ -1474,6 +1759,34 @@ void Visualizer::drawFrame(const OrbitCamera& camera, const VizSettings& setting
         glDrawArrays(GL_POINTS, 0, im.particleCount);
         glDisable(GL_PROGRAM_POINT_SIZE);
         glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
+    // ---- 4. cotton tufts: one GL_LINE_STRIP per strand, depth-tested AND
+    // depth-written (they're surface geometry that should occlude the fog
+    // behind them just like the mesh, and hide strands on the far side of the
+    // body). Drawn over the opaque mesh with a light over-blend so the user
+    // opacity slider reads. The attachment color (green->red) is in each
+    // node's .w from the advection kernel.
+    if (settings.showCottonTufts && im.progTufts && im.tuftCount > 0
+        && im.tuftVAO) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        // A slight depth bias pulls the lines toward the camera so they sit on
+        // TOP of the (coincident) foil skin rather than z-fighting into it.
+        glEnable(GL_POLYGON_OFFSET_LINE);
+        glPolygonOffset(-1.0f, -1.0f);
+        glLineWidth(std::clamp(settings.tuftThickness, 1.0f, 8.0f));
+        glUseProgram(im.progTufts);
+        glUniformMatrix4fv(im.uTViewProj, 1, GL_FALSE, viewProj.m);
+        glUniform1f(im.uTAlpha, std::clamp(settings.tuftOpacity, 0.0f, 1.0f));
+        glBindVertexArray(im.tuftVAO);
+        // One strip per strand: contiguous kTuftNodes-node slices (precomputed
+        // in seedTufts) drawn in a single multi-draw call.
+        glMultiDrawArrays(GL_LINE_STRIP, im.tuftFirst.data(),
+                          im.tuftSizes.data(), im.tuftCount);
+        glLineWidth(1.0f);
+        glDisable(GL_POLYGON_OFFSET_LINE);
         glDisable(GL_BLEND);
     }
 

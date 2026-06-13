@@ -48,9 +48,13 @@ inline constexpr int kTuftNodes = 5;
 /// and to know the rest length / surface tangent each strand relaxes toward.
 struct TuftAnchor {
     float3 root;     ///< Pinned root position on the foil skin (lattice space).
+    float3 normal;   ///< Unit outward surface normal: the direction a tuft
+                     ///< STANDS UP along at rest (taped at the root, free end
+                     ///< pointing off the skin). The flow then bends it over.
     float3 tangent;  ///< Unit surface tangent (downstream, lattice space): the
-                     ///< direction an ATTACHED tuft lies along. The attachment
-                     ///< metric measures departure from this.
+                     ///< direction an ATTACHED tuft lies along once the flow has
+                     ///< pushed it flat. The attachment metric measures how far
+                     ///< the bent strand departs from this.
     float  segLen;   ///< Rest length of each segment (cells). The strand wants
                      ///< node i at root + i*segLen along its bent path.
 };
@@ -58,27 +62,37 @@ struct TuftAnchor {
 /// @brief Tunables for one tuft advection launch.
 struct TuftAdvectParams {
     float dtSteps   = 1.0f;  ///< Sim steps advanced this frame (advection time).
-    float stiffness = 0.45f; ///< Spring gain pulling each segment back to its
-                             ///< rest length (0 = floppy, 1 = rigid). Keeps the
-                             ///< strand from stretching or collapsing while
-                             ///< still letting the flow bend it.
     float damping   = 0.65f; ///< Velocity-blend toward the sampled flow per
                              ///< step (0 = ignore flow, 1 = snap to flow). Lower
                              ///< values give the lazy cotton "flutter".
     float flowScale = 6.0f;  ///< Multiplies sampled velocity when displacing
                              ///< nodes, so a tuft a few cells long visibly
                              ///< streams in the freestream (u_lat ~ 0.08).
+    float sampleFloor = 1.25f; ///< Minimum wall distance (cells, along the
+                             ///< anchor normal) the flow is SAMPLED at. The
+                             ///< halfway bounce-back wall plus the voxel
+                             ///< stair-step leave a dead band of ~zero velocity
+                             ///< right at the skin; nodes hugging the surface
+                             ///< must feel the overlying flow or they lag the
+                             ///< free tip and the strand shears into a fold.
+                             ///< Node POSITIONS are unaffected — only where
+                             ///< their drag velocity is read from.
     float sepScale  = 0.5f;  ///< Reversal/cross-flow magnitude (fraction of the
                              ///< root speed) that maps the attachment scalar to
                              ///< 1.0 (fully separated/red).
 };
 
 /// @brief Advance every tuft one frame: pin node 0 to its anchor, drag the
-/// free nodes with the trilinearly-sampled velocity field (spring-to-rest +
-/// damping mini cloth sim), wrap z periodically like the particle advector,
-/// and write each strand's attachment scalar into all of its nodes' .w.
-/// Defensive against a not-yet-converged solver: non-finite samples leave the
-/// node at rest instead of poisoning the VBO.
+/// free nodes with the trilinearly-sampled velocity field, then re-project
+/// each link to its EXACT rest length (hard follow-the-leader constraint, the
+/// standard PBD rope/hair scheme). The hard links matter: a soft spring lets
+/// the chain stretch when near-wall nodes sit in slow air while the tip rides
+/// fast air, and the lagging strand folds back over itself. Inextensible
+/// links can only rotate about their parent, so the strand stays a single
+/// clean line however hard the shear. Each strand's attachment scalar is
+/// written into all of its nodes' .w. Defensive against a not-yet-converged
+/// solver: non-finite samples leave the node at rest instead of poisoning the
+/// VBO.
 /// @param nodes    Mapped GL VBO: float4 per node (see layout above).
 /// @param anchors  Device anchor buffer (tuftCount entries), persistent.
 /// @param tuftCount Number of strands.

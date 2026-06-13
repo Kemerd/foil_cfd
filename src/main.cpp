@@ -917,10 +917,21 @@ StlMesh buildVoxelMesh(const App& app) {
 /// path stays consistent with the voxel-view toggle.
 void uploadRenderGeometry(App& app) {
     if (app.params.voxelView) {
+        // Voxel view still simulates the same airfoil section — keep the tuft
+        // anchors tracking the live AoA/section even though the smooth prism
+        // isn't drawn (uploadGeometry, which normally stashes it, is skipped
+        // on this branch). STL solids have no 2D section to anchor on.
+        if (!app.stlActive) {
+            app.viz.setTuftGeometry(app.airfoil, app.params.aoaDeg, app.layout);
+        }
         app.viz.uploadStlMesh(buildVoxelMesh(app));
         return;
     }
     if (app.stlActive) {
+        // STL mode has no 2D section for the tuft seeder to anchor on — clear
+        // the stash (an invalid section makes the seeder retire the strands)
+        // so tufts from the previous airfoil don't float inside the solid.
+        app.viz.setTuftGeometry(AirfoilGeometry{}, 0.0f, app.layout);
         // Re-derive the normalized STL render mesh from the kept raw import
         // (the normalized copy is transient — this path re-creates it the
         // same way initSimulation does).
@@ -1539,6 +1550,9 @@ void applyEvents(App& app) {
             // then re-seed the developed flow.
             applyRefinement(app);
             runPreconverge(app);
+            // The flow restarts from rest — stand the tufts back up so they
+            // comb over with the fresh ramp instead of lingering mid-bend.
+            app.viz.reseedTufts();
             char msg[96];
             std::snprintf(msg, sizeof msg,
                           "airspeed/chord -> %.2f m/s / %.2f m (sim restarted)",
@@ -1601,6 +1615,8 @@ void applyEvents(App& app) {
     // ---- sim transport ----
     if (ev.resetCold) {
         app.solver.reset();
+        // Flow restarts from rest: stand the tufts back upright with it.
+        app.viz.reseedTufts();
         setStatus(app, "cold reset");
     }
     if (ev.singleStep) {

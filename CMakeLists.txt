@@ -103,6 +103,7 @@ add_executable(FoilCFD
     src/platform/gl_loader.cpp
     src/platform/platform.cpp
     src/render/particles.cu
+    src/render/tufts.cu
     src/render/viz.cpp
     src/sim/lbm_core.cu
     src/sim/lbm_refine.cu

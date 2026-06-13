@@ -257,6 +257,7 @@ void handleHotkeys(UIContext& ctx) {
     if (ImGui::IsKeyPressed(ImGuiKey_3, false)) p.viz.showQRaycast  = !p.viz.showQRaycast;
     if (ImGui::IsKeyPressed(ImGuiKey_4, false)) p.viz.showFoilMesh  = !p.viz.showFoilMesh;
     if (ImGui::IsKeyPressed(ImGuiKey_5, false)) p.viz.showVelocityVolume = !p.viz.showVelocityVolume;
+    if (ImGui::IsKeyPressed(ImGuiKey_6, false)) p.viz.showCottonTufts = !p.viz.showCottonTufts;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) p.running = !p.running;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) ctx.events->frameFoilView = true;
     // R key: cold-restart the sim (zero field, re-run viscosity ramp).
@@ -1478,6 +1479,41 @@ void drawViewPanel(UIContext& ctx) {
             if (ImGui::Combo("Palette##q", &qm, kMaps4, 4))
                 p.viz.qColormap = static_cast<Colormap>(qm);
         }
+        ImGui::Unindent();
+    }
+
+    // ---- cotton tufts: the surface stall-line survey ----
+    ImGui::Checkbox("Cotton tufts  [6]", &p.viz.showCottonTufts);
+    helpMarker("Tapes a grid of little flexible strands to the upper (suction) "
+               "surface, just like a real wind-tunnel or flight-test tuft "
+               "survey. A tuft that streams flat and steady is in attached "
+               "flow; one that flutters or reverses is sitting in separated "
+               "air. Colored green (attached) -> red (separated) so the stall "
+               "line jumps out — and watch it creep forward as you raise the "
+               "angle of attack. The cleanest way to SEE what your VGs do.");
+    if (p.viz.showCottonTufts) {
+        ImGui::Indent();
+        // Grid density: chordwise resolution is what resolves WHERE the line
+        // sits; a handful of span rows is enough to read spanwise unsteadiness.
+        ImGui::SliderInt("Chord strands", &p.viz.tuftChordCount, 4, 40);
+        helpMarker("How many tufts run from leading to trailing edge. More = "
+                   "a sharper read on exactly where the flow lets go.");
+        ImGui::SliderInt("Span rows", &p.viz.tuftSpanCount, 1, 24);
+        // Strand length: long enough to visibly curl in reversed flow, short
+        // enough to stay glued to the surface read.
+        ImGui::SliderFloat("Length", &p.viz.tuftLengthC, 0.01f, 0.12f, "%.3f c");
+        helpMarker("Strand length as a fraction of chord. Longer strands "
+                   "flutter more dramatically in separated flow but read less "
+                   "precisely.");
+        // Sensitivity of the red (separated) mapping.
+        ImGui::SliderFloat("Separation sensitivity", &p.viz.tuftSepScale, 0.1f,
+                           1.0f, "%.2f");
+        helpMarker("How readily a tuft turns red. Lower flags marginal/"
+                   "incipient separation sooner; higher waits for a clear "
+                   "reversal.");
+        ImGui::SliderFloat("Thickness", &p.viz.tuftThickness, 1.0f, 6.0f,
+                           "%.1f px");
+        ImGui::SliderFloat("Opacity", &p.viz.tuftOpacity, 0.0f, 2.0f, "%.2f");
         ImGui::Unindent();
     }
 
