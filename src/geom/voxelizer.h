@@ -23,11 +23,16 @@ struct VGParams;
 /// anchored at x = 0.3*nx, mid-height. Snapshot keys depend on grid dims and
 /// AoA only, so this struct stays out of the key — it is derived layout.
 ///
-/// The optional ABSOLUTE anchor override (anchorXCells/anchorYCells >= 0)
-/// exists for the refinement patch (plan M-refine): the fine level is a
-/// sub-box of the domain, so the foil's quarter-chord must land at an
-/// explicit patch-local cell coordinate rather than a fraction of the
-/// (patch-sized) grid. Negative values (the default) keep the fractional
+/// The optional ABSOLUTE anchor override (anchorAbsolute = true, set by
+/// makeFineLayout) exists for the refinement patch (plan M-refine): the fine
+/// level is a sub-box of the domain, so the foil's quarter-chord must land at
+/// an explicit patch-local cell coordinate rather than a fraction of the
+/// (patch-sized) grid. A patch-local anchor can be legitimately NEGATIVE —
+/// the nested VG box hugs the suction surface ABOVE the quarter-chord line,
+/// so the anchor sits below the patch origin — which is why the override is
+/// an explicit flag rather than a "negative means fractional" sentinel (the
+/// sentinel silently re-anchored the foil mid-box and the x4 level voxelized
+/// a misplaced section). Default (flag off, cells < 0) keeps the fractional
 /// behavior, so every existing call site is untouched.
 /// @brief Analytic descriptor of one voxelized vane, kept so the interpolated
 /// bounce-back (q-LIBB) can recover the TRUE sub-cell surface position instead
@@ -54,18 +59,26 @@ struct DomainLayout {
     int   chordCells = 256;   ///< N_c — chord length in cells.
     float foilAnchorXFrac = 0.3f; ///< Quarter-chord x position as fraction of nx.
     float foilAnchorYFrac = 0.5f; ///< Quarter-chord y position as fraction of ny.
-    float anchorXCells = -1.0f;   ///< Absolute x anchor [cells]; < 0 = use frac.
-    float anchorYCells = -1.0f;   ///< Absolute y anchor [cells]; < 0 = use frac.
+    float anchorXCells = -1.0f;   ///< Absolute x anchor [cells]; authoritative
+                                  ///< when anchorAbsolute (may be NEGATIVE for
+                                  ///< patch-local layouts) or when >= 0.
+    float anchorYCells = -1.0f;   ///< Absolute y anchor [cells]; same rules.
+    bool  anchorAbsolute = false; ///< True for patch-local layouts
+                                  ///< (makeFineLayout): the *Cells anchors are
+                                  ///< authoritative EVEN WHEN NEGATIVE — the
+                                  ///< nested VG box sits above the quarter-
+                                  ///< chord line, so its anchor y is below the
+                                  ///< patch origin. See the struct doc.
 
     /// @brief Lattice x coordinate of the quarter-chord anchor (cells).
     float anchorX() const {
-        return anchorXCells >= 0.0f
+        return (anchorAbsolute || anchorXCells >= 0.0f)
                    ? anchorXCells
                    : foilAnchorXFrac * static_cast<float>(dims.nx);
     }
     /// @brief Lattice y coordinate of the quarter-chord anchor (cells).
     float anchorY() const {
-        return anchorYCells >= 0.0f
+        return (anchorAbsolute || anchorYCells >= 0.0f)
                    ? anchorYCells
                    : foilAnchorYFrac * static_cast<float>(dims.ny);
     }

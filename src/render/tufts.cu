@@ -196,7 +196,14 @@ __global__ void tuftAdvectKernel(float4* nodes, const TuftAnchor* anchors,
         const float3 target = add3(p, scale3(flow, prm.flowScale * prm.dtSteps));
         // Damping blends previous position toward the flow target — low damping
         // keeps the lazy cotton lag/flutter, high snaps to the streamlines.
-        p = lerp3(p, target, prm.damping);
+        // Weighted by the LOCAL air speed (tuft "weight"): s/(s + minResponse)
+        // rolls the authority off smoothly as the air dies, so a strand inside
+        // the thick aft boundary-layer film holds its pose with dignity rather
+        // than twitching to every micro-eddy of near-zero velocity. Freestream
+        // air retains near-full authority over the strand.
+        const float spd = len3(flow);
+        const float authority = spd / (spd + fmaxf(prm.minResponseSpeed, 1e-6f));
+        p = lerp3(p, target, prm.damping * authority);
 
         // --- hard inextensible link (follow-the-leader / PBD rope) ----------
         // The node is snapped to EXACTLY segLen from its parent: a tuft is an

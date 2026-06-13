@@ -207,7 +207,12 @@ DomainLayout makeFineLayout(const DomainLayout& coarse, const PatchBox& box,
     fine.chordCells = factor * coarse.chordCells;
     // Anchor in patch-local FINE cells: the coarse anchor shifted to the
     // patch origin, scaled up. Fractions are bypassed via the absolute
-    // override so the foil lands at the exact same physical spot.
+    // override so the foil lands at the exact same physical spot. The flag —
+    // not a sign sentinel — marks them authoritative: a VG-hugging nested box
+    // sits ABOVE the quarter-chord line, so its patch-local anchor y is
+    // legitimately negative (the old >= 0 sentinel silently fell back to the
+    // mid-box fraction there, voxelizing a misplaced section into the level).
+    fine.anchorAbsolute = true;
     fine.anchorXCells = static_cast<float>(factor)
                       * (coarse.anchorX() - static_cast<float>(box.x0));
     fine.anchorYCells = static_cast<float>(factor)

@@ -249,6 +249,89 @@ void checkAoA25Margins() {
     }
 }
 
+// -----------------------------------------------------------------------
+// Patch-local anchor regression (the nested VG box bug): makeFineLayout must
+// keep a NEGATIVE patch-local anchor authoritative. A VG-hugging refinement
+// box sits on the suction surface ABOVE the quarter-chord line (and can start
+// downstream of it), so anchor - box origin is legitimately negative on
+// either axis. The old ">= 0 means absolute" sentinel silently fell back to
+// the mid-box FRACTION there, voxelizing a misplaced section into the level
+// (the user-visible "mesh flipped inside the x4 box"). Pin both the accessor
+// values and the voxelized geometry against the same analytic diamond used
+// by checkDiamondParity, expressed in patch-local fine coordinates.
+// -----------------------------------------------------------------------
+void checkPatchLocalAnchorAboveChord() {
+    // Same coarse setup as checkDiamondParity: anchor (9.6, 12), diamond
+    // center (13.6, 12), semi-axes (8, 4) in coarse cells.
+    const GridDims dims{32, 24, 3};
+    DomainLayout layout;
+    layout.dims = dims;
+    layout.chordCells = 16;
+
+    // Patch origin above AND downstream of the anchor -> both patch-local
+    // anchor coordinates go negative: x: 2*(9.6-10) = -0.8, y: 2*(12-13) = -2.
+    PatchBox box;
+    box.x0 = 10; box.x1 = 20; // coarse cells, exclusive upper
+    box.y0 = 13; box.y1 = 22;
+    const int factor = 2;
+    const DomainLayout fine = makeFineLayout(layout, box, factor);
+
+    TCHECK_MSG(std::fabs(fine.anchorX() - (-0.8f)) < 1e-4f,
+               "fine anchorX = %.3f (want -0.8; fraction fallback?)",
+               fine.anchorX());
+    TCHECK_MSG(std::fabs(fine.anchorY() - (-2.0f)) < 1e-4f,
+               "fine anchorY = %.3f (want -2.0; fraction fallback?)",
+               fine.anchorY());
+
+    // Voxelize the diamond into a Fluid-initialized fine field (the real
+    // refinement pipeline starts from Fluid too — no boundary stamps).
+    std::vector<std::uint8_t> flags(
+        static_cast<std::size_t>(fine.dims.cellCount()), flagOf(CellFlag::Fluid));
+    voxelizeAirfoil(makeDiamond(), /*aoa_deg=*/0.0f, fine, flags);
+
+    // Analytic diamond in patch-local FINE coordinates: center
+    // ((13.6-10)*2, (12-13)*2) = (7.2, -2), semi-axes (16, 8) fine cells.
+    const auto fineS = [](float px, float py) {
+        return std::fabs(px - 7.2f) / 16.0f + std::fabs(py + 2.0f) / 8.0f;
+    };
+
+    // Dual cell-center-convention enforcement, same scheme as
+    // checkDiamondParity: only cells where both conventions agree with margin
+    // are asserted, so the test pins placement without pinning the convention.
+    bool classifierOk = true;
+    int enforcedInside = 0;
+    // Skip the outermost ring like checkDiamondParity does: the voxelizer
+    // leaves domain-boundary planes to their boundary flags, and the real
+    // pipeline stamps the patch rim as Interface shell anyway.
+    for (int j = 1; j < fine.dims.ny - 1; ++j) {
+        for (int i = 1; i < fine.dims.nx - 1; ++i) {
+            const bool solid =
+                flags[idx(fine.dims, i, j, 0)] == flagOf(CellFlag::Solid);
+            const float sA = fineS(static_cast<float>(i), static_cast<float>(j));
+            const float sB = fineS(static_cast<float>(i) + 0.5f,
+                                   static_cast<float>(j) + 0.5f);
+            if (sA <= 0.75f && sB <= 0.75f) {
+                ++enforcedInside;
+                if (!solid) {
+                    std::printf("  fine cell (%d,%d) is well inside "
+                                "(s=%.2f/%.2f) but not Solid\n", i, j, sA, sB);
+                    classifierOk = false;
+                }
+            }
+            if (sA >= 1.25f && sB >= 1.25f && solid) {
+                std::printf("  fine cell (%d,%d) is well outside "
+                            "(s=%.2f/%.2f) but Solid\n", i, j, sA, sB);
+                classifierOk = false;
+            }
+        }
+    }
+    TCHECK(classifierOk);
+    // The box overlaps the diamond's upper half — the inside assertion must
+    // have actually fired (a misplaced section would also tend to zero this).
+    TCHECK_MSG(enforcedInside > 10, "only %d enforced-inside cells",
+               enforcedInside);
+}
+
 } // namespace
 
 int main() {
@@ -256,5 +339,6 @@ int main() {
     checkDiamondParity();
     checkTrailingEdgeClosure();
     checkAoA25Margins();
+    checkPatchLocalAnchorAboveChord();
     return finish("test_voxelizer");
 }

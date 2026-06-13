@@ -72,11 +72,22 @@ struct TuftAdvectParams {
                              ///< anchor normal) the flow is SAMPLED at. The
                              ///< halfway bounce-back wall plus the voxel
                              ///< stair-step leave a dead band of ~zero velocity
-                             ///< right at the skin; nodes hugging the surface
+                             ///< right at the skin, and the aft boundary layer
+                             ///< thickens into a slow film a real tuft would
+                             ///< poke up through; nodes hugging the surface
                              ///< must feel the overlying flow or they lag the
                              ///< free tip and the strand shears into a fold.
+                             ///< The caller scales this with strand length
+                             ///< (tall tufts reach over thick slow layers).
                              ///< Node POSITIONS are unaffected — only where
                              ///< their drag velocity is read from.
+    float minResponseSpeed = 0.012f; ///< Sampled speed (lattice units) at which
+                             ///< a strand responds at half strength. Models
+                             ///< tuft WEIGHT: response scales s/(s+this), so
+                             ///< near-dead air (thick aft BL, wake film) moves
+                             ///< the strand sluggishly instead of letting
+                             ///< micro-noise whip it around, while freestream
+                             ///< (~0.08) drives it at near-full authority.
     float sepScale  = 0.5f;  ///< Reversal/cross-flow magnitude (fraction of the
                              ///< root speed) that maps the attachment scalar to
                              ///< 1.0 (fully separated/red).

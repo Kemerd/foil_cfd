@@ -1476,6 +1476,15 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
                     // stepN burst would otherwise fling the strands in one frame.
                     tp.dtSteps = std::min(dtSteps, 8.0f);
                     tp.sepScale = std::clamp(settings.tuftSepScale, 0.1f, 1.0f);
+                    // Sample height scales with strand length: a tall tuft
+                    // pokes up through the thick aft boundary-layer film and
+                    // feels the moving air above it (like real cotton), instead
+                    // of drowning in the near-wall slow band. Floor of 1.25
+                    // cells still clears the halfway wall + voxel stair-step.
+                    const float strandCells =
+                        std::max(settings.tuftLengthC, 1e-3f)
+                        * static_cast<float>(im.tuftLayout.chordCells);
+                    tp.sampleFloor = std::max(1.25f, 0.35f * strandCells);
                     e = launchTuftAdvect(nodes, im.tuftAnchors, im.tuftCount,
                                          vel, tp, im.stream);
                 }
