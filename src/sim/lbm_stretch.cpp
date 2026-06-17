@@ -41,14 +41,24 @@ AxisProfile buildAxisProfile(const std::vector<float>& wallDistCells, int n,
 
     // dx grows geometrically with distance from the wall: dx(d) = dxMin*g^d,
     // clamped at dxMax. g is the per-cell growth; cap it so no neighbour pair
-    // ever jumps more than growthCap (the accuracy guarantee). d is the cells-
-    // from-wall distance for this index (already reduced to 1-D by the caller).
+    // ever jumps more than growthCap (the accuracy guarantee). The distance is
+    // measured RELATIVE to the finest plane (the global minimum along this
+    // axis), so the closest-to-wall index gets g^0 = dxMin and a uniform
+    // distance field maps to a uniform dxMin grid (the gather then collapses to
+    // the exact integer pull — the m6_stretch uniform-collapse invariant).
+    float dMin = std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i)
+        dMin = std::min(dMin, std::max(0.0f,
+                                       wallDistCells[static_cast<std::size_t>(i)]));
+    if (!std::isfinite(dMin)) dMin = 0.0f;
     const float g = std::min(growthCap, dxMax / dxMin); // never exceed the cap
     p.growth = g;
+    const float lng = std::log(g);
     for (int i = 0; i < n; ++i) {
-        const float d = std::max(0.0f, wallDistCells[static_cast<std::size_t>(i)]);
+        const float d = std::max(0.0f, wallDistCells[static_cast<std::size_t>(i)])
+                      - dMin; // cells beyond the finest plane
         // dxMin * g^d, but computed as exp(d*ln g) and clamped to dxMax.
-        const float dxi = dxMin * std::exp(d * std::log(g));
+        const float dxi = dxMin * std::exp(d * lng);
         p.dx[static_cast<std::size_t>(i)] = std::min(dxi, dxMax);
     }
 

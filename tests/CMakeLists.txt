@@ -133,6 +133,18 @@ add_executable(m5_integration
 target_link_libraries(m5_integration PRIVATE foilcfd_test_sim)
 add_test(NAME m5_integration COMMAND m5_integration)
 
+# ISLBM A/B force-accuracy gate: a Re-150 cylinder run uniform vs stretched-mesh
+# (needs buildWallDistanceField from voxelizer.cpp; vg.cpp for its
+# deriveVGPatchBoxFine dependency). Two full cylinder transients -> labeled slow.
+add_executable(m6b_stretch_cylinder
+    m6b_stretch_cylinder.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/voxelizer.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/vg.cpp
+    ${CMAKE_SOURCE_DIR}/src/geom/airfoil.cpp) # vg.cpp -> surfaceFrameAt
+target_link_libraries(m6b_stretch_cylinder PRIVATE foilcfd_test_sim)
+add_test(NAME m6b_stretch_cylinder COMMAND m6b_stretch_cylinder)
+set_tests_properties(m6b_stretch_cylinder PROPERTIES LABELS "gpu;slow")
+
 # Manual validation tool (deliberately NOT registered with CTest): the
 # LS(1)-0413 lift-polar sweep against the digitized NASA TM X-72843 curves,
 # wall model on/off. ~15 minutes of GPU time; run from the repo root so the
