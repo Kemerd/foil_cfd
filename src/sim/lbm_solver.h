@@ -333,6 +333,12 @@ public:
     /// @brief True when ISLBM stretched-mesh mode is active.
     bool stretchActive() const;
 
+    /// @brief Toggle the ISLBM gather quality live (no mesh rebuild): true =
+    /// FAST raw-population gather (near-uniform speed, qualitative forces, the
+    /// interactive default); false = ACCURATE per-tap feq+rescaled-fneq gather
+    /// (correct Cl/Cd, ~4-5x the gather cost). No-op when ISLBM is off.
+    void setStretchFastGather(bool fast);
+
     /// @brief Stretched-mesh status for the UI (zeroed when ISLBM is off):
     /// dx range, achieved growth, wall/far tau, and the fluid-cell saving.
     StretchInfo stretchInfo() const;

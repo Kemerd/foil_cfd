@@ -592,6 +592,7 @@ void applyRefinement(App& app) {
             buildWallDistanceField(app.layout.dims, app.activeFlags);
         std::string serr;
         if (app.solver.initStretchMode(wallDist, &serr)) {
+            app.solver.setStretchFastGather(app.params.refine.islbmFastGather);
             const StretchInfo si = app.solver.stretchInfo();
             char msg[200];
             std::snprintf(msg, sizeof msg,

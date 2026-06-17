@@ -202,6 +202,12 @@ struct UIParams {
         // big jump — gentler seams, less interface aliasing. Rungs beyond the
         // nested VG box are placed by the Q-criterion seam sensor on the
         // DEVELOPED field (deferred rebuild) so no seam lands in the VG wake.
+        bool  islbmFastGather = true; ///< ISLBM (Stretch mode) gather quality:
+                                 ///< true = fast raw-population gather (near-
+                                 ///< uniform speed, qualitative forces — the
+                                 ///< interactive default); false = accurate
+                                 ///< feq+rescaled-fneq gather (correct Cl/Cd,
+                                 ///< ~4-5x the gather cost). Live toggle.
         bool  autoCascade = true;  ///< Let buildLevelPlan choose the rung count
                                  ///< from the boundary-layer thickness (delta99)
                                  ///< and VG vane height vs the local cell size,

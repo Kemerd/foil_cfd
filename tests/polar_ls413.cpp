@@ -26,16 +26,24 @@ constexpr int kNc = 192; ///< Fast preset.
 /// @brief One polar point: run the clean foil at one AoA to a trustworthy
 /// force readout (3 flow-throughs: gate at 2, trailing window fully inside
 /// developed flow) and report the windowed coefficients.
+/// Mesh strategy for a polar point: the proven 2x cascade patch, or the ISLBM
+/// continuous-gradient stretched mesh (single grid, finest at the wall). Used
+/// to A/B the gradient against the cascade on the real Glasair section that we
+/// have NASA TM X-72843 + wind-tunnel data for.
+enum class Mesh { Cascade, Stretch };
+
 struct PolarPoint {
     float aoa = 0.0f;
     bool  wallModel = true;
     bool  ok = false;     ///< False = diverged or init failure.
     float cl = 0.0f, cd = 0.0f;
     float yplusMean = 0.0f;
+    double mlups = 0.0;    ///< Throughput (million lattice updates/s) — "fast".
 };
 
 PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel,
-                    bool usePatch = true) {
+                    bool usePatch = true, Mesh mesh = Mesh::Cascade,
+                    bool fastGather = true) {
     PolarPoint pt;
     pt.aoa = aoa;
     pt.wallModel = wallModel;
@@ -66,29 +74,40 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel,
     solver.setSurfaceReference(clean);
     solver.setWallModelEnabled(wallModel);
 
-    // 2x patch, app-default margins — the configuration a user actually
-    // runs, so the validation validates the product.
-    auto cellsOf = [](float chords) {
-        return std::max(2, static_cast<int>(std::lround(
-                               chords * static_cast<float>(kNc))));
-    };
-    const PatchBox box = derivePatchBox(layout.dims, clean,
-                                        cellsOf(0.20f), cellsOf(0.50f),
-                                        cellsOf(0.10f), cellsOf(0.20f));
-    if (usePatch && box.valid()) {
-        const DomainLayout fineLayout = makeFineLayout(layout, box, 2);
-        std::vector<std::uint8_t> fine(
-            static_cast<std::size_t>(fineLayout.dims.cellCount()),
-            static_cast<std::uint8_t>(CellFlag::Fluid));
-        voxelizeAirfoil(foil, aoa, fineLayout, fine);
-        std::vector<std::uint8_t> fineClean = fine;
-        closeTrailingEdgeGaps(fineLayout.dims, fineClean);
-        closeTrailingEdgeGaps(fineLayout.dims, fine);
-        stampInterfaceShell(fineLayout.dims, fine);
-        if (solver.initRefinement(box, 2, fine, &err))
-            solver.setRefinedSurfaceReference(fineClean);
+    if (mesh == Mesh::Stretch) {
+        // ISLBM continuous-gradient mesh: one stretched grid, finest at the
+        // foil, built from the wall-distance field. No discrete patch.
+        const std::vector<float> wallDist =
+            buildWallDistanceField(layout.dims, clean);
+        if (solver.initStretchMode(wallDist, &err))
+            solver.setStretchFastGather(fastGather);
         else
-            std::printf("  (patch unavailable: %s)\n", err.c_str());
+            std::printf("  (stretch mesh unavailable: %s)\n", err.c_str());
+    } else if (usePatch) {
+        // 2x patch, app-default margins — the configuration a user actually
+        // runs, so the validation validates the product.
+        auto cellsOf = [](float chords) {
+            return std::max(2, static_cast<int>(std::lround(
+                                   chords * static_cast<float>(kNc))));
+        };
+        const PatchBox box = derivePatchBox(layout.dims, clean,
+                                            cellsOf(0.20f), cellsOf(0.50f),
+                                            cellsOf(0.10f), cellsOf(0.20f));
+        if (box.valid()) {
+            const DomainLayout fineLayout = makeFineLayout(layout, box, 2);
+            std::vector<std::uint8_t> fine(
+                static_cast<std::size_t>(fineLayout.dims.cellCount()),
+                static_cast<std::uint8_t>(CellFlag::Fluid));
+            voxelizeAirfoil(foil, aoa, fineLayout, fine);
+            std::vector<std::uint8_t> fineClean = fine;
+            closeTrailingEdgeGaps(fineLayout.dims, fineClean);
+            closeTrailingEdgeGaps(fineLayout.dims, fine);
+            stampInterfaceShell(fineLayout.dims, fine);
+            if (solver.initRefinement(box, 2, fine, &err))
+                solver.setRefinedSurfaceReference(fineClean);
+            else
+                std::printf("  (patch unavailable: %s)\n", err.c_str());
+        }
     }
 
     // 5 flow-throughs: the trailing force window covers [3, 5] FT, fully
@@ -114,6 +133,7 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel,
     pt.cl = f.clAvg;
     pt.cd = f.cdAvg;
     pt.yplusMean = solver.wallModelReadout().meanYplus;
+    pt.mlups = solver.perfStats().mlups; // throughput for the "fast" check
     pt.ok = true;
     return pt;
 }
@@ -145,6 +165,34 @@ int main(int argc, char** argv) {
             const PolarPoint pt = runPoint(load.airfoil, 0.0f, c.wm, c.patch);
             std::printf("  %s  Cl %7.3f  Cd %7.4f%s\n", c.label, pt.cl,
                         pt.cd, pt.ok ? "" : "  FAILED");
+            std::fflush(stdout);
+        }
+        return 0;
+    }
+
+    // --islbm-ab: A/B the ISLBM continuous-gradient mesh against the proven 2x
+    // cascade on the real Glasair section, wall model on. For each AoA prints
+    // Cl/Cd/MLUPS for both meshes and the Cl/Cd deltas — the accuracy-and-speed
+    // proof on geometry we have NASA TM X-72843 + wind-tunnel data for.
+    if (argc > 1 && std::string(argv[1]) == "--islbm-ab") {
+        std::printf("LS(1)-0413 A/B (wall model on), chord %d cells, Re 2.84e6\n"
+                    "cascade = proven; ISLBM-acc = rescaled gather (numbers); "
+                    "ISLBM-fast = raw gather (preview)\n\n", kNc);
+        std::printf("%5s | %-20s | %-20s | %-20s\n", "aoa",
+                    "cascade Cl/Cd/MLUPS", "ISLBM-acc Cl/Cd/MLUPS",
+                    "ISLBM-fast Cl/Cd/MLUPS");
+        const float sweep[] = {0.0f, 8.0f, 12.0f};
+        for (const float aoa : sweep) {
+            const PolarPoint c = runPoint(load.airfoil, aoa, true, true,
+                                          Mesh::Cascade);
+            const PolarPoint sa = runPoint(load.airfoil, aoa, true, true,
+                                           Mesh::Stretch, /*fast=*/false);
+            const PolarPoint sf = runPoint(load.airfoil, aoa, true, true,
+                                           Mesh::Stretch, /*fast=*/true);
+            std::printf("%5.1f | %6.3f %6.4f %5.0f | %6.3f %6.4f %5.0f | "
+                        "%6.3f %6.4f %5.0f\n",
+                        aoa, c.cl, c.cd, c.mlups, sa.cl, sa.cd, sa.mlups,
+                        sf.cl, sf.cd, sf.mlups);
             std::fflush(stdout);
         }
         return 0;

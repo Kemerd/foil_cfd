@@ -92,6 +92,14 @@ struct StretchView {
     int nx = 0; ///< Grid x extent (foot-map stride).
     int ny = 0; ///< Grid y extent.
 
+    /// Gather quality. FAST (default): interpolate raw populations — cheap (one
+    /// load per tap), ~full uniform throughput, great for interactive preview,
+    /// but it blends incompatibly-scaled near-wall stresses so lift/drag are
+    /// only qualitative. ACCURATE (false): reconstruct each tap into
+    /// feq + tau-rescaled fneq — physically correct Cl/Cd, but ~4-5x the gather
+    /// cost (per-tap moments + equilibrium). Toggle per the UI "fast gather" box.
+    bool fastGather = true;
+
     /// @brief True when a stretch mesh is supplied this step.
     bool active() const {
         return footFracX && footBaseX && footFracY && footBaseY && tauField;
@@ -120,6 +128,7 @@ struct StretchMesh {
 
     int nx = 0, ny = 0, nz = 0;
     bool active = false;
+    bool fastGather = true; ///< Mirrors StretchView::fastGather (UI toggle).
 
     // Device arrays (owned). Foot maps are [2*n] (sign-major); tau is [ncells].
     float*       dFootFracX = nullptr;
@@ -135,6 +144,7 @@ struct StretchMesh {
         v.footFracX = dFootFracX; v.footBaseX = dFootBaseX;
         v.footFracY = dFootFracY; v.footBaseY = dFootBaseY;
         v.tauField  = dTauField;  v.nx = nx;   v.ny = ny;
+        v.fastGather = fastGather;
         return v;
     }
 

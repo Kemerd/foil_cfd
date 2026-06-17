@@ -2406,6 +2406,10 @@ bool LBMSolver::stretchActive() const {
     return impl_ && impl_->stretch.active;
 }
 
+void LBMSolver::setStretchFastGather(bool fast) {
+    if (impl_) impl_->stretch.fastGather = fast;
+}
+
 StretchInfo LBMSolver::stretchInfo() const {
     StretchInfo info;
     const Impl& s = *impl_;

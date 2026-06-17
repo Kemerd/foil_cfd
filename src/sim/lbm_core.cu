@@ -73,6 +73,88 @@ __device__ __forceinline__ void equilibrium19(float rho, float ux, float uy,
     }
 }
 
+/// @brief Latt-Chopard regularization of a non-equilibrium population set: project
+/// fneq onto the second-order Hermite (stress) subspace, discarding the non-
+/// hydrodynamic ghost moments while preserving mass and momentum exactly
+/// (Latt & Chopard 2006, Eq. 10). Used by the ISLBM bulk gather to clean the
+/// interpolated fneq before rescaling it across the local dx gradient — the same
+/// cure lbm_refine.cu applies at a refinement interface, here on the smooth mesh.
+///   Pi_ab = sum_q c_qa c_qb fneq_q ; fneq_q = (w_q/2cs^4)(c_qa c_qb - cs^2 d_ab):Pi
+__device__ __forceinline__ void regularizeFneqCore(float fneq[kQ]) {
+    constexpr float kCs2     = 1.0f / 3.0f;
+    constexpr float kRegNorm = 4.5f; // 1 / (2 cs^4)
+    float pxx = 0.0f, pyy = 0.0f, pzz = 0.0f, pxy = 0.0f, pxz = 0.0f, pyz = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float f = fneq[q];
+        const float cx = static_cast<float>(d_cx[q]);
+        const float cy = static_cast<float>(d_cy[q]);
+        const float cz = static_cast<float>(d_cz[q]);
+        pxx += cx * cx * f; pyy += cy * cy * f; pzz += cz * cz * f;
+        pxy += cx * cy * f; pxz += cx * cz * f; pyz += cy * cz * f;
+    }
+    const float trace = kCs2 * (pxx + pyy + pzz);
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float cx = static_cast<float>(d_cx[q]);
+        const float cy = static_cast<float>(d_cy[q]);
+        const float cz = static_cast<float>(d_cz[q]);
+        const float qPi = cx * cx * pxx + cy * cy * pyy + cz * cz * pzz
+                        + 2.0f * (cx * cy * pxy + cx * cz * pxz + cy * cz * pyz)
+                        - trace;
+        fneq[q] = kRegNorm * d_w[q] * qPi;
+    }
+}
+
+/// @brief Reconstruct one tap cell's 19 populations for the ISLBM gather,
+/// rescaled to the home cell's relaxation time. Reads the tap's raw f, forms its
+/// moments + equilibrium, splits off fneq, REGULARIZES it (drop ghost moments),
+/// then rescales: fneq carries the viscous stress ~ tau·strain, and tau varies
+/// per cell on the stretched mesh, so transferring it to the home cell needs the
+/// Dupuis-Chopard factor (tauHome-1/2)/(tauTap-1/2) — the continuous-gradient
+/// (m=1 between neighbours) form of the cascade's interface rescale. Without
+/// this the gather blends incompatibly-scaled stresses and over-diffuses the
+/// near-wall boundary layer (the airfoil lift-collapse bug). Writes @p out[kQ].
+/// @param src       Source population buffer.
+/// @param pTap      Padded index of the tap cell.
+/// @param ncellsPad Per-q stride.
+/// @param tapCell   UNPADDED tap index (into the tau field).
+/// @param tauField  Per-cell tau (unpadded).
+/// @param tauHomeVisc Home cell's (tau - 1/2).
+/// @param out       Output: feq + rescaled, regularized fneq for all 19 q.
+__device__ __forceinline__ void islbmReconstructTap(
+    const FPop* __restrict__ src, long long pTap, long long ncellsPad,
+    long long tapCell, const float* __restrict__ tauField, float tauHomeVisc,
+    float out[kQ]) {
+    float fr[kQ];
+    float rho = 0.0f, jx = 0.0f, jy = 0.0f, jz = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float f = load_f(src, static_cast<long long>(q) * ncellsPad + pTap);
+        fr[q] = f;
+        rho += f;
+        jx += d_cx[q] * f; jy += d_cy[q] * f; jz += d_cz[q] * f;
+    }
+    rho = fmaxf(rho, 0.05f);
+    const float inv = 1.0f / rho;
+    float feq[kQ];
+    equilibrium19(rho, jx * inv, jy * inv, jz * inv, feq);
+    // Rescale the tap's viscous stress (fneq) to the home cell's tau: fneq ~
+    // tau*strain, and tau varies per cell on the stretched mesh, so transferring
+    // it needs the Dupuis-Chopard factor (tauHome-1/2)/(tauTap-1/2). NO Hermite
+    // regularization here: that PROJECTS fneq (drops ghost moments), which on a
+    // uniform mesh would alter every bulk cell's own populations every step (a
+    // strong artificial filter — it broke the uniform-collapse invariant). When
+    // tau is uniform s == 1 and this is the exact identity (feq + fneq = raw f),
+    // so the gather still collapses to the integer pull. Regularization belongs
+    // only at a steep-stretch SEAM, not in the smooth bulk (deferred — see
+    // kStretchRegularizeRatio).
+    const float tauTapVisc = fmaxf(tauField[tapCell] - 0.5f, 1e-6f);
+    const float s = tauHomeVisc / tauTapVisc;
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) out[q] = feq[q] + s * (fr[q] - feq[q]);
+}
+
 /// @brief Decompose an UNPADDED linear cell index into (x, y, z).
 __device__ __forceinline__ void unpackCell(long long cell, int nx, long long nxny,
                                            int& x, int& y, int& z) {
@@ -333,13 +415,17 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
     // the uniform/cascade modes. Inert (compiles to nothing) when ISLBM=false:
     // tau0 stays the scalar the launch wrapper passed.
     bool islbmBulk = false;
+    float tauHomeVisc = 0.0f; // home cell's (tau - 1/2), for the gather rescale
+    int   nz = 0;             // span extent, for the tap z-wrap
     if constexpr (ISLBM) {
         const float tauCell = stretch.tauField[cell];
         tau0 = 0.5f + tauRampMul * (tauCell - 0.5f);
+        tauHomeVisc = fmaxf(tauCell - 0.5f, 1e-6f);
         // A bulk cell's whole gather stencil is pure fluid -> the off-node
         // interpolated pull is well-defined; collar cells fall back to the exact
-        // integer flag-predicated pull below. ny is implicit in nxny/nx.
+        // integer flag-predicated pull below. ny/nz implicit in the strides.
         const int ny = static_cast<int>(nxny / nx);
+        nz = static_cast<int>(ncells / nxny);
         islbmBulk = islbmIsBulk(flags, x, y, z, nx, ny, nxny);
     }
 
@@ -375,15 +461,43 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
                 const int   zn0 = z - d_cz[q]; // Z uniform: integer neighbour
                 const long long qBase = static_cast<long long>(q) * ncellsPad;
                 float acc = 0.0f;
+                if (stretch.fastGather) {
+                    // FAST: interpolate raw populations — one load per tap, near
+                    // uniform throughput. Mixes per-cell-scaled fneq, so forces
+                    // are qualitative; ideal for live preview (UI default).
 #pragma unroll
-                for (int dyi = -1; dyi <= 1; ++dyi) {
-                    const float wy = (dyi < 0) ? wym : (dyi == 0) ? wy0 : wyp;
+                    for (int dyi = -1; dyi <= 1; ++dyi) {
+                        const float wy = (dyi < 0) ? wym : (dyi == 0) ? wy0 : wyp;
 #pragma unroll
-                    for (int dxi = -1; dxi <= 1; ++dxi) {
-                        const float wx = (dxi < 0) ? wxm : (dxi == 0) ? wx0 : wxp;
-                        acc += wx * wy
-                             * load_f(src, qBase
-                                            + pIdx(bx + dxi, by + dyi, zn0, nx, nxny));
+                        for (int dxi = -1; dxi <= 1; ++dxi) {
+                            const float wx = (dxi < 0) ? wxm : (dxi == 0) ? wx0 : wxp;
+                            acc += wx * wy
+                                 * load_f(src, qBase
+                                              + pIdx(bx + dxi, by + dyi, zn0, nx, nxny));
+                        }
+                    }
+                } else {
+                    // ACCURATE: reconstruct each tap into feq + tau-rescaled fneq
+                    // (each tap's dx -> own tau -> own fneq scaling), then take
+                    // slice q. ~4-5x the gather cost; physically correct Cl/Cd.
+#pragma unroll
+                    for (int dyi = -1; dyi <= 1; ++dyi) {
+                        const float wy = (dyi < 0) ? wym : (dyi == 0) ? wy0 : wyp;
+#pragma unroll
+                        for (int dxi = -1; dxi <= 1; ++dxi) {
+                            const float wx = (dxi < 0) ? wxm : (dxi == 0) ? wx0 : wxp;
+                            const float w = wx * wy;
+                            if (w == 0.0f) continue; // skip zero-weight taps
+                            const int tx = bx + dxi, ty = by + dyi;
+                            const long long tapCell = static_cast<long long>(tx)
+                                + static_cast<long long>(nx) * ty
+                                + nxny * ((zn0 + nz) % nz);
+                            const long long pTap = pIdx(tx, ty, zn0, nx, nxny);
+                            float rec[kQ];
+                            islbmReconstructTap(src, pTap, ncellsPad, tapCell,
+                                                stretch.tauField, tauHomeVisc, rec);
+                            acc += w * rec[q];
+                        }
                     }
                 }
                 fpop[q] = acc;

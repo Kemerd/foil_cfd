@@ -1776,6 +1776,22 @@ void drawMeshPanel(UIContext& ctx) {
                    "so lift/drag stay trustworthy; the bulk uses an interpolated "
                    "gather (~60-70% of uniform throughput).");
 
+        // Stretch-mode gather quality: fast preview (default) vs accurate forces.
+        if (p.refine.meshMode == UIParams::MeshMode::Stretch) {
+            if (ImGui::Checkbox("Fast gather (preview speed)",
+                                &p.refine.islbmFastGather)) {
+                ev.meshRefinementChanged = true;
+            }
+            helpMarker("ON (default): the stretched-mesh gather interpolates raw "
+                       "populations — near-uniform throughput, great for live "
+                       "preview, but lift/drag are only qualitative (it blends "
+                       "near-wall stresses across cells of different spacing). "
+                       "OFF: reconstruct each tap with the proper viscous-stress "
+                       "rescale — trustworthy Cl/Cd, but ~4-5x slower in the "
+                       "gather. Turn off when you want numbers, on when you want "
+                       "frames.");
+        }
+
         // The stretched-mesh readout: dx range, growth, tau wall->far, savings.
         if (p.refine.meshMode == UIParams::MeshMode::Stretch
             && r.stretch.active) {
@@ -1784,10 +1800,12 @@ void drawMeshPanel(UIContext& ctx) {
                                r.stretch.dxMin * 1e3f, r.stretch.dxMax * 1e3f,
                                r.stretch.growthX, r.stretch.growthY);
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
-                               "tau %.3f (wall) -> %.3f (far)%s",
+                               "tau %.3f (wall) -> %.3f (far)%s%s",
                                r.stretch.tauWall, r.stretch.tauFar,
                                r.stretch.tauFloorClamped ? "  [floor clamped]"
-                                                         : "");
+                                                         : "",
+                               p.refine.islbmFastGather ? "  [fast/preview]"
+                                                        : "  [accurate]");
         }
     }
 
