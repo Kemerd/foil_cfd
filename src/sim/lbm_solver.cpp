@@ -74,15 +74,18 @@ struct LBMSolver::Impl {
     float*        v      = nullptr;
     float*        w      = nullptr;
     float*        force  = nullptr;            ///< 3-float momentum-exchange sum.
+    float*        mass   = nullptr;            ///< 2-float mass diagnostic {sum rho, count}.
     int*          nanDev = nullptr;            ///< Watchdog trip flag.
     std::uint8_t* editMask = nullptr;          ///< Unpadded VG-edit mask (reused).
 
     // ---- pinned host readback + events (all readbacks are poll-don't-stall:
     // the frame loop must never block on a D2H copy) ------------------------
     float* hForce = nullptr; ///< Pinned 3-float force sample.
+    float* hMass  = nullptr; ///< Pinned 2-float mass sample {sum rho, count}.
     int*   hNan   = nullptr; ///< Pinned watchdog flag.
     cudaEvent_t evT0 = nullptr, evT1 = nullptr; ///< Batch timing pair.
     cudaEvent_t evForce = nullptr;              ///< Force-readback fence.
+    cudaEvent_t evMass  = nullptr;              ///< Mass-readback fence.
     cudaEvent_t evNan   = nullptr;              ///< Watchdog-readback fence.
 
     // ---- sim state ---------------------------------------------------------
@@ -106,6 +109,18 @@ struct LBMSolver::Impl {
     bool      forcePending = false;        ///< A reduction readback is in flight.
     long long stepsAtForceLaunch   = 0;
     long long stepsAtLastForceFold = 0;
+
+    // Mass-drift diagnostic (graded-refinement health monitor, 2026-06-16).
+    // A poll-don't-stall reduction sums rho over fluid cells once per batch.
+    // meanMassBaseline is latched on the first post-ramp sample (the field is
+    // developed by then); meanMassNow tracks the latest sample, and the host
+    // exposes the relative drift (now/baseline - 1) in the readout. DIAGNOSTIC
+    // ONLY — nothing here rescales the field (a global rescale would smear a
+    // structured near-wall leak into the force/pressure integration).
+    bool      massPending      = false;    ///< A mass readback is in flight.
+    bool      massBaselineSet  = false;    ///< Baseline latched after the ramp.
+    float     meanMassBaseline = 1.0f;     ///< Mean fluid rho at baseline.
+    float     meanMassNow      = 1.0f;     ///< Mean fluid rho, latest sample.
 
     /// @brief One sample stored in the rolling average ring buffer.
     struct ForceSample {
@@ -652,6 +667,22 @@ struct LBMSolver::Impl {
             stepsAtLastForceFold = stepsAtForceLaunch;
             forcePending = false;
         }
+        // Mass-drift sample -> mean fluid density. hMass = {sum rho, count};
+        // the mean is the conserved quantity to watch (exact streaming holds it
+        // to round-off). The baseline is latched once the startup ramp is over
+        // (rampActive false) so it reflects a developed field, not the rest
+        // init; thereafter meanMassNow / meanMassBaseline - 1 is the drift the
+        // readout reports. No rescale — diagnostic only.
+        if (massPending && eventDone(evMass)) {
+            if (hMass[1] > 0.0f) {
+                meanMassNow = hMass[0] / hMass[1];
+                if (!massBaselineSet && !rampActive) {
+                    meanMassBaseline = meanMassNow;
+                    massBaselineSet  = true;
+                }
+            }
+            massPending = false;
+        }
         // Watchdog verdict. Flag 1 = non-finite populations, flag 2 = a cell
         // pinned at the collision limiter's velocity cap (diverged-but-finite
         // runaway) — both latch the pause; the diagnosis text distinguishes.
@@ -760,11 +791,13 @@ struct LBMSolver::Impl {
         cudaFree(v); v = nullptr;
         cudaFree(w); w = nullptr;
         cudaFree(force); force = nullptr;
+        cudaFree(mass); mass = nullptr;
         cudaFree(nanDev); nanDev = nullptr;
         cudaFree(editMask); editMask = nullptr;
         cudaFreeHost(hForce); hForce = nullptr;
+        cudaFreeHost(hMass); hMass = nullptr;
         cudaFreeHost(hNan); hNan = nullptr;
-        for (cudaEvent_t* ev : {&evT0, &evT1, &evForce, &evNan}) {
+        for (cudaEvent_t* ev : {&evT0, &evT1, &evForce, &evMass, &evNan}) {
             if (*ev) { cudaEventDestroy(*ev); *ev = nullptr; }
         }
         // In-flight async readbacks died with their events/buffers above, so
@@ -778,6 +811,8 @@ struct LBMSolver::Impl {
         timingPending = false;
         timingBatchN  = 0;
         forcePending  = false;
+        massPending     = false;
+        massBaselineSet = false;
         nanPending    = false;
         // Pacing estimates are per-grid: a per-step time measured on a smaller
         // grid would let the first post-reinit batch overshoot the TDR budget
@@ -843,6 +878,8 @@ bool LBMSolver::init(const GridDims& dims, const LatticeScaling& scaling,
         return fail("edit mask allocation failed", err);
     if (auto err = cudaMalloc(&s.force, 3 * sizeof(float)); err != cudaSuccess)
         return fail("force accumulator allocation failed", err);
+    if (auto err = cudaMalloc(&s.mass, 2 * sizeof(float)); err != cudaSuccess)
+        return fail("mass accumulator allocation failed", err);
     if (auto err = cudaMalloc(&s.nanDev, sizeof(int)); err != cudaSuccess)
         return fail("watchdog flag allocation failed", err);
 
@@ -850,12 +887,15 @@ bool LBMSolver::init(const GridDims& dims, const LatticeScaling& scaling,
     // silently serialize, which would defeat the poll-don't-stall design.
     if (auto err = cudaMallocHost(&s.hForce, 3 * sizeof(float)); err != cudaSuccess)
         return fail("pinned force readback allocation failed", err);
+    if (auto err = cudaMallocHost(&s.hMass, 2 * sizeof(float)); err != cudaSuccess)
+        return fail("pinned mass readback allocation failed", err);
     if (auto err = cudaMallocHost(&s.hNan, sizeof(int)); err != cudaSuccess)
         return fail("pinned watchdog readback allocation failed", err);
 
     // Timing events keep timestamps; the readback fences don't need them.
     for (auto [ev, flags_] : {std::pair{&s.evT0, 0u}, {&s.evT1, 0u},
                               {&s.evForce, (unsigned)cudaEventDisableTiming},
+                              {&s.evMass, (unsigned)cudaEventDisableTiming},
                               {&s.evNan, (unsigned)cudaEventDisableTiming}}) {
         if (auto err = cudaEventCreateWithFlags(ev, flags_); err != cudaSuccess)
             return fail("event creation failed", err);
@@ -1350,6 +1390,21 @@ cudaError_t LBMSolver::stepN(int n) {
             cudaEventRecord(s.evForce, s.stream);
             s.forcePending = true;
             s.stepsAtForceLaunch = s.steps;
+        }
+    }
+
+    // One mass-drift diagnostic sample per batch, same poll-don't-stall shape
+    // as the force reduction. Reads the COARSE post-collision buffer: total
+    // fluid mass on the base grid is the global conserved quantity (the patch
+    // restriction writes fine-derived moments back into it on render steps, so
+    // a fine-level leak surfaces here too). Diagnostic only — see pollAsync.
+    if (!s.massPending) {
+        if (launchMassReduction(s.view(s.src), s.mass, s.stream)
+            == cudaSuccess) {
+            cudaMemcpyAsync(s.hMass, s.mass, 2 * sizeof(float),
+                            cudaMemcpyDeviceToHost, s.stream);
+            cudaEventRecord(s.evMass, s.stream);
+            s.massPending = true;
         }
     }
 
@@ -2057,6 +2112,14 @@ RefinementInfo LBMSolver::refinementInfo() const {
             + static_cast<double>(s.finer.ncellsPad);
     }
     return info;
+}
+
+float LBMSolver::massDrift() const {
+    const Impl& s = *impl_;
+    // Undefined until the baseline is latched (first post-ramp sample) and
+    // until a positive baseline exists — report a healthy 0 in the interim.
+    if (!s.massBaselineSet || s.meanMassBaseline <= 0.0f) return 0.0f;
+    return s.meanMassNow / s.meanMassBaseline - 1.0f;
 }
 
 bool LBMSolver::seedFromCoarse(const LBMSolver& presolver, std::string* error) {

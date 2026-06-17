@@ -81,8 +81,26 @@ inline constexpr int kRestrictBandCoarse = 2;
 /// populations with a weight ramping 0 -> 1 inward. A hard cutoff leaves a
 /// velocity kink at the band edge that the Q-criterion lights up as a
 /// spurious vortex sheet standing on the patch faces (observed in the fog
-/// view); the ramp spreads the level hand-off over a few cells instead.
-inline constexpr int kRestrictBlendCoarse = 3;
+/// view); the ramp spreads the level hand-off over several cells instead.
+///
+/// Widened from 3 to 7 (2026-06-16): the level hand-off is the actual Astoul
+/// aliasing-injection site, and spreading it over a wider band cuts the
+/// per-cell correction gradient (~1/band) so the ghost-mode energy generated
+/// at the seam drops roughly in proportion. Paired with the C2 smoothstep
+/// weight (restrictBlendWeight in lbm_refine.cu) replacing the old linear ramp.
+/// The restriction band (kRestrictBandCoarse) is deliberately UNCHANGED — it
+/// must stay purely coarse-evolved as the fill source; only the blend RAMP
+/// inside the restricted region widens. A patch must still leave a valid
+/// restricted interior (PatchBox::valid requires width/height > 8, which after
+/// the 2-cell band per side leaves >= 5 cells — the ramp clamps to that).
+inline constexpr int kRestrictBlendCoarse = 7;
+
+/// Use the quintic C2 smootherstep (6s^5-15s^4+10s^3) instead of the cubic C1
+/// smoothstep (3s^2-2s^3) for the restriction edge blend. The cubic removes the
+/// velocity kink; the quintic additionally zeroes the SECOND derivative at both
+/// ends, for the case where the cubic's curvature jump still shows as residual
+/// seam noise. Default cubic: cheaper and sufficient in practice.
+inline constexpr bool kRestrictBlendQuintic = false;
 
 /// @brief Fine grid dimensions for a patch over the given coarse grid.
 inline GridDims fineDimsFor(const PatchBox& box, const GridDims& coarse,

@@ -637,6 +637,49 @@ __global__ void forceReductionKernel(const FPop* __restrict__ f,
 }
 
 // ===========================================================================
+// Total-mass diagnostic reduction (graded-refinement health monitor). One
+// thread per cell; fluid cells contribute their zeroth moment (sum_q f_q) and
+// a unit count, block-reduced and atomically folded into the 2-float output.
+// Mirrors forceReductionKernel's structure; reads the post-collision buffer.
+// ===========================================================================
+
+__global__ void massReductionKernel(const FPop* __restrict__ f,
+                                     const std::uint8_t* __restrict__ flags,
+                                     long long ncells, long long ncellsPad,
+                                     long long nxny, float* __restrict__ d_out) {
+    __shared__ float sRho[kBlock], sCnt[kBlock];
+    const long long cell =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    float rho = 0.0f, cnt = 0.0f;
+    if (cell < ncells) {
+        const long long pcell = cell + nxny;
+        if (flags[pcell] == kFlagFluid) {
+            // Zeroth moment is the density: rho = sum_q f_q (no equilibrium
+            // split needed, the populations sum directly). Read through the
+            // accessor so the FP16-storage path stays consistent.
+#pragma unroll
+            for (int q = 0; q < kQ; ++q)
+                rho += load_f(f, static_cast<long long>(q) * ncellsPad + pcell);
+            cnt = 1.0f;
+        }
+    }
+
+    // Standard tree reduction in shared memory, then one atomic pair.
+    const int t = threadIdx.x;
+    sRho[t] = rho; sCnt[t] = cnt;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s >>= 1) {
+        if (t < s) { sRho[t] += sRho[t + s]; sCnt[t] += sCnt[t + s]; }
+        __syncthreads();
+    }
+    if (t == 0 && sCnt[0] != 0.0f) {
+        atomicAdd(&d_out[0], sRho[0]);
+        atomicAdd(&d_out[1], sCnt[0]);
+    }
+}
+
+// ===========================================================================
 // Warm-restart flag-edit fixup (plan section 8 VG-edit flow). Cold path —
 // runs once per VG edit on a handful of cells; clarity over throughput.
 // ===========================================================================
@@ -897,6 +940,24 @@ cudaError_t launchForceReduction(DeviceLatticeView lattice,
             lattice.f, lattice.flags, ncells, lattice.dims.paddedCellCount(),
             nxny, lattice.dims.nx, acc.d_force, slip);
     }
+    return cudaGetLastError();
+}
+
+cudaError_t launchMassReduction(DeviceLatticeView lattice, float* d_out,
+                                cudaStream_t stream) {
+    const long long ncells = lattice.dims.cellCount();
+    if (ncells <= 0 || !lattice.f || !lattice.flags || !d_out)
+        return cudaErrorInvalidValue;
+    // The wrapper owns zeroing the accumulator (matches the force-reduction
+    // contract): both the mass sum and the cell count start at zero.
+    if (auto err = cudaMemsetAsync(d_out, 0, 2 * sizeof(float), stream);
+        err != cudaSuccess)
+        return err;
+    const long long nxny =
+        static_cast<long long>(lattice.dims.nx) * lattice.dims.ny;
+    massReductionKernel<<<gridFor(ncells), kBlock, 0, stream>>>(
+        lattice.f, lattice.flags, ncells, lattice.dims.paddedCellCount(),
+        nxny, d_out);
     return cudaGetLastError();
 }
 

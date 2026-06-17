@@ -342,6 +342,28 @@ cudaError_t launchForceReduction(DeviceLatticeView lattice,
                                  DeviceForceAccumulator acc, cudaStream_t stream,
                                  WallSlipView slip = WallSlipView{});
 
+/// @brief Total-mass diagnostic reduction (graded-refinement health monitor,
+/// 2026-06-16): sum the zeroth moment (sum_q f_q == rho) over every FLUID cell,
+/// alongside the fluid-cell count, into a 2-float device accumulator. The host
+/// folds successive samples into a slow mass-drift readout: with exact integer
+/// streaming total fluid mass is conserved to round-off, so any sustained drift
+/// is an early fingerprint of an interface/coupling instability — it shows up
+/// here BEFORE the strided NaN watchdog (which only samples ~1/4093 cells every
+/// ~200 steps) catches the eventual blow-up. DIAGNOSTIC ONLY: nothing rescales
+/// the field from this number. A global rescale would smear a spatially
+/// structured near-wall leak uniformly across the domain and bias the
+/// force/pressure integration the project's Cl/Cd depend on, so the reduction
+/// reports and the human (or the seam planner) acts — it never silently
+/// corrects. Same block-reduction + atomic structure as the force reduction.
+/// @param lattice Post-collision buffer to read populations from.
+/// @param d_out   Device 2-float accumulator, zeroed by the wrapper before
+///                launch: d_out[0] = sum of rho over fluid cells,
+///                d_out[1] = fluid-cell count (as a float; exact to 2^24 cells,
+///                far above any single-level grid, and only used as a divisor
+///                for the displayed mean so sub-ULP count error is irrelevant).
+cudaError_t launchMassReduction(DeviceLatticeView lattice, float* d_out,
+                                cudaStream_t stream);
+
 /// @brief Refresh the two spanwise ghost planes of a padded f buffer (all kQ
 /// population slices): ghost z=-1 <- real z=nz-1, ghost z=nz <- real z=0.
 /// Must run after every kernel that rewrites the buffer (stream-collide, init

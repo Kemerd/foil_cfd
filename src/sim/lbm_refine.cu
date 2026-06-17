@@ -105,6 +105,33 @@ __device__ __forceinline__ void unpackCell(long long cell, int nx, long long nxn
     x = static_cast<int>(rem - static_cast<long long>(y) * nx);
 }
 
+/// @brief C2 restriction edge-blend weight (Astoul et al. 2020 / Gendre 2017):
+/// the level hand-off ramps from 0 at the band edge to 1 over @p band coarse
+/// cells. The OLD ramp was LINEAR ((dEdge+1)/(band+1)) — C0, so its derivative
+/// jumps at both ends and leaves a velocity kink the Q-criterion lights up as a
+/// spurious vortex sheet standing on the patch faces. Hermite smoothstep
+/// w(s)=3s^2-2s^3 is C1 (zero slope at s=0 and s=1), which removes that kink;
+/// the quintic 6s^5-15s^4+10s^3 is C2 (zero first AND second derivative at the
+/// ends) and is selected when kRestrictBlendQuintic is set, for cases where the
+/// second-derivative discontinuity of the cubic still shows as residual noise.
+///
+/// s is computed as (dEdge+1)/(band+1) so the innermost band cell reaches w=1
+/// exactly, matching the old ramp's endpoint convention (no off-by-one shift in
+/// where the fully-restricted region begins).
+/// @param dEdge Manhattan distance (coarse cells) from the nearest sub-box edge.
+/// @param band  Ramp width in coarse cells (kRestrictBlendCoarse).
+__device__ __forceinline__ float restrictBlendWeight(int dEdge, int band) {
+    // Normalised position through the ramp, clamped to the fully-blended core.
+    const float s = fminf(1.0f, static_cast<float>(dEdge + 1)
+                                    / static_cast<float>(band + 1));
+    const float s2 = s * s;
+    if (kRestrictBlendQuintic)
+        // Quintic smootherstep: 6 s^5 - 15 s^4 + 10 s^3 (C2 at both ends).
+        return s2 * s * (s * (s * 6.0f - 15.0f) + 10.0f);
+    // Cubic smoothstep: 3 s^2 - 2 s^3 (C1 at both ends).
+    return s2 * (3.0f - 2.0f * s);
+}
+
 // ===========================================================================
 // Coarse-to-fine fill.
 //
@@ -349,12 +376,11 @@ __global__ void fineToCoarseRestrictKernel(
     // Edge blend weight: 0 at the band edge ramping to 1 over
     // kRestrictBlendCoarse cells inward. A hard hand-off leaves a velocity
     // kink the Q-criterion renders as a spurious vortex sheet standing on
-    // the patch faces; the ramp hands the levels over smoothly instead.
+    // the patch faces; the C2 smoothstep ramp (restrictBlendWeight) hands the
+    // levels over with continuous slope so no kink is injected.
     const int dEdge = min(min(xc - rx0, rx1 - 1 - xc),
                           min(yc - ry0, ry1 - 1 - yc));
-    const float blend = fminf(1.0f,
-        static_cast<float>(dEdge + 1)
-            / static_cast<float>(kRestrictBlendCoarse + 1));
+    const float blend = restrictBlendWeight(dEdge, kRestrictBlendCoarse);
 
     // ---- center cell: child-averaged fneq + its own rho/u ----------------
     // Stair-step walls differ slightly between levels; childAvgFneq averages

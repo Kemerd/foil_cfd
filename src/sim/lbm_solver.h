@@ -245,6 +245,16 @@ public:
     /// @brief Refinement status for the UI (zeroed RefinementInfo when off).
     RefinementInfo refinementInfo() const;
 
+    /// @brief Relative total-mass drift since the post-ramp baseline, a
+    /// graded-refinement health diagnostic (2026-06-16). Returns
+    /// meanFluidRho_now / meanFluidRho_baseline - 1: ~0 for a healthy run
+    /// (exact streaming conserves mass to round-off), growing in magnitude as
+    /// an interface/coupling instability leaks mass — it trips here before the
+    /// strided NaN watchdog catches the blow-up. Diagnostic ONLY: the solver
+    /// never rescales the field from this number. Returns 0 until the baseline
+    /// is latched (first post-ramp sample).
+    float massDrift() const;
+
     /// @brief Mesh-sequencing seed (plan M-refine part 2): trilinearly
     /// upsample the @p presolver's macroscopic field onto this solver's grid,
     /// equilibrium re-init both ping-pong buffers from it, and run the

@@ -75,6 +75,51 @@ typedef/index-function swap rather than a kernel rewrite.
 | Ginzburg, I., Verhaeghe, F., d'Humieres, D.: *Two-relaxation-time lattice Boltzmann scheme: about parametrization, velocity, pressure and mixed boundary conditions.* Commun. Comput. Phys. 3(2), 427-478 (2008). | The TRT "magic parameter" Lambda = 3/16 (the solver's `kTRTMagicLambda`) that pins simple bounce-back to exactly q=0.5 independent of viscosity — the reason q-LIBB inherits viscosity-independent wall location here. |
 | Zhao, W., Yong, W.-A.: *Single-node second-order boundary schemes for the lattice Boltzmann method.* J. Comput. Phys. 329, 1-15 (2017); DOI 10.1016/j.jcp.2016.10.049. | The single-node second-order scheme held in reserve for the very thinnest vanes (where the two-node Bouzidi branch has no fluid neighbour); v1 falls back to plain half-way bounce-back on those links instead. |
 
+### Graded refinement: buffer width, seam placement & cascade (added 2026-06-16)
+
+References adopted for the graded-refinement work (`docs/CITATIONS.md` plan;
+`sim/lbm_refine.cu`, the N-level cascade in `sim/lbm_solver.cpp`). All DOIs/arXiv
+ids verified against Crossref + arXiv 2026-06-16.
+
+| Citation | Use in FoilCFD |
+|---|---|
+| Gendre, F., Ricot, D., Fritz, G., Sagaut, P.: *Grid refinement for aeroacoustics in the lattice Boltzmann method: A directional splitting approach.* Phys. Rev. E 96(2), 023311 (2017); DOI 10.1103/PhysRevE.96.023311. | Mechanism behind the Q-criterion **seam-placement sensor**: spurious density/acoustic error is generated when a *vortex* crosses a doubling interface (the convected-vortex case, not the acoustic-pulse case). Justifies keeping every refinement seam OUT of the energetic VG near-wake and in smooth flow — the likely root cause of the reported nested-patch divergence. |
+| Berger, M.J., Colella, P.: *Local Adaptive Mesh Refinement for Shock Hydrodynamics.* J. Comput. Phys. 82(1), 64-84 (1989); DOI 10.1016/0021-9991(89)90035-1. | The FVM origin of the **proper-nesting + buffer-zone** rule the cascade's auto-placer enforces: fine patches sit interior to their parent by a buffer sized so a disturbance cannot traverse it between regrids. The transferable justification for the configurable >=8-cell min-buffer (vs the ~6-cell algorithmic floor). |
+| Schornbaum, F., Rüde, U.: *Massively Parallel Algorithms for the Lattice Boltzmann Method on Non-uniform Grids.* SIAM J. Sci. Comput. 38(2), C96-C126 (2016); DOI 10.1137/15M1035240; arXiv:1508.07982. | The canonical block-structured (octree) LBM refinement: strict **2:1 balance** (neighbouring blocks differ by at most one level) + a one-cell overlap layer filled by interpolation each coarse step. The architectural invariant the N-level 2x cascade enforces, and the evidence that large resolution changes are built by STACKING factor-2 levels, never one big jump or a non-integer ratio. |
+| Bellotti, T., Gouarin, L., Graille, B., Massot, M.: *Multidimensional fully adaptive lattice Boltzmann methods with error control based on multiresolution analysis.* J. Comput. Phys. 471, 111670 (2022); DOI 10.1016/j.jcp.2022.111670; arXiv:2103.02903. | Wavelet-multiresolution LBM with rigorous error control — the principled "many nested dyadic levels" formalism. Confirms graded refinement = stacked factor-2 levels (NOT a continuous ratio), supporting the cascade design. |
+| Bellotti, T., Gouarin, L., Graille, B., Massot, M.: *Does the multiresolution lattice Boltzmann method allow to deal with waves passing through mesh jumps?* C. R. Math. 360(G7), 761-769 (2022); DOI 10.5802/crmath.319; arXiv:2105.12609. | Shows reflected-wave amplitude at a mesh jump is **O(Δx_fine⁴)** for a well-built multiresolution scheme — interface noise falls steeply as the interface neighbourhood is refined. Quantifies the payoff of the cascade (each 2x seam carries ~16x less reflected energy than the current single 4x jump). |
+
+### Virtual transition strip (boundary-layer trip) — Phase 3 (added 2026-06-16)
+
+| Citation | Use in FoilCFD |
+|---|---|
+| Xue, X., Yao, H.-D., Davidson, L.: *Synthetic turbulence generator for lattice Boltzmann method at the interface between RANS and LES.* Phys. Fluids 34(5), 055118 (2022); DOI 10.1063/5.0090641; arXiv:2205.02774. | THE template for the **STG transition strip**: inject synthetic velocity fluctuations by reconstructing the populations via regularized LBM — `f = feq(rho, u+u') + regularized fneq`. Reuses FoilCFD's existing `regularizeFneq` (Latt-Chopard) verbatim; the strip slots into the collision step with no new operator. |
+| Klein, M., Sadiki, A., Janicka, J.: *A digital filter based generation of inflow data for spatially developing direct numerical or large eddy simulations.* J. Comput. Phys. 186(2), 652-665 (2003); DOI 10.1016/S0021-9991(03)00090-1. | The **digital-filter method (DFM)** generating the `u'` field fed into the Xue reconstruction: filtered white noise matching a target length/time scale and Reynolds-stress tensor. The lightest per-step generator for an explicit kernel (precomputed coefficients + a small convolution of a seeded random field — reproducible like the speck). |
+| Jarrin, N., Benhamadouche, S., Laurence, D., Prosser, R.: *A synthetic-eddy-method for generating inflow conditions for large-eddy simulations.* Int. J. Heat Fluid Flow 27(4), 585-593 (2006); DOI 10.1016/j.ijheatfluidflow.2006.02.006. | Higher-fidelity SEM alternative to the DFM (turbulence as superposed coherent eddies, full Reynolds-stress anisotropy); held in reserve if DFM-tripped transition is too weak. |
+| Schmidt, S., Breuer, M.: *Source term based synthetic turbulence inflow generator for eddy-resolving predictions of an airfoil flow including a laminar separation bubble.* Computers & Fluids 146, 1-22 (2017); DOI 10.1016/j.compfluid.2016.12.023. | The conceptual blueprint for a *localized interior* trip strip (not an inflow plane): synthetic turbulence as a volume-force source at an arbitrary location to seed transition upstream of a laminar separation bubble on an airfoil — FoilCFD's exact geometry. |
+| Schlatter, P., Örlü, R.: *Turbulent boundary layers at moderate Reynolds numbers: inflow length and tripping effects.* J. Fluid Mech. 710, 5-34 (2012); DOI 10.1017/jfm.2012.324. | The form/placement of the trip (thin near-wall random-volume-force strip at low Re) and the **calibration caveat**: trip strength must be tuned and the resulting BL state (θ, H, Cf) validated, since over/under-tripping shifts the virtual origin. Drives the Phase-3 validation step. |
+
+### Continuous-refinement landscape (evaluated 2026-06-16, decision in the graded-refinement plan)
+
+Evaluated for the owner's continuous-gradient ("limit as Δx → finer") dream. **Verdict:**
+the integer factor-of-2 rule is fundamental ONLY to *exact streaming* (populations hop
+exactly one cell/step, Δt ∝ Δx). Genuinely continuous / non-integer resolution change is
+possible but ONLY by replacing exact streaming with an interpolated gather — which is
+architecturally incompatible with FoilCFD's flag-predicated boundary pull (bounce-back,
+slip mirroring, q-LIBB) near the surface that produces the Cd/δ99 the mission needs. So
+the gradient is realized as a **staircase of stacked factor-2 levels** (Phase 2), with a
+**bulk-only** interpolated-gather (ISLBM) reserved for Phase 3 where it is well-posed.
+This is lattice-*metric* stretching (grid dx varies; geometry untouched) — distinct from
+the geometry-distorting coordinate stretching rejected 2026-06-12.
+
+| Source | Verdict |
+|---|---|
+| He, X., Luo, L.-S., Dembo, M.: *Some Progress in Lattice Boltzmann Method. Part I. Nonuniform Mesh Grids.* J. Comput. Phys. 129(2), 357-363 (1996); DOI 10.1006/jcph.1996.0255. | The original interpolation-supplemented LBM (ISLBM): keep collision-streaming on a uniform lattice, interpolate onto an arbitrary non-uniform mesh after streaming. Proof of concept that interpolation permits non-integer, smoothly-graded spacing. **Phase-3 basis (bulk only).** |
+| Xu, A., Zhao, Z., Xu, B.-R., Jiang, L.-S.: *Interpolation-supplemented lattice Boltzmann simulation of thermal convection on non-uniform meshes.* Int. J. Heat Mass Transfer 255, 127790 (2026); DOI 10.1016/j.ijheatmasstransfer.2025.127790; arXiv:2509.01099. | Modern GPU ISLBM: quadratic-interp streaming on a smoothly-stretched (growth ≤1.0044) Cartesian mesh at **60-70% of uniform MLUPS**, stable, ~3rd order. The realistic cost estimate for a Phase-3 bulk gather on sm_120; non-coalesced access is the dominant penalty. |
+| Krämer, A., Küllmer, K., Reith, D., Joppich, W., Foysi, H.: *Semi-Lagrangian off-lattice Boltzmann method for weakly compressible flows.* Phys. Rev. E 95(2), 023305 (2017); DOI 10.1103/PhysRevE.95.023305. | SLLBM: backtrace each velocity's characteristic to an off-node departure point, interpolate. Genuinely continuous + decouples Δt from Δx + arbitrary meshes — but a near-total kernel rewrite with non-exact mass conservation. Rejected as a near-term path; the most powerful long-term option. |
+| Shu, C., Niu, X.D., Chew, Y.T.: *Taylor-series expansion and least-squares-based lattice Boltzmann method (TLLBM).* Phys. Rev. E 65(3), 036708 (2002); DOI 10.1103/PhysRevE.65.036708. | Mesh-agnostic Taylor+least-squares update ("no limitation on mesh structure"). A generalized interpolation LBM; heavier machinery than ISLBM for similar payoff. Noted, not adopted. |
+| Di Ilio, G., Dorschner, B., Bella, G., Succi, S., Karlin, I.V.: *Simulation of turbulent flows with the entropic multirelaxation time lattice Boltzmann method on body-fitted meshes.* J. Fluid Mech. 849, 35-56 (2018); DOI 10.1017/jfm.2018.413. | Semi-Lagrangian streaming + entropic collision + FE interpolation on body-fitted unstructured meshes (cylinder wake Re=3900). The body-fitted SLLBM variant; same rewrite cost verdict as Krämer 2017. |
+
 VG-placement anchors (Lin 2002; Strausak 2021; Wentz & Seetharam; McGhee &
 Beasley TM X-72843) carry over from the tables above and drive the FoilCFD
 VG-guidance overlay (Lin: VGs 5-10 h upstream of separation onset, h = 0.1-1.0
