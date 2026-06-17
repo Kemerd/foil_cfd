@@ -23,6 +23,7 @@ add_library(foilcfd_test_sim STATIC
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_core.cu
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_refine.cu
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_solver.cpp
+    ${CMAKE_SOURCE_DIR}/src/sim/lbm_stretch.cpp
     ${CMAKE_SOURCE_DIR}/src/sim/lbm_wallmodel.cu
     ${CMAKE_SOURCE_DIR}/src/sim/wall_model.cpp)
 target_include_directories(foilcfd_test_sim PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -113,7 +114,7 @@ add_test(NAME cuda_smoke COMMAND cuda_smoke)
 # Physics milestones M0-M3 (plan section 10 + plan M-refine). Host TUs
 # driving the solver's public API; all device work happens in the sim module.
 foreach(gpu_test IN ITEMS m0_taylor_green m1_cavity m2_cylinder m3_refine
-        m4_finer m4_wallmodel)
+        m4_finer m4_wallmodel m6_stretch)
     add_executable(${gpu_test} ${gpu_test}.cpp)
     target_link_libraries(${gpu_test} PRIVATE foilcfd_test_sim)
     add_test(NAME ${gpu_test} COMMAND ${gpu_test})

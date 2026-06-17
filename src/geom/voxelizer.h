@@ -136,6 +136,21 @@ std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
                                               float aoa_deg,
                                               const DomainLayout& layout);
 
+/// @brief Unsigned distance (in cells) from every cell to the nearest Solid
+/// cell of @p flags, via an exact separable Euclidean distance transform
+/// (Felzenszwalb-Huttenlocher; three 1-D lower-envelope sweeps, O(N)). Geometry
+/// agnostic: the Solid set can be a voxelized airfoil, VG vanes, or an imported
+/// STL — anything stamped Solid seeds the transform. Computed on the CLEAN
+/// (VG-free) flag field so the metric tracks the body surface and is stable
+/// across transient VG edits. Drives the ISLBM stretched-mesh spacing profile
+/// (sim/lbm_stretch.h): finest dx at the wall (distance 0), coarsening outward.
+/// Solid cells get distance 0.
+/// @param dims  Grid dims.
+/// @param flags Flag field; index = x + nx*(y + ny*z), CellFlag::Solid = wall.
+/// @return dims.cellCount() floats, distance in cells, same index convention.
+std::vector<float> buildWallDistanceField(const GridDims& dims,
+                                          const std::vector<std::uint8_t>& flags);
+
 // ===========================================================================
 // Refinement-patch flag construction (two-level ML-LBM). The fine level is a
 // 2x-finer sub-box of the coarse domain spanning the full z extent; its flag

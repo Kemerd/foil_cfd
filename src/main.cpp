@@ -576,6 +576,43 @@ void applyRefinement(App& app) {
         app.finerFlags.clear();
     };
 
+    // ---- ISLBM stretched-mesh mode (continuous-gradient refinement) -------
+    // One smoothly-stretched grid replaces the discrete levels: build the wall-
+    // distance field over the live solids (foil + VGs, so the mesh concentrates
+    // around the vanes too) and hand it to the solver, which sizes dx finest at
+    // the wall. Mutually exclusive with the cascade — tear any levels down first.
+    // Falls back to a uniform grid if the build fails (OOM) or no solids exist.
+    if (app.params.refine.meshMode == UIParams::MeshMode::Stretch
+        && !app.stlActive) {
+        app.solver.shutdownRefinement(); // drop any cascade levels
+        app.patchBox = PatchBox{};
+        app.fineFlags.clear();
+        clearFiner();
+        const std::vector<float> wallDist =
+            buildWallDistanceField(app.layout.dims, app.activeFlags);
+        std::string serr;
+        if (app.solver.initStretchMode(wallDist, &serr)) {
+            const StretchInfo si = app.solver.stretchInfo();
+            char msg[200];
+            std::snprintf(msg, sizeof msg,
+                          "stretched mesh (ISLBM): dx %.3g->%.3g mm (growth "
+                          "x%.4f/y%.4f), tau wall %.3f -> far %.3f%s",
+                          si.dxMin * 1e3f, si.dxMax * 1e3f, si.growthX,
+                          si.growthY, si.tauWall, si.tauFar,
+                          si.tauFloorClamped ? " [tau-floor clamped]" : "");
+            logLine(msg);
+        } else {
+            setStatus(app, "stretched mesh unavailable: " + serr
+                               + " — running uniform grid");
+            app.solver.shutdownStretchMode();
+        }
+        applyWallModelPolicy(app); // the (single) finest level changed
+        return;
+    }
+    // Leaving stretch mode (or never in it): make sure the solver isn't holding
+    // a stale stretched mesh before the cascade path below allocates levels.
+    app.solver.shutdownStretchMode();
+
     if (factor < 2 || app.stlActive) {
         app.solver.shutdownRefinement();
         app.patchBox = PatchBox{};
@@ -1388,6 +1425,23 @@ void updateReadouts(App& app) {
         rr.qlibbActive   = qr.enabled && qr.links > 0;
         rr.qlibbLinks    = qr.links;
         rr.qlibbFallback = qr.fallback;
+    }
+
+    // ISLBM stretched-mesh status (mutually exclusive with the cascade above;
+    // its readout is zeroed whenever the mesh is off).
+    {
+        const StretchInfo si = app.solver.stretchInfo();
+        auto& sr = app.readouts.stretch;
+        sr.active          = si.active;
+        sr.dxMin           = si.dxMin;
+        sr.dxMax           = si.dxMax;
+        sr.growthX         = si.growthX;
+        sr.growthY         = si.growthY;
+        sr.tauWall         = si.tauWall;
+        sr.tauFar          = si.tauFar;
+        sr.tauFloorClamped = si.tauFloorClamped;
+        sr.fluidCellSaving = si.fluidCellSaving;
+        sr.vramGB          = si.vramBytes / (1024.0 * 1024.0 * 1024.0);
     }
     // The presolve runs synchronously inside the apply functions, so there is
     // never a mid-flight progress value to report between frames.

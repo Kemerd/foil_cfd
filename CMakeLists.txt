@@ -108,6 +108,7 @@ add_executable(FoilCFD
     src/sim/lbm_core.cu
     src/sim/lbm_refine.cu
     src/sim/lbm_solver.cpp
+    src/sim/lbm_stretch.cpp
     src/sim/lbm_wallmodel.cu
     src/sim/snapshot.cpp
     src/sim/wall_model.cpp)

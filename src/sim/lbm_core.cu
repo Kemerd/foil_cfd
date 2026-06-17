@@ -5,6 +5,7 @@
 // FoilCFD - PolyForm Noncommercial 1.0.0 - see LICENSE
 
 #include "lbm_core.cuh"
+#include "lbm_stretch.h" // ISLBM stretched-mesh view + tunables
 
 #include <cmath>
 #include <type_traits> // std::true_type/false_type tags for the 2x2 dispatch
@@ -89,6 +90,28 @@ __device__ __forceinline__ void unpackPadded(long long pcell, int nx, long long 
     y = static_cast<int>(rem / nx);
     x = static_cast<int>(rem - static_cast<long long>(y) * nx);
     z = zp - 1; // padded plane 0 is the low ghost (z = -1)
+}
+
+/// @brief ISLBM bulk predicate: true when cell (x,y,z) is far enough from every
+/// non-fluid cell AND domain face that the interpolated-gather stencil (a 5x5
+/// in-plane neighbourhood — Chebyshev radius kStretchCollarCells — plus the two
+/// z-neighbour planes) reads ONLY Fluid. Bulk cells take the off-node gather;
+/// everything within the collar keeps the exact integer flag-predicated pull,
+/// where bounce-back / slip mirror / q-LIBB are well-defined. The home cell is
+/// already known Fluid by the caller. z rides the ghost planes (flag ghosts are
+/// valid post-refreshGhostZFlags), so no z-wrap arithmetic here.
+__device__ __forceinline__ bool islbmIsBulk(const std::uint8_t* flags, int x,
+                                            int y, int z, int nx, int ny,
+                                            long long nxny) {
+    const int m = kStretchCollarCells;
+    if (x < m || x >= nx - m || y < m || y >= ny - m) return false;
+#pragma unroll
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -m; dy <= m; ++dy)
+            for (int dx = -m; dx <= m; ++dx)
+                if (flags[pIdx(x + dx, y + dy, z + dz, nx, nxny)] != kFlagFluid)
+                    return false;
+    return true;
 }
 
 // ===========================================================================
@@ -210,7 +233,7 @@ __global__ void initFromMacroKernel(FPop* __restrict__ f,
 /// back links (lbm_wallmodel.cuh); WM = false is the exact pre-wall-model
 /// kernel — the if constexpr blocks vanish, so the plain path stays
 /// bit-identical and pays nothing.
-template <bool WM, bool QLIBB>
+template <bool WM, bool QLIBB, bool ISLBM>
 __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     FPop* __restrict__ dst,
                                     const std::uint8_t* __restrict__ flags,
@@ -223,7 +246,8 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
                                     float tau0, float magicLambda,
                                     float smagPrefactor, float uInlet,
                                     int writeMacro, WallSlipView slip,
-                                    QLinkView qlink) {
+                                    QLinkView qlink, StretchView stretch,
+                                    float tauRampMul) {
     const long long cell =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (cell >= ncells) return;
@@ -303,9 +327,70 @@ __global__ void streamCollideKernel(const FPop* __restrict__ src,
     float uwx = 0.0f, uwy = 0.0f, uwz = 0.0f;
     bool uwLoaded = false;
 
+    // ISLBM: the relaxation time varies per cell (nu_lat ~ 1/dx(i)^2). Read the
+    // per-cell tau and apply the startup ramp to its VISCOSITY part (tau-1/2),
+    // so the whole graded field eases in from rest like the scalar ramp does for
+    // the uniform/cascade modes. Inert (compiles to nothing) when ISLBM=false:
+    // tau0 stays the scalar the launch wrapper passed.
+    bool islbmBulk = false;
+    if constexpr (ISLBM) {
+        const float tauCell = stretch.tauField[cell];
+        tau0 = 0.5f + tauRampMul * (tauCell - 0.5f);
+        // A bulk cell's whole gather stencil is pure fluid -> the off-node
+        // interpolated pull is well-defined; collar cells fall back to the exact
+        // integer flag-predicated pull below. ny is implicit in nxny/nx.
+        const int ny = static_cast<int>(nxny / nx);
+        islbmBulk = islbmIsBulk(flags, x, y, z, nx, ny, nxny);
+    }
+
     float fpop[kQ];
 #pragma unroll
     for (int q = 0; q < kQ; ++q) {
+        // ---- ISLBM bulk gather: recover the population at the off-node
+        // characteristic foot by a separable 3-tap quadratic interpolation
+        // (He-Luo 1996). In index space the foot of a pull link sits at
+        // (x,y) + footBase + footFrac per axis; Z is uniform so it uses the
+        // integer upstream neighbour. All 9 in-plane taps are fluid (bulk), so
+        // the source slice is q itself — no flag-predicated selection. ------
+        if constexpr (ISLBM) {
+            if (islbmBulk) {
+                const int   cxq = d_cx[q], cyq = d_cy[q];
+                const bool  mvx = (cxq != 0), mvy = (cyq != 0);
+                // signBit: 0 = link travels -1 in index (pull from -x side).
+                const int   sgx = (cxq > 0) ? 0 : 1;
+                const int   sgy = (cyq > 0) ? 0 : 1;
+                const float fx = mvx ? stretch.footFracX[sgx * nx + x] : 0.0f;
+                const int   bx = x + (mvx ? stretch.footBaseX[sgx * nx + x] : 0);
+                const float fy = mvy ? stretch.footFracY[sgy * stretch.ny + y]
+                                     : 0.0f;
+                const int   by = y + (mvy ? stretch.footBaseY[sgy * stretch.ny + y]
+                                          : 0);
+                // Quadratic Lagrange weights over {-1,0,+1} from the fraction.
+                const float wxm = 0.5f * fx * (fx - 1.0f);
+                const float wx0 = 1.0f - fx * fx;
+                const float wxp = 0.5f * fx * (fx + 1.0f);
+                const float wym = 0.5f * fy * (fy - 1.0f);
+                const float wy0 = 1.0f - fy * fy;
+                const float wyp = 0.5f * fy * (fy + 1.0f);
+                const int   zn0 = z - d_cz[q]; // Z uniform: integer neighbour
+                const long long qBase = static_cast<long long>(q) * ncellsPad;
+                float acc = 0.0f;
+#pragma unroll
+                for (int dyi = -1; dyi <= 1; ++dyi) {
+                    const float wy = (dyi < 0) ? wym : (dyi == 0) ? wy0 : wyp;
+#pragma unroll
+                    for (int dxi = -1; dxi <= 1; ++dxi) {
+                        const float wx = (dxi < 0) ? wxm : (dxi == 0) ? wx0 : wxp;
+                        acc += wx * wy
+                             * load_f(src, qBase
+                                            + pIdx(bx + dxi, by + dyi, zn0, nx, nxny));
+                    }
+                }
+                fpop[q] = acc;
+                continue; // skip the integer flag-predicated body for bulk
+            }
+        }
+
         const int xn = x - d_cx[q];
         const int yn = y - d_cy[q];
         const int zn = z - d_cz[q];
@@ -818,7 +903,8 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 const StepParams& params,
                                 float* macroRho, float* macroU, float* macroV,
                                 float* macroW, cudaStream_t stream,
-                                WallSlipView slip, QLinkView qlink) {
+                                WallSlipView slip, QLinkView qlink,
+                                StretchView stretch) {
     const long long ncells = src.dims.cellCount();
     if (ncells <= 0 || !src.f || !dst.f || !src.flags) return cudaErrorInvalidValue;
     const bool wantMacro = params.writeMacro && macroRho && macroU && macroV && macroW;
@@ -829,25 +915,37 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
         ? 18.0f * 1.41421356f * params.smagorinskyCs * params.smagorinskyCs
         : 0.0f;
 
-    // 2x2 template dispatch over (WM, QLIBB) keeps every path's machine code
-    // untouched: the <false,false> instantiation IS the original kernel, and a
-    // disabled feature's if-constexpr block vanishes (zero cost).
+    // 2x2x2 template dispatch over (WM, QLIBB, ISLBM) keeps every path's machine
+    // code untouched: the <false,false,false> instantiation IS the original
+    // kernel, and a disabled feature's if-constexpr block vanishes (zero cost).
+    // Uniform/cascade callers pass no stretch view -> ISLBM=false -> unchanged.
     const bool wm = slip.active();
     const bool ql = qlink.active();
-    auto launch = [&](auto wmTag, auto qlTag) {
-        streamCollideKernel<decltype(wmTag)::value, decltype(qlTag)::value>
+    const bool is = stretch.active();
+    auto launch = [&](auto wmTag, auto qlTag, auto isTag) {
+        streamCollideKernel<decltype(wmTag)::value, decltype(qlTag)::value,
+                            decltype(isTag)::value>
             <<<gridFor(ncells), kBlock, 0, stream>>>(
                 src.f, dst.f, src.flags, macroRho, macroU, macroV, macroW,
                 ncells, src.dims.paddedCellCount(), nxny, src.dims.nx,
                 params.tau, params.magicLambda, smagPre, params.uInlet,
-                wantMacro ? 1 : 0, slip, qlink);
+                wantMacro ? 1 : 0, slip, qlink, stretch, params.tauRampMul);
     };
     using T = std::true_type;
     using F = std::false_type;
-    if (wm && ql)        launch(T{}, T{});
-    else if (wm && !ql)  launch(T{}, F{});
-    else if (!wm && ql)  launch(F{}, T{});
-    else                 launch(F{}, F{});
+    if (!is) {
+        // Uniform / cascade: the original 2x2 paths, ISLBM tag false.
+        if (wm && ql)        launch(T{}, T{}, F{});
+        else if (wm && !ql)  launch(T{}, F{}, F{});
+        else if (!wm && ql)  launch(F{}, T{}, F{});
+        else                 launch(F{}, F{}, F{});
+    } else {
+        // ISLBM stretched mesh: same WM/QLIBB matrix, ISLBM tag true.
+        if (wm && ql)        launch(T{}, T{}, T{});
+        else if (wm && !ql)  launch(T{}, F{}, T{});
+        else if (!wm && ql)  launch(F{}, T{}, T{});
+        else                 launch(F{}, F{}, T{});
+    }
     return cudaGetLastError();
 }
 

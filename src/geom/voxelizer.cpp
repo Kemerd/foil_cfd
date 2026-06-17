@@ -193,6 +193,103 @@ std::vector<std::uint8_t> buildCleanFoilFlags(const AirfoilGeometry& airfoil,
     return flags;
 }
 
+namespace {
+// Exact 1-D squared-distance transform (Felzenszwalb & Huttenlocher 2012):
+// given per-sample seed costs f[i] (0 at a seed, +inf elsewhere), overwrite f
+// with min_j ( (i-j)^2 + f[j] ) by computing the lower envelope of the family
+// of upward parabolas rooted at each sample. O(n) per row. The full 3-D EDT is
+// this sweep run independently along x, then y, then z (separability of the
+// squared Euclidean metric); the result is exact, not a chamfer approximation.
+void edt1D(std::vector<float>& f, int n, std::vector<int>& v,
+           std::vector<float>& z, std::vector<float>& out) {
+    const float kInf = std::numeric_limits<float>::infinity();
+    int k = 0;          // index of the rightmost parabola in the lower envelope
+    v[0] = 0;           // locations of the envelope parabolas
+    z[0] = -kInf;       // breakpoints between consecutive envelope parabolas
+    z[1] = kInf;
+    for (int q = 1; q < n; ++q) {
+        // Intersection of the parabola from q with the current rightmost one;
+        // pop envelope parabolas the new one now dominates.
+        float s;
+        while (true) {
+            const int vk = v[k];
+            s = ((f[q] + static_cast<float>(q) * q)
+                 - (f[vk] + static_cast<float>(vk) * vk))
+                / (2.0f * static_cast<float>(q - vk));
+            if (s <= z[k]) --k; else break;
+        }
+        ++k;
+        v[k]     = q;
+        z[k]     = s;
+        z[k + 1] = kInf;
+    }
+    // Walk the envelope left to right, sampling the lowest parabola at each i.
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < static_cast<float>(q)) ++k;
+        const int vk = v[k];
+        const float d = static_cast<float>(q - vk);
+        out[q] = d * d + f[vk];
+    }
+}
+} // namespace
+
+std::vector<float> buildWallDistanceField(
+    const GridDims& dims, const std::vector<std::uint8_t>& flags) {
+    const int nx = dims.nx, ny = dims.ny, nz = dims.nz;
+    const long long n = dims.cellCount();
+    const float kInf = std::numeric_limits<float>::infinity();
+    const auto solid = static_cast<std::uint8_t>(CellFlag::Solid);
+
+    // Seed: 0 at every Solid cell, +inf elsewhere. The transform then carries
+    // the squared distance to the nearest seed through the three axis sweeps.
+    std::vector<float> sq(static_cast<std::size_t>(n));
+    for (long long i = 0; i < n; ++i)
+        sq[static_cast<std::size_t>(i)] =
+            (flags[static_cast<std::size_t>(i)] == solid) ? 0.0f : kInf;
+
+    // Scratch reused across rows (sized to the longest axis).
+    const int maxN = std::max(nx, std::max(ny, nz));
+    std::vector<float> f(maxN), out(maxN), z(maxN + 1);
+    std::vector<int>   v(maxN);
+    auto idx = [nx, ny](int x, int y, int zc) {
+        return static_cast<std::size_t>(x)
+             + static_cast<std::size_t>(nx) * (y + static_cast<long long>(ny) * zc);
+    };
+
+    // --- sweep along x (rows over fixed y,z) ---
+    for (int zc = 0; zc < nz; ++zc)
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) f[x] = sq[idx(x, y, zc)];
+            edt1D(f, nx, v, z, out);
+            for (int x = 0; x < nx; ++x) sq[idx(x, y, zc)] = out[x];
+        }
+    // --- sweep along y (columns over fixed x,z) ---
+    for (int zc = 0; zc < nz; ++zc)
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) f[y] = sq[idx(x, y, zc)];
+            edt1D(f, ny, v, z, out);
+            for (int y = 0; y < ny; ++y) sq[idx(x, y, zc)] = out[y];
+        }
+    // --- sweep along z (pillars over fixed x,y) ---
+    for (int y = 0; y < ny; ++y)
+        for (int x = 0; x < nx; ++x) {
+            for (int zc = 0; zc < nz; ++zc) f[zc] = sq[idx(x, y, zc)];
+            edt1D(f, nz, v, z, out);
+            for (int zc = 0; zc < nz; ++zc) sq[idx(x, y, zc)] = out[zc];
+        }
+
+    // Squared distance -> distance in cells. A domain with no Solid at all
+    // (kInf everywhere) reports 0 so the caller falls back to a uniform mesh.
+    std::vector<float> dist(static_cast<std::size_t>(n));
+    for (long long i = 0; i < n; ++i) {
+        const float s = sq[static_cast<std::size_t>(i)];
+        dist[static_cast<std::size_t>(i)] =
+            std::isfinite(s) ? std::sqrt(s) : 0.0f;
+    }
+    return dist;
+}
+
 // ===========================================================================
 // Refinement-patch flag construction (plan M-refine). The fine level reuses
 // the SAME voxelization machinery as the coarse grid — the only differences

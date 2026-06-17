@@ -1752,10 +1752,50 @@ void drawMeshPanel(UIContext& ctx) {
         "domain. Effective Re is shared across levels — the patch buys "
         "RESOLUTION at the same Re, not a higher Re.");
 
-    // Patch resolution: 1x = uniform grid (off), 2x..4x = fine-level factor.
-    // Cost grows steeply (~m^4 in time, m^3 in VRAM) — the help text and the
-    // live VRAM readout below keep the bill visible.
+    // Mesh mode: how the solver concentrates resolution. Cascade is the proven
+    // discrete x2 staircase; Stretch is the ISLBM continuous-gradient mesh (one
+    // smoothly-stretched grid, finest at the wall, no levels or seams). The
+    // factor / VG-patch controls below apply to Cascade mode only.
     {
+        static const char* kModeNames[] = {
+            "Uniform  (no refinement)",
+            "Cascade  (discrete 2x levels)",
+            "Stretch  (ISLBM continuous gradient)"};
+        int midx = static_cast<int>(p.refine.meshMode);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##meshmode", &midx, kModeNames, 3)) {
+            p.refine.meshMode = static_cast<UIParams::MeshMode>(midx);
+            ev.meshRefinementChanged = true;
+        }
+        helpMarker("Cascade: the discrete x2 refinement staircase (fine patch + "
+                   "nested VG box) — proven, exactly conservative. Stretch "
+                   "(ISLBM): a single grid whose cells grow smoothly from finest "
+                   "at the wall to coarsest in the far field — the continuous "
+                   "'gradient' refinement, auto-built from the geometry, with no "
+                   "interface seams. The wall keeps an exact bounce-back collar "
+                   "so lift/drag stay trustworthy; the bulk uses an interpolated "
+                   "gather (~60-70% of uniform throughput).");
+
+        // The stretched-mesh readout: dx range, growth, tau wall->far, savings.
+        if (p.refine.meshMode == UIParams::MeshMode::Stretch
+            && r.stretch.active) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                               "dx %.3g->%.3g mm  growth x%.4f/y%.4f",
+                               r.stretch.dxMin * 1e3f, r.stretch.dxMax * 1e3f,
+                               r.stretch.growthX, r.stretch.growthY);
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                               "tau %.3f (wall) -> %.3f (far)%s",
+                               r.stretch.tauWall, r.stretch.tauFar,
+                               r.stretch.tauFloorClamped ? "  [floor clamped]"
+                                                         : "");
+        }
+    }
+
+    // Patch resolution (Cascade mode): 1x = uniform grid (off), 2x..4x = fine-
+    // level factor. Cost grows steeply (~m^4 in time, m^3 in VRAM) — the help
+    // text and the live VRAM readout below keep the bill visible. Disabled while
+    // the Stretch mesh owns the resolution.
+    if (p.refine.meshMode != UIParams::MeshMode::Stretch) {
         static const char* kFactorNames[] = {
             "Off  (1x, uniform grid)",
             "2x  (recommended)",

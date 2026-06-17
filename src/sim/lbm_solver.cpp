@@ -200,6 +200,153 @@ struct LBMSolver::Impl {
         return DeviceLatticeView{fine.f[which], fine.flags, fine.dims};
     }
 
+    // ---- N-level cascade (graded refinement, 2026-06-16) -------------------
+    // The historical design has exactly two refinement levels: `fine` (rung 0,
+    // 2x the coarse grid, hugging the foil) and `finer` (rung 1, nested 2x the
+    // fine grid around the VGs). The cascade generalizes this to an arbitrary
+    // staircase of integer-2x rungs WITHOUT touching the level-agnostic coupling
+    // kernels: each rung is an exact 2x of its parent, tau telescopes
+    // (fineTauFor composes), and the coarse-to-fine fill / fine-to-coarse
+    // restrict pair couples any (parent, child) pair identically.
+    //
+    // To keep the ~170 existing references to `fine`/`finer` (and the proven
+    // 2-level tests) working verbatim, the first two rungs REMAIN the named
+    // `fine`/`finer` members; rungs at depth >= 2 live in `extraLevels`. The
+    // `chain` vector is the unifying iteration order, rebuilt by syncChain()
+    // whenever a level is (de)allocated: chain[0] = &fine, chain[1] = &finer
+    // (only while active), chain[2..] = &extraLevels[i]. Parallel vectors hold
+    // each deep rung's wall-model + q-LIBB mirror and host flag copies, indexed
+    // the same way (chain depth d >= 2 -> extra* [d-2]).
+    std::vector<FineLevel> extraLevels;        ///< Rungs at cascade depth >= 2.
+    std::vector<FineLevel*> chain;             ///< Active rungs, parent->child.
+
+    // ---- ISLBM stretched-mesh mode (continuous-gradient refinement) -------
+    // Mutually exclusive with the cascade: when this is active no refinement
+    // levels are allocated and stepN routes the single coarse grid through the
+    // interpolated-gather kernel. Rebuilt from the wall-distance field on every
+    // geometry edit; the host copy is kept so setFlags can rebuild it.
+    StretchMesh stretch;                       ///< Device mesh + diagnostics.
+    std::vector<float> stretchWallDist;        ///< Host wall-distance field copy.
+
+    /// @brief View over one buffer of cascade rung @p depth (0 = fine).
+    DeviceLatticeView chainView(int depth, int which) const {
+        const FineLevel* L = chain[depth];
+        return DeviceLatticeView{L->f[which], L->flags, L->dims};
+    }
+
+    /// @brief Rebuild `chain` from the live level storage. chain[0]=&fine when
+    /// fine is active, then &finer if active, then each active extra rung. The
+    /// strict nesting invariant (a rung is active only if its parent is) means
+    /// the active prefix is contiguous, so iteration stops at the first gap.
+    void syncChain() {
+        chain.clear();
+        if (!fine.active) return;
+        chain.push_back(&fine);
+        if (!finer.active) return;
+        chain.push_back(&finer);
+        for (FineLevel& e : extraLevels) {
+            if (!e.active) break;
+            chain.push_back(&e);
+        }
+    }
+
+    /// @brief This rung's wall-model slip view (named members at depth 0/1, the
+    /// wmExtra vector beyond — the same indexing syncChain uses).
+    WallSlipView chainSlip(int depth) const {
+        return (depth == 0) ? wmFine.slipView()
+             : (depth == 1) ? wmFiner.slipView()
+                            : wmExtra[depth - 2].slipView();
+    }
+    /// @brief This rung's q-LIBB link view (same depth indexing).
+    QLinkView chainQLink(int depth) const {
+        return (depth == 0) ? qFine.view()
+             : (depth == 1) ? qFiner.view()
+                            : qExtra[depth - 2].view();
+    }
+
+    /// @brief Recursively advance cascade rung @p depth by its factor sub-steps
+    /// against its parent, then restrict it back into the parent buffers. The
+    /// depth-general form of the historical fine/finer block; couples any
+    /// (parent, child) pair with the level-agnostic fill/restrict kernels
+    /// (tau telescopes via fineTauFor). Recursion-before-swap is preserved so
+    /// both of a rung's time-level buffers stay valid for its child's fill.
+    /// @param depth        Index into `chain` (0 = fine, coupled to coarse).
+    /// @param parentParams The parent rung's StepParams (its tau is the base
+    ///                     for this rung's fineTauFor).
+    /// @param parentT0     Parent buffer view at time t (pre-swap source).
+    /// @param parentT1Buf  Parent f buffer at time t+1 (post-collision).
+    /// @param parentDstBuf Parent f buffer the restriction overwrites.
+    /// @param macroRho/U/V/W Coarse macro arrays to write on a render step
+    ///                     (depth 0 only; null deeper and on non-render steps).
+    cudaError_t advanceCascadeRung(int depth, const StepParams& parentParams,
+                                   DeviceLatticeView parentT0, FPop* parentT1Buf,
+                                   FPop* parentDstBuf, float* macroRho,
+                                   float* macroU, float* macroV, float* macroW) {
+        FineLevel& L = *chain[depth];
+        const int   m    = L.factor;
+        const float tauP = parentParams.tau;
+        const float tauL = fineTauFor(tauP, m);
+        StepParams lp = parentParams;
+        lp.tau        = tauL;
+        lp.writeMacro = false; // refinement levels never own macro arrays
+
+        const WallSlipView slip  = chainSlip(depth);
+        const QLinkView    qlink = chainQLink(depth);
+        const bool hasChild = (depth + 1) < static_cast<int>(chain.size());
+
+        for (int k = 0; k < m; ++k) {
+            // Fill: sub-step k sees the parent field time-interpolated at
+            // t + k/m (the two parent buffers bracket it).
+            if (auto e = launchCoarseToFineFill(
+                    parentT0, parentT1Buf, chainView(depth, L.src), L.box, m,
+                    static_cast<float>(k) / static_cast<float>(m), tauP, tauL,
+                    /*fullVolume=*/false, stream);
+                e != cudaSuccess)
+                return e;
+            if (auto e = launchRefreshGhostZ(L.f[L.src], L.dims, stream);
+                e != cudaSuccess)
+                return e;
+            if (auto e = launchStreamCollide(
+                    chainView(depth, L.src), chainView(depth, 1 - L.src), lp,
+                    nullptr, nullptr, nullptr, nullptr, stream, slip, qlink);
+                e != cudaSuccess)
+                return e;
+            if (auto e = launchRefreshGhostZ(L.f[1 - L.src], L.dims, stream);
+                e != cudaSuccess)
+                return e;
+
+            // Recurse into the child BEFORE swapping this rung: both of this
+            // rung's buffers (t = L.f[L.src], t+1 = L.f[1-L.src]) are valid and
+            // ghost-refreshed, the contract the child's fill needs. The child
+            // restricts into this rung's t+1 buffer, carried up by the restrict
+            // below.
+            if (hasChild) {
+                if (auto e = advanceCascadeRung(
+                        depth + 1, lp, chainView(depth, L.src),
+                        L.f[1 - L.src], L.f[1 - L.src],
+                        nullptr, nullptr, nullptr, nullptr);
+                    e != cudaSuccess)
+                    return e;
+            }
+
+            L.src = 1 - L.src; // swap only after the child subtree finished
+        }
+
+        // Restrict this rung -> the parent's post-collision buffer (+ the
+        // coarse macro arrays at depth 0 on a render step; deeper rungs carry
+        // their moments up through the chain of restrictions).
+        if (auto e = launchFineToCoarseRestrict(
+                chainView(depth, L.src),
+                DeviceLatticeView{parentDstBuf, parentT0.flags, parentT0.dims},
+                L.box, m, tauP, tauL, macroRho, macroU, macroV, macroW, stream);
+            e != cudaSuccess)
+            return e;
+        if (auto e = launchRefreshGhostZ(parentDstBuf, parentT0.dims, stream);
+            e != cudaSuccess)
+            return e;
+        return cudaSuccess;
+    }
+
     // ---- nested VG patch (third level) -------------------------------------
     // The finer level is a FineLevel reused one rung down: its `box` is in FINE
     // cells, its parent is `fine` (not the coarse grid), and it couples to the
@@ -263,6 +410,9 @@ struct LBMSolver::Impl {
     WMLevel wmFiner; ///< Nested VG patch wall list (VGs live here at the
                      ///< finest resolution — this is the level whose wall
                      ///< stress the readout reports when active).
+    /// Wall-model mirrors for cascade rungs at depth >= 2 (parallel to
+    /// extraLevels; wmExtra[i] belongs to extraLevels[i]).
+    std::vector<WMLevel> wmExtra;
 
     // ---- interpolated bounce-back (q-LIBB) per level -----------------------
     // The dense per-cell-per-direction cut-fraction field the hot kernel reads
@@ -288,6 +438,8 @@ struct LBMSolver::Impl {
     QLevel qCoarse;              ///< (Normally inactive — vanes unresolved here.)
     QLevel qFine;
     QLevel qFiner;
+    /// q-LIBB mirrors for cascade rungs at depth >= 2 (parallel to extraLevels).
+    std::vector<QLevel> qExtra;
     // NOTE: the analytic vane slabs + q-link construction live in the GEOM layer
     // (vg.h buildVaneQLinks/densifyQLinks); the app builds the dense fields and
     // hands them here via setFineQLinks/setFinerQLinks, so the solver stays
@@ -302,6 +454,11 @@ struct LBMSolver::Impl {
     // Finer-level analogs (the live finer flags + the clean VG-free reference).
     std::vector<std::uint8_t> finerHostFlags;
     std::vector<std::uint8_t> finerSurfaceRefFlags;
+
+    // Host flag copies for cascade rungs at depth >= 2 (live + clean reference),
+    // parallel to extraLevels — the wall-list rebuild needs them per rung.
+    std::vector<std::vector<std::uint8_t>> extraHostFlags;
+    std::vector<std::vector<std::uint8_t>> extraSurfaceRefFlags;
 
     /// @brief Build one level's wall-cell list on the host and mirror it to
     /// the device. Frees the previous mirror first; leaves the level inactive
@@ -470,21 +627,52 @@ struct LBMSolver::Impl {
     /// of both levels — cold starts must not inherit the previous run's wall
     /// stress.
     void resetWallModelState() {
-        for (WMLevel* wm : {&wmCoarse, &wmFine, &wmFiner}) {
-            if (!wm->active) continue;
-            const long long n = (wm == &wmCoarse) ? ncells
-                              : (wm == &wmFine)   ? fine.ncells
-                                                  : finer.ncells;
-            cudaMemsetAsync(wm->dUTau, 0, wm->count * sizeof(float), stream);
-            cudaMemsetAsync(wm->dUwx, 0, n * sizeof(std::uint16_t), stream);
-            cudaMemsetAsync(wm->dUwy, 0, n * sizeof(std::uint16_t), stream);
-            cudaMemsetAsync(wm->dUwz, 0, n * sizeof(std::uint16_t), stream);
-        }
+        // (WMLevel*, cell-count) for the coarse grid + every active cascade
+        // rung. The deep rungs (depth >= 2) pull their count from extraLevels.
+        auto zero = [this](WMLevel& wm, long long n) {
+            if (!wm.active) return;
+            cudaMemsetAsync(wm.dUTau, 0, wm.count * sizeof(float), stream);
+            cudaMemsetAsync(wm.dUwx, 0, n * sizeof(std::uint16_t), stream);
+            cudaMemsetAsync(wm.dUwy, 0, n * sizeof(std::uint16_t), stream);
+            cudaMemsetAsync(wm.dUwz, 0, n * sizeof(std::uint16_t), stream);
+        };
+        zero(wmCoarse, ncells);
+        zero(wmFine, fine.ncells);
+        zero(wmFiner, finer.ncells);
+        for (std::size_t i = 0; i < wmExtra.size(); ++i)
+            zero(wmExtra[i], extraLevels[i].ncells);
+    }
+
+    /// @brief Release one deep cascade rung's device memory (helper for the
+    /// extraLevels storage; the named fine/finer rungs use freeFine/freeFiner).
+    void freeExtraLevel(int i) {
+        FineLevel& e = extraLevels[i];
+        for (FPop*& p : e.f) { cudaFree(p); p = nullptr; }
+        cudaFree(e.flags); e.flags = nullptr;
+        e = FineLevel{};
+        wmExtra[i].free();
+        qExtra[i].free();
+        extraHostFlags[i].clear();
+        extraSurfaceRefFlags[i].clear();
+    }
+
+    /// @brief Release every deep cascade rung (depth >= 2), deepest first so the
+    /// nesting invariant (child freed before parent) holds. Leaves fine/finer.
+    void freeExtraLevels() {
+        for (int i = static_cast<int>(extraLevels.size()) - 1; i >= 0; --i)
+            freeExtraLevel(i);
+        extraLevels.clear();
+        wmExtra.clear();
+        qExtra.clear();
+        extraHostFlags.clear();
+        extraSurfaceRefFlags.clear();
     }
 
     /// @brief Release only the FINER level's device memory. The fine + coarse
     /// sim is untouched (the overlap simply stops receiving finer restrictions).
+    /// Cascade rungs deeper than `finer` nest inside it, so they go first.
     void freeFiner() {
+        freeExtraLevels();
         for (FPop*& p : finer.f) { cudaFree(p); p = nullptr; }
         cudaFree(finer.flags); finer.flags = nullptr;
         finer = FineLevel{};
@@ -492,6 +680,7 @@ struct LBMSolver::Impl {
         qFiner.free();
         finerHostFlags.clear();
         finerSurfaceRefFlags.clear();
+        syncChain();
     }
 
     /// @brief Release only the fine level's device memory.
@@ -508,6 +697,7 @@ struct LBMSolver::Impl {
         qFine.free();
         fineHostFlags.clear();
         fineSurfaceRefFlags.clear();
+        syncChain();
     }
 
     /// @brief Seed the fine level from the CURRENT coarse field: full-volume
@@ -560,6 +750,58 @@ struct LBMSolver::Impl {
                 return err;
         }
         return cudaSuccess;
+    }
+
+    /// @brief Composed base tau at cascade depth @p depth: the coarse tau
+    /// folded through every 2x hop down to that rung (fineTauFor telescopes, so
+    /// folding factor-by-factor is exact). depth -1 returns the coarse tau.
+    float tauAtDepth(int depth) const {
+        float tau = effectiveTau();
+        for (int d = 0; d <= depth && d < static_cast<int>(chain.size()); ++d)
+            tau = fineTauFor(tau, chain[d]->factor);
+        return tau;
+    }
+
+    /// @brief Seed a deep cascade rung (depth >= 2, the i-th extra level) from
+    /// its CURRENT parent field — the depth-general form of seedFinerFromFine.
+    /// The parent is chain[depth-1]; both parent time levels point at the same
+    /// buffer (weight 0: a snapshot, not a time interpolation).
+    cudaError_t seedExtraFromParent(int i) {
+        const int depth = i + 2;            // extra[i] lives at cascade depth i+2
+        if (depth >= static_cast<int>(chain.size())) return cudaSuccess;
+        FineLevel& L = extraLevels[i];
+        const float tauParent = tauAtDepth(depth - 1);
+        const float tauL      = fineTauFor(tauParent, L.factor);
+        const DeviceLatticeView parent = chainView(depth - 1, chain[depth - 1]->src);
+        FPop* parentBuf = chain[depth - 1]->f[chain[depth - 1]->src];
+        for (int b = 0; b < 2; ++b) {
+            if (auto err = launchCoarseToFineFill(
+                    parent, parentBuf, chainView(depth, b), L.box, L.factor,
+                    /*timeWeight=*/0.0f, tauParent, tauL,
+                    /*fullVolume=*/true, stream);
+                err != cudaSuccess)
+                return err;
+            if (auto err = launchRefreshGhostZ(L.f[b], L.dims, stream);
+                err != cudaSuccess)
+                return err;
+        }
+        return cudaSuccess;
+    }
+
+    /// @brief (Re)build a deep cascade rung's wall-cell list (depth >= 2). Same
+    /// shape as rebuildWallModelFiner, keyed off the per-rung host flag copies.
+    void rebuildWallModelExtra(int i) {
+        wmExtra[i].free();
+        FineLevel& L = extraLevels[i];
+        if (!wmEnabled || !L.active
+            || extraHostFlags[i].size() != static_cast<std::size_t>(L.ncells))
+            return;
+        const std::vector<std::uint8_t>& clean =
+            (extraSurfaceRefFlags[i].size() == extraHostFlags[i].size())
+                ? extraSurfaceRefFlags[i]
+                : extraHostFlags[i];
+        buildWMLevel(wmExtra[i], L.dims, extraHostFlags[i], clean,
+                     kWallSampleCellsFine, L.ncells);
     }
 
     /// @brief Recompute whether the patch covers every coarse Solid cell
@@ -781,6 +1023,8 @@ struct LBMSolver::Impl {
     /// @brief Release everything; safe to call repeatedly / when empty.
     void freeAll() {
         freeFine();
+        stretch.free();  // ISLBM device mesh (no-op when uniform/cascade).
+        stretchWallDist.clear();
         wmCoarse.free(); // wmFine already died with freeFine(); the wmEnabled
                          // SETTING survives so re-init reapplies the policy.
         qCoarse.free();  // qFine/qFiner died with freeFine(); the setting survives.
@@ -1166,6 +1410,19 @@ void LBMSolver::applyEditedFlags(const std::vector<std::uint8_t>& flags) {
 }
 
 // ===========================================================================
+// N-level cascade advance (graded refinement). Recursively advances cascade
+// rung `depth` (chain[depth]) by its factor sub-steps against its parent, then
+// restricts it back into the parent's post-collision buffer. This is the
+// depth-general form of the historical two-level fine/finer block: depth 0 is
+// the fine patch coupled to the coarse grid, depth 1 the nested VG patch, and
+// any deeper rung couples to its immediate parent with the SAME level-agnostic
+// fill/restrict kernels (tau telescopes via fineTauFor). The recursion-before-
+// swap ordering is preserved exactly: a rung does not swap its ping-pong until
+// its entire child subtree has advanced and restricted, so both of the rung's
+// time-level buffers stay valid for the child's interface fill.
+// ===========================================================================
+
+// ===========================================================================
 // Stepping + pacing
 // ===========================================================================
 
@@ -1193,10 +1450,22 @@ cudaError_t LBMSolver::stepN(int n) {
         // final step pays the extra 16 B/cell of write traffic (plan 11).
         params.writeMacro = (i == n - 1);
 
+        // ISLBM: the per-cell tau lives in the stretch field, so the startup
+        // viscosity ramp can't ride the scalar `params.tau` — it rides
+        // tauRampMul, the ratio of the ramped to the target viscosity. The
+        // scalar tau is still set (the collar cells, all at the finest spacing,
+        // use it and it equals the wall field value by construction).
+        if (s.stretch.active) {
+            const float nuTarget = s.scaling.tau - 0.5f;
+            const float nuNow    = s.effectiveTau() - 0.5f;
+            params.tauRampMul = (nuTarget > 1e-9f) ? (nuNow / nuTarget) : 1.0f;
+            params.tau        = s.scaling.tau; // wall reference for the collar
+        }
+
         const cudaError_t err = launchStreamCollide(
             s.view(s.src), s.view(1 - s.src), params,
             s.rho, s.u, s.v, s.w, s.stream, s.wmCoarse.slipView(),
-            s.qCoarse.view());
+            s.qCoarse.view(), s.stretch.view());
         if (err != cudaSuccess) return err;
 
         // The freshly written buffer needs its spanwise ghost planes synced
@@ -1205,127 +1474,22 @@ cudaError_t LBMSolver::stepN(int n) {
             err2 != cudaSuccess)
             return err2;
 
-        // ---- two-level coupling (plan M-refine): the fine patch advances
-        // m sub-steps of dt/m per coarse step. The coarse ping-pong pair
-        // provides both time levels for the interface fill — f[src] still
-        // holds t, f[1-src] just received t+1. ----------------------------
-        if (s.fine.active) {
-            const int   m    = s.fine.factor;
-            const float tauC = params.tau;
-            const float tauF = fineTauFor(tauC, m);
-            StepParams fineParams = params;
-            fineParams.tau        = tauF;
-            fineParams.writeMacro = false; // fine level has no macro arrays
-
-            for (int half = 0; half < m; ++half) {
-                // Interface fill: sub-step k sees the coarse field time-
-                // interpolated at t + k/m of the coarse step.
-                if (auto e = launchCoarseToFineFill(
-                        s.view(s.src), s.f[1 - s.src],
-                        s.fineView(s.fine.src), s.fine.box, m,
-                        static_cast<float>(half) / static_cast<float>(m),
-                        tauC, tauF,
-                        /*fullVolume=*/false, s.stream);
-                    e != cudaSuccess)
-                    return e;
-                // The fill rewrites shell cells on every z plane; their
-                // ghost images must be re-synced before the pull reads them
-                // across the periodic seam.
-                if (auto e = launchRefreshGhostZ(s.fine.f[s.fine.src],
-                                                 s.fine.dims, s.stream);
-                    e != cudaSuccess)
-                    return e;
-                if (auto e = launchStreamCollide(
-                        s.fineView(s.fine.src), s.fineView(1 - s.fine.src),
-                        fineParams, nullptr, nullptr, nullptr, nullptr,
-                        s.stream, s.wmFine.slipView(), s.qFine.view());
-                    e != cudaSuccess)
-                    return e;
-                if (auto e = launchRefreshGhostZ(s.fine.f[1 - s.fine.src],
-                                                 s.fine.dims, s.stream);
-                    e != cudaSuccess)
-                    return e;
-
-                // ---- three-level coupling (nested VG patch): the finer level
-                // advances m2 sub-steps of dt_fine/m2 per FINE sub-step. The
-                // fine ping-pong pair now provides both time levels for the
-                // finer interface fill — fine.f[fine.src] still holds t, and
-                // fine.f[1-fine.src] just received t+1. This block sits BEFORE
-                // the fine swap precisely so both fine buffers are valid and
-                // ghost-refreshed; the finer restriction writes the fine t+1
-                // buffer, which is what the fine->coarse restriction reads. ---
-                if (s.finer.active) {
-                    const int   m2       = s.finer.factor;
-                    const float tauFiner = fineTauFor(tauF, m2);
-                    StepParams finerParams = fineParams;
-                    finerParams.tau        = tauFiner;
-                    finerParams.writeMacro = false; // no macro arrays at all
-
-                    for (int q = 0; q < m2; ++q) {
-                        // Fill: parent = fine. t0 = fine.f[fine.src] (t),
-                        // t1 = fine.f[1-fine.src] (t+1), interpolated at q/m2.
-                        if (auto e = launchCoarseToFineFill(
-                                s.fineView(s.fine.src), s.fine.f[1 - s.fine.src],
-                                s.finerView(s.finer.src), s.finer.box, m2,
-                                static_cast<float>(q) / static_cast<float>(m2),
-                                tauF, tauFiner,
-                                /*fullVolume=*/false, s.stream);
-                            e != cudaSuccess)
-                            return e;
-                        if (auto e = launchRefreshGhostZ(
-                                s.finer.f[s.finer.src], s.finer.dims, s.stream);
-                            e != cudaSuccess)
-                            return e;
-                        if (auto e = launchStreamCollide(
-                                s.finerView(s.finer.src),
-                                s.finerView(1 - s.finer.src), finerParams,
-                                nullptr, nullptr, nullptr, nullptr, s.stream,
-                                s.wmFiner.slipView(), s.qFiner.view());
-                            e != cudaSuccess)
-                            return e;
-                        if (auto e = launchRefreshGhostZ(
-                                s.finer.f[1 - s.finer.src], s.finer.dims,
-                                s.stream);
-                            e != cudaSuccess)
-                            return e;
-                        s.finer.src = 1 - s.finer.src;
-                    }
-
-                    // Restrict finer -> the fine POST-collision buffer (the t+1
-                    // one). No macro arrays: macros only exist on the coarse
-                    // grid, and the fine->coarse restriction below carries the
-                    // finer-derived moments the rest of the way on render steps.
-                    if (auto e = launchFineToCoarseRestrict(
-                            s.finerView(s.finer.src),
-                            s.fineView(1 - s.fine.src), s.finer.box, m2,
-                            tauF, tauFiner,
-                            nullptr, nullptr, nullptr, nullptr, s.stream);
-                        e != cudaSuccess)
-                        return e;
-                    // The restriction rewrote real fine cells on every z plane.
-                    if (auto e = launchRefreshGhostZ(
-                            s.fine.f[1 - s.fine.src], s.fine.dims, s.stream);
-                        e != cudaSuccess)
-                        return e;
-                }
-
-                s.fine.src = 1 - s.fine.src;
-            }
-
-            // Restriction: overwrite the coarse overlap with the fine
-            // solution (and the coarse macro arrays on render steps, so
-            // every macro consumer sees fine-derived data for free).
-            if (auto e = launchFineToCoarseRestrict(
-                    s.fineView(s.fine.src), s.view(1 - s.src), s.fine.box, m,
-                    tauC, tauF,
+        // ---- N-level cascade coupling (graded refinement): advance the whole
+        // refinement staircase recursively. chain[0] (the fine patch) couples
+        // to the coarse grid here; advanceCascadeRung recurses into every
+        // deeper rung before each swap and restricts each rung back into its
+        // parent. The coarse ping-pong pair provides both interface-fill time
+        // levels (f[src] holds t, f[1-src] just received t+1). The depth-0
+        // restriction writes the coarse macro arrays on render steps, so every
+        // macro consumer still sees fine-derived data for free. ------------
+        if (!s.chain.empty()) {
+            if (auto e = s.advanceCascadeRung(
+                    /*depth=*/0, params, s.view(s.src), s.f[1 - s.src],
+                    s.f[1 - s.src],
                     params.writeMacro ? s.rho : nullptr,
                     params.writeMacro ? s.u : nullptr,
                     params.writeMacro ? s.v : nullptr,
-                    params.writeMacro ? s.w : nullptr, s.stream);
-                e != cudaSuccess)
-                return e;
-            // Restriction rewrote real coarse cells on every z plane.
-            if (auto e = launchRefreshGhostZ(s.f[1 - s.src], s.dims, s.stream);
+                    params.writeMacro ? s.w : nullptr);
                 e != cudaSuccess)
                 return e;
         }
@@ -1344,17 +1508,14 @@ cudaError_t LBMSolver::stepN(int n) {
             // coprime to the watchdog's prime stride), so repeated checks
             // sweep different cells instead of re-probing one fixed set.
             launchNaNWatchdog(s.view(s.src), s.nanDev, s.steps * 977, s.stream);
-            if (s.fine.active) {
-                // flagBase 2: a fine-buffer verdict reads 3/4, so the
-                // diagnosis names the grid that actually went unstable.
-                launchNaNWatchdog(s.fineView(s.fine.src), s.nanDev,
-                                  s.steps * 977, s.stream, /*flagBase=*/2);
-            }
-            if (s.finer.active) {
-                // flagBase 4: a finer-buffer verdict reads 5/6, distinguishing
-                // a nested-VG-patch divergence from coarse (1/2) and fine (3/4).
-                launchNaNWatchdog(s.finerView(s.finer.src), s.nanDev,
-                                  s.steps * 977, s.stream, /*flagBase=*/4);
+            // Sample every cascade rung too — a rung-level divergence would
+            // otherwise hide until it bled into the overlap. flagBase = 2*(d+1)
+            // so a verdict identifies the grid: coarse 1/2, fine 3/4, nested
+            // 5/6, deeper rungs 7/8, ... (the diagnosis text reads base+1/+2).
+            for (int d = 0; d < static_cast<int>(s.chain.size()); ++d) {
+                launchNaNWatchdog(s.chainView(d, s.chain[d]->src), s.nanDev,
+                                  s.steps * 977, s.stream,
+                                  /*flagBase=*/2 * (d + 1));
             }
             cudaMemcpyAsync(s.hNan, s.nanDev, sizeof(int),
                             cudaMemcpyDeviceToHost, s.stream);
@@ -1420,26 +1581,25 @@ cudaError_t LBMSolver::stepN(int n) {
                               s.wmCoarse.dUwx, s.wmCoarse.dUwy, s.wmCoarse.dUwz,
                               wmp, s.wmCoarse.dStats, s.stream);
     }
-    if (s.wmFine.active) {
-        WallModelParams wmp;
-        // The fine level runs at its own (acoustically scaled) viscosity.
-        const float tauF = fineTauFor(s.effectiveTau(), s.fine.factor);
-        wmp.nuLat    = (tauF - 0.5f) / 3.0f;
-        wmp.utCutoff = 1e-3f * s.scaling.u_lat;
-        launchWallModelUpdate(s.wmFine.listView(), s.fineView(s.fine.src),
-                              s.wmFine.dUwx, s.wmFine.dUwy, s.wmFine.dUwz,
-                              wmp, s.wmFine.dStats, s.stream);
-    }
-    if (s.wmFiner.active) {
-        WallModelParams wmp;
-        // The finer level's viscosity is the composed fine->finer scaling.
-        const float tauF     = fineTauFor(s.effectiveTau(), s.fine.factor);
-        const float tauFiner = fineTauFor(tauF, s.finer.factor);
-        wmp.nuLat    = (tauFiner - 0.5f) / 3.0f;
-        wmp.utCutoff = 1e-3f * s.scaling.u_lat;
-        launchWallModelUpdate(s.wmFiner.listView(), s.finerView(s.finer.src),
-                              s.wmFiner.dUwx, s.wmFiner.dUwy, s.wmFiner.dUwz,
-                              wmp, s.wmFiner.dStats, s.stream);
+    // Every cascade rung's wall model, in depth order. The rung's viscosity is
+    // the coarse tau composed through each 2x hop down to it (fineTauFor
+    // telescopes, so folding factor-by-factor down the chain is exact). The
+    // mirror lives in the named members for depth 0/1 and wmExtra beyond.
+    {
+        float tau = s.effectiveTau();
+        for (int d = 0; d < static_cast<int>(s.chain.size()); ++d) {
+            tau = fineTauFor(tau, s.chain[d]->factor); // compose down this hop
+            Impl::WMLevel& wm = (d == 0) ? s.wmFine
+                              : (d == 1) ? s.wmFiner
+                                         : s.wmExtra[d - 2];
+            if (!wm.active) continue;
+            WallModelParams wmp;
+            wmp.nuLat    = (tau - 0.5f) / 3.0f;
+            wmp.utCutoff = 1e-3f * s.scaling.u_lat;
+            launchWallModelUpdate(wm.listView(), s.chainView(d, s.chain[d]->src),
+                                  wm.dUwx, wm.dUwy, wm.dUwz, wmp, wm.dStats,
+                                  s.stream);
+        }
     }
     return cudaSuccess;
 }
@@ -1876,6 +2036,12 @@ bool LBMSolver::initRefinement(const PatchBox& box, int factor,
         if (error) *error = "solver not initialized";
         return false;
     }
+    // Refinement levels and ISLBM are mutually exclusive: the stretched mesh IS
+    // the (continuous) refinement, so a discrete patch on top is meaningless.
+    if (s.stretch.active) {
+        if (error) *error = "ISLBM stretched mode active (no discrete patches)";
+        return false;
+    }
     shutdownRefinement(); // replace any previous fine level
 
     if (factor < 2 || factor > kMaxRefineFactor) {
@@ -1933,6 +2099,7 @@ bool LBMSolver::initRefinement(const PatchBox& box, int factor,
         return fail("fine flag ghost refresh failed", err);
 
     fl.active = true;
+    s.syncChain(); // fine is now chain[0]
     s.updateForcesFromFine();
 
     // Keep the host copy the fine wall-cell list rebuild scans, then build
@@ -2042,6 +2209,7 @@ bool LBMSolver::initFinerRefinement(const PatchBox& finerBox, int m2,
         return fail("finer flag ghost refresh failed", err);
 
     fr.active = true;
+    s.syncChain(); // finer is now chain[1]
 
     // Keep the host copy the finer wall-cell list rebuild scans, then build it.
     s.finerHostFlags = finerFlags;
@@ -2084,6 +2252,180 @@ void LBMSolver::setRefinedFinerSurfaceReference(
     s.rebuildWallModelFiner();
 }
 
+// ---------------------------------------------------------------------------
+// N-level cascade: rungs at depth >= 2.
+// ---------------------------------------------------------------------------
+
+bool LBMSolver::appendCascadeLevel(const PatchBox& box, int m,
+                                   const std::vector<std::uint8_t>& flags,
+                                   const std::vector<std::uint8_t>& cleanFlags,
+                                   std::string* error) {
+    Impl& s = *impl_;
+    if (!s.initialized) {
+        if (error) *error = "solver not initialized";
+        return false;
+    }
+    // A deep rung needs a parent: finer must be active (so the cascade already
+    // has depth 2's parent). chain.back() is the deepest active rung = parent.
+    if (!s.finer.active || s.chain.empty()) {
+        if (error) *error = "finer level not active (deep rung has no parent)";
+        return false;
+    }
+    if (m < 2 || m > kMaxRefineFactor) {
+        if (error) *error = "cascade factor out of range (2..4)";
+        return false;
+    }
+    Impl::FineLevel& parent = *s.chain.back();
+    if (!box.valid() || box.x0 < 1 || box.y0 < 1
+        || box.x1 > parent.dims.nx - 1 || box.y1 > parent.dims.ny - 1) {
+        if (error) *error = "cascade patch box out of range for its parent";
+        return false;
+    }
+
+    // Reserve the parallel slots for this new rung up front so the indices line
+    // up (extra[i] <-> wmExtra[i] <-> qExtra[i] <-> extraHostFlags[i]).
+    const int i = static_cast<int>(s.extraLevels.size());
+    s.extraLevels.emplace_back();
+    s.wmExtra.emplace_back();
+    s.qExtra.emplace_back();
+    s.extraHostFlags.emplace_back();
+    s.extraSurfaceRefFlags.emplace_back();
+
+    Impl::FineLevel& L = s.extraLevels[i];
+    L.factor    = m;
+    L.box       = box;
+    L.dims      = fineDimsFor(box, parent.dims, m);
+    L.ncells    = L.dims.cellCount();
+    L.nxny      = static_cast<long long>(L.dims.nx) * L.dims.ny;
+    L.ncellsPad = L.dims.paddedCellCount();
+    L.scaling   = refinedScaling(parent.scaling, m);
+    L.src = 0;
+    L.forcesFromFine = false; // deep rungs cover only a sub-region, never forces
+
+    auto fail = [&](const char* what, cudaError_t err) {
+        if (error) *error = std::string(what) + ": " + cudaGetErrorString(err);
+        s.freeExtraLevel(i);
+        // Drop the just-added (now-empty) slots so the vectors stay in lockstep.
+        s.extraLevels.pop_back(); s.wmExtra.pop_back(); s.qExtra.pop_back();
+        s.extraHostFlags.pop_back(); s.extraSurfaceRefFlags.pop_back();
+        s.syncChain();
+        return false;
+    };
+
+    if (flags.size() != static_cast<std::size_t>(L.ncells)) {
+        if (error) *error = "cascade flag field size does not match the patch";
+        return fail("size mismatch", cudaErrorInvalidValue);
+    }
+
+    const std::size_t fBytes =
+        static_cast<std::size_t>(kQ) * L.ncellsPad * sizeof(FPop);
+    for (FPop*& p : L.f) {
+        if (auto err = cudaMalloc(&p, fBytes); err != cudaSuccess)
+            return fail("cascade f buffer allocation failed", err);
+    }
+    if (auto err = cudaMalloc(&L.flags, static_cast<std::size_t>(L.ncellsPad));
+        err != cudaSuccess)
+        return fail("cascade flag allocation failed", err);
+    if (auto err = cudaMemcpyAsync(L.flags + L.nxny, flags.data(),
+                                   static_cast<std::size_t>(L.ncells),
+                                   cudaMemcpyHostToDevice, s.stream);
+        err != cudaSuccess)
+        return fail("cascade flag upload failed", err);
+    if (auto err = launchRefreshGhostZFlags(L.flags, L.dims, s.stream);
+        err != cudaSuccess)
+        return fail("cascade flag ghost refresh failed", err);
+
+    L.active = true;
+    s.syncChain(); // the new rung is now chain.back()
+
+    // Host flag copies + wall list, then seed from the parent's current field.
+    s.extraHostFlags[i]       = flags;
+    if (cleanFlags.size() == static_cast<std::size_t>(L.ncells))
+        s.extraSurfaceRefFlags[i] = cleanFlags;
+    s.rebuildWallModelExtra(i);
+    if (auto err = s.seedExtraFromParent(i); err != cudaSuccess)
+        return fail("cascade level seeding failed", err);
+    return true;
+}
+
+void LBMSolver::shutdownDeepLevels() {
+    if (!impl_) return;
+    impl_->freeExtraLevels();
+    impl_->syncChain();
+}
+
+int LBMSolver::cascadeDepth() const {
+    return impl_ ? static_cast<int>(impl_->chain.size()) : 0;
+}
+
+void LBMSolver::setCascadeQLinks(int depth,
+                                 const std::vector<std::uint8_t>& qFrac,
+                                 const std::vector<std::uint32_t>& ffMask,
+                                 int links, int fallback) {
+    Impl& s = *impl_;
+    if (!s.initialized || depth < 2) return;
+    const int i = depth - 2;
+    if (i < 0 || i >= static_cast<int>(s.extraLevels.size())) return;
+    if (!s.extraLevels[i].active) return;
+    s.uploadQLevel(s.qExtra[i], qFrac, ffMask, s.extraLevels[i].ncells, links,
+                   fallback);
+}
+
+// ---------------------------------------------------------------------------
+// ISLBM stretched-mesh mode.
+// ---------------------------------------------------------------------------
+
+bool LBMSolver::initStretchMode(const std::vector<float>& wallDist,
+                                std::string* error) {
+    Impl& s = *impl_;
+    if (!s.initialized) {
+        if (error) *error = "solver not initialized";
+        return false;
+    }
+    // Mutually exclusive with the cascade: tear down every refinement level
+    // first (the single stretched grid replaces them).
+    s.freeFine();
+    // Build + upload the stretched mesh from the wall-distance field. Keep the
+    // host copy so setFlags/geometry edits can rebuild without re-deriving it.
+    if (!buildStretchMesh(s.stretch, s.dims, s.scaling, wallDist, s.stream,
+                          error)) {
+        s.stretchWallDist.clear();
+        return false; // graceful: mode stays uniform, coarse sim runs on
+    }
+    s.stretchWallDist = wallDist;
+    return true;
+}
+
+void LBMSolver::shutdownStretchMode() {
+    if (!impl_) return;
+    impl_->stretch.free();
+    impl_->stretchWallDist.clear();
+}
+
+bool LBMSolver::stretchActive() const {
+    return impl_ && impl_->stretch.active;
+}
+
+StretchInfo LBMSolver::stretchInfo() const {
+    StretchInfo info;
+    const Impl& s = *impl_;
+    if (!s.stretch.active) return info;
+    info.active          = true;
+    info.dxMin           = s.stretch.dxMin;
+    info.dxMax           = s.stretch.dxMax;
+    info.growthX         = s.stretch.growthX;
+    info.growthY         = s.stretch.growthY;
+    info.tauWall         = s.stretch.tauWall;
+    info.tauFar          = s.stretch.tauFar;
+    info.tauFloorClamped = s.stretch.tauFloorClamped;
+    info.fluidCellSaving = s.stretch.fluidCellSaving;
+    // Foot LUTs (2*nx + 2*ny entries of float+int8) + the per-cell tau field.
+    info.vramBytes =
+        static_cast<double>(2 * s.dims.nx + 2 * s.dims.ny) * (sizeof(float) + 1)
+        + static_cast<double>(s.ncells) * sizeof(float);
+    return info;
+}
+
 RefinementInfo LBMSolver::refinementInfo() const {
     const Impl& s = *impl_;
     RefinementInfo info;
@@ -2110,6 +2452,31 @@ RefinementInfo LBMSolver::refinementInfo() const {
             2.0 * static_cast<double>(kQ)
                 * static_cast<double>(s.finer.ncellsPad) * sizeof(FPop)
             + static_cast<double>(s.finer.ncellsPad);
+    }
+
+    // Cascade rungs at depth >= 2 (graded refinement). Walk the chain so the
+    // effective (cumulative-vs-coarse) factor accumulates down the staircase.
+    auto rungVram = [](long long ncellsPad) {
+        return 2.0 * static_cast<double>(kQ) * static_cast<double>(ncellsPad)
+                   * sizeof(FPop)
+             + static_cast<double>(ncellsPad);
+    };
+    info.cascadeDepth   = static_cast<int>(s.chain.size());
+    info.totalVramBytes = info.vramBytes + info.finerVramBytes;
+    int effective = s.fine.active ? s.fine.factor : 1;
+    if (s.finer.active) effective *= s.finer.factor;
+    for (std::size_t i = 0; i < s.extraLevels.size(); ++i) {
+        const Impl::FineLevel& L = s.extraLevels[i];
+        if (!L.active) break; // active prefix is contiguous (nesting invariant)
+        effective *= L.factor;
+        RefinementInfo::LevelInfo li;
+        li.factor          = L.factor;
+        li.effectiveFactor = effective;
+        li.box             = L.box;
+        li.dims            = L.dims;
+        li.vramBytes       = rungVram(L.ncellsPad);
+        info.totalVramBytes += li.vramBytes;
+        info.deepLevels.push_back(li);
     }
     return info;
 }

@@ -154,7 +154,16 @@ struct UIParams {
     /// chord fractions around the solid bbox; the patch derivation clamps
     /// them against the domain faces. Default 2x — the VRAM readout in the
     /// panel (and the graceful init-failure path) protects smaller cards.
+    /// How the solver concentrates resolution around the geometry.
+    ///   Uniform : one even grid (factor 1) — no refinement.
+    ///   Cascade : the discrete x2 staircase (fine + nested VG levels).
+    ///   Stretch : ISLBM continuous-gradient mesh (one smoothly-stretched grid,
+    ///             finest at the wall, no levels/seams; auto-built from the
+    ///             geometry's wall-distance field — works for foil/VG/STL).
+    enum class MeshMode { Uniform, Cascade, Stretch };
+
     struct RefinementUIParams {
+        MeshMode meshMode = MeshMode::Cascade; ///< Default keeps current behaviour.
         int   factor    = 2;     ///< Patch resolution: 1 = off (uniform grid),
                                  ///< 2..4 = fine-level factor (cells shrink by
                                  ///< 1/m, cost grows ~m^4 — see the panel's
@@ -184,6 +193,30 @@ struct UIParams {
                                  ///< (Bouzidi 2001). Effective only on the fine /
                                  ///< nested levels where vanes are resolved; thin
                                  ///< vanes fall back to plain bounce-back per link.
+
+        // ---- N-level cascade (graded refinement, 2026-06-16) --------------
+        // The fine (2x) + nested VG (4x) levels above are the depth-1/2 rungs.
+        // The cascade stacks additional integer-2x rungs into a smooth-ish
+        // staircase (the discrete approximation of a continuous resolution
+        // gradient) so each refinement seam carries half the gradient of one
+        // big jump — gentler seams, less interface aliasing. Rungs beyond the
+        // nested VG box are placed by the Q-criterion seam sensor on the
+        // DEVELOPED field (deferred rebuild) so no seam lands in the VG wake.
+        bool  autoCascade = true;  ///< Let buildLevelPlan choose the rung count
+                                 ///< from the boundary-layer thickness (delta99)
+                                 ///< and VG vane height vs the local cell size,
+                                 ///< clamped to maxCascadeDepth. Off = stop at
+                                 ///< the fine+nested levels (legacy behaviour).
+        int   maxCascadeDepth = 3; ///< Hard cap on total rungs (1=fine only,
+                                 ///< 2=+nested, 3=+one deeper, 4=+two ...). Caps
+                                 ///< VRAM/launch cost; the planner never exceeds
+                                 ///< it even when the BL/VG heuristic asks for more.
+        int   cascadeBufferCells = 8; ///< Min smooth-flow buffer (in the rung's
+                                 ///< own cells) the seam sensor keeps between a
+                                 ///< seam and the geometry / the next jump
+                                 ///< (Berger-Colella proper nesting; practitioner
+                                 ///< "8-10 cells per level" guidance). >= the
+                                 ///< ~6-cell coupling floor.
 
         /// Patch active at all (factor 1 = pure uniform grid).
         bool enabled() const { return factor >= 2; }
@@ -293,6 +326,21 @@ struct UIReadouts {
         int      qlibbFallback = 0;     ///< Thin-vane links left at half-way.
     };
     RefinementReadout refine;
+
+    // -- ISLBM stretched-mesh status (Mesh panel readout) --
+    struct StretchReadout {
+        bool   active   = false; ///< Stretched mesh allocated and stepping.
+        float  dxMin    = 0.0f;  ///< Finest spacing (wall) [m].
+        float  dxMax    = 0.0f;  ///< Coarsest spacing (far field) [m].
+        float  growthX  = 1.0f;  ///< Achieved per-cell growth ratio, X.
+        float  growthY  = 1.0f;  ///< Achieved per-cell growth ratio, Y.
+        float  tauWall  = 0.0f;  ///< tau at the finest cell.
+        float  tauFar   = 0.0f;  ///< tau at the coarsest cell.
+        bool   tauFloorClamped = false; ///< dxMax reduced to keep tauFar valid.
+        double fluidCellSaving = 0.0;   ///< Fraction coarser than the wall.
+        double vramGB = 0.0;            ///< Foot LUTs + per-cell tau field.
+    };
+    StretchReadout stretch;
 
     // -- pre-convergence status (plan M-refine part 2) --
     float preconvergeProgress = -1.0f; ///< 0..1 while running; < 0 = idle.

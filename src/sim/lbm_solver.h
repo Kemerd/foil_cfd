@@ -122,6 +122,34 @@ struct RefinementInfo {
     GridDims       finerDims;            ///< Finer grid dimensions.
     LatticeScaling finerScaling;         ///< refinedScaling(fineScaling, m2).
     double         finerVramBytes = 0.0; ///< Finer f-pair + flag allocation.
+
+    // ---- N-level cascade: rungs at depth >= 2 (graded refinement). The fine
+    // (depth 0) and finer (depth 1) fields above stay populated as before; this
+    // vector carries any deeper rungs of the staircase for the UI readout.
+    struct LevelInfo {
+        int            factor          = 0;   ///< Factor vs the parent rung.
+        int            effectiveFactor = 0;   ///< Cumulative factor vs coarse.
+        PatchBox       box;                   ///< Box in the parent rung's cells.
+        GridDims       dims;                  ///< This rung's grid dimensions.
+        double         vramBytes        = 0.0;///< f-pair + flag allocation.
+    };
+    std::vector<LevelInfo> deepLevels;        ///< Rungs at cascade depth >= 2.
+    int    cascadeDepth   = 0;                ///< Total active rungs (1=fine,...).
+    double totalVramBytes = 0.0;              ///< Sum over all refinement rungs.
+};
+
+/// @brief ISLBM stretched-mesh status for the UI Mesh panel (zeroed when off).
+struct StretchInfo {
+    bool   active   = false;  ///< Stretched mesh allocated and stepping.
+    float  dxMin    = 0.0f;   ///< Finest spacing (wall) [m].
+    float  dxMax    = 0.0f;   ///< Coarsest spacing (far field) [m].
+    float  growthX  = 1.0f;   ///< Achieved per-cell growth ratio, X.
+    float  growthY  = 1.0f;   ///< Achieved per-cell growth ratio, Y.
+    float  tauWall  = 0.0f;   ///< tau at the finest cell.
+    float  tauFar   = 0.0f;   ///< tau at the coarsest cell (>= kMinTau).
+    bool   tauFloorClamped = false; ///< dxMax reduced to keep tauFar valid.
+    double fluidCellSaving = 0.0;   ///< Fraction of cells coarser than the wall.
+    double vramBytes = 0.0;   ///< Foot LUTs + per-cell tau field.
 };
 
 /// @brief Host orchestrator for the D3Q19 TRT-Smagorinsky solver.
@@ -241,6 +269,73 @@ public:
     /// @param finerCleanFlags Clean finer flag field (must match finer dims).
     void setRefinedFinerSurfaceReference(
         const std::vector<std::uint8_t>& finerCleanFlags);
+
+    // ------ N-level cascade: rungs at depth >= 2 (graded refinement) ------
+    // The fine (depth 0) and finer (depth 1) levels keep their dedicated API
+    // above. Deeper rungs of the staircase are appended through these calls:
+    // each is an integer-2x (or up to kMaxRefineFactor) refinement of the rung
+    // one level shallower, coupled by the same level-agnostic kernels. A deep
+    // rung requires every shallower rung to already be active (strict nesting).
+
+    /// @brief Append a cascade rung at the next depth (>= 2): a patch over the
+    /// given box, expressed in the PARENT rung's cells, at factor @p m relative
+    /// to the parent. Requires the parent rung (depth-1) to be active. Seeded
+    /// from the current parent field, so valid mid-run. Fails gracefully on OOM
+    /// (the shallower cascade keeps running). The first call appends depth 2,
+    /// the next depth 3, and so on; shutdownDeepLevels() clears them all.
+    /// @param box       Patch box in the PARENT rung's cells.
+    /// @param m         Factor relative to the parent (2..kMaxRefineFactor).
+    /// @param flags     Rung flag field, fineDimsFor(box, parentDims, m)
+    ///                  .cellCount() bytes, with the Interface shell stamped.
+    /// @param cleanFlags VG-free reference flags (wall-model normals); same dims.
+    /// @param error     On failure, receives a human-readable reason.
+    /// @return True on success.
+    bool appendCascadeLevel(const PatchBox& box, int m,
+                            const std::vector<std::uint8_t>& flags,
+                            const std::vector<std::uint8_t>& cleanFlags,
+                            std::string* error);
+
+    /// @brief Release every cascade rung at depth >= 2 (the fine/finer levels
+    /// are untouched). Deepest first, preserving the nesting invariant.
+    void shutdownDeepLevels();
+
+    /// @brief Number of active refinement rungs (0 = coarse only, 1 = fine,
+    /// 2 = fine+finer, 3+ = deeper cascade). The cascade depth for the UI.
+    int cascadeDepth() const;
+
+    /// @brief Upload the dense q-LIBB cut-fraction field for cascade rung
+    /// @p depth (>= 2; depth 0/1 use setFineQLinks/setFinerQLinks). No-op when
+    /// the rung is inactive or q-LIBB is disabled.
+    void setCascadeQLinks(int depth, const std::vector<std::uint8_t>& qFrac,
+                          const std::vector<std::uint32_t>& ffMask, int links,
+                          int fallback);
+
+    // ------ ISLBM stretched-mesh mode (continuous-gradient refinement) ------
+    // A single smoothly-stretched grid replaces the discrete refinement levels:
+    // the bulk runs the interpolated-gather kernel, a thin collar around walls
+    // keeps the exact pull. Mutually exclusive with the cascade — enabling it
+    // tears down every refinement level; initRefinement refuses while it is on.
+
+    /// @brief Enable ISLBM mode: build the stretched mesh from @p wallDist (a
+    /// buildWallDistanceField result over THIS grid) anchored on the base
+    /// scaling, upload it, and route stepN through the gather kernel. Tears down
+    /// any cascade first. Rebuild on every geometry/AoA/STL edit (the mesh
+    /// tracks the wall distance). Fails gracefully on OOM (reverts to Uniform).
+    /// @param wallDist Per-cell wall distance, dims().cellCount() floats.
+    /// @param error    On failure, receives a human-readable reason.
+    /// @return True on success (mode now ISLBM).
+    bool initStretchMode(const std::vector<float>& wallDist, std::string* error);
+
+    /// @brief Disable ISLBM mode and free the stretched mesh (reverts to a
+    /// uniform grid). No-op when ISLBM is off.
+    void shutdownStretchMode();
+
+    /// @brief True when ISLBM stretched-mesh mode is active.
+    bool stretchActive() const;
+
+    /// @brief Stretched-mesh status for the UI (zeroed when ISLBM is off):
+    /// dx range, achieved growth, wall/far tau, and the fluid-cell saving.
+    StretchInfo stretchInfo() const;
 
     /// @brief Refinement status for the UI (zeroed RefinementInfo when off).
     RefinementInfo refinementInfo() const;

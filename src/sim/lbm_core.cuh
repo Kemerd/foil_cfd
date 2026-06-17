@@ -9,6 +9,8 @@
 #include <cuda_runtime_api.h>
 #include <vector_types.h> // float4 for the particle-buffer declarations
 
+#include "lbm_stretch.h" // StretchView (ISLBM stretched-mesh) for StepParams/launch
+
 namespace foilcfd {
 
 // ===========================================================================
@@ -238,6 +240,11 @@ struct StepParams {
                                    ///< the eddy-viscosity term.
     float uInlet      = 0.08f;  ///< Inlet x-velocity in lattice units (u_lat).
     bool  writeMacro  = true;   ///< Store rho/u/v/w this step (only when rendering needs it).
+    /// ISLBM startup-ramp multiplier on the per-cell viscosity (tau-1/2): the
+    /// stretched-mesh tau lives in a per-cell field (StretchView::tauField), so
+    /// the ramp can't ride the scalar `tau` above — it rides this instead. 1.0
+    /// (no ramp) for the uniform/cascade modes, which ramp via `tau` directly.
+    float tauRampMul  = 1.0f;
 };
 
 /// @brief Result slot of the momentum-exchange force reduction: total lattice
@@ -294,7 +301,8 @@ cudaError_t launchStreamCollide(DeviceLatticeView src, DeviceLatticeView dst,
                                 float* macroRho, float* macroU, float* macroV,
                                 float* macroW, cudaStream_t stream,
                                 WallSlipView slip = WallSlipView{},
-                                QLinkView qlink = QLinkView{});
+                                QLinkView qlink = QLinkView{},
+                                StretchView stretch = StretchView{});
 
 /// @brief NaN watchdog (plan 4.5): checks a strided sample of cells (~1/4093,
 /// prime stride so the sample set cannot alias onto boundary columns of
