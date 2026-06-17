@@ -228,6 +228,14 @@ struct LBMSolver::Impl {
     StretchMesh stretch;                       ///< Device mesh + diagnostics.
     std::vector<float> stretchWallDist;        ///< Host wall-distance field copy.
 
+    // ---- virtual transition strip (boundary-layer trip) -------------------
+    // A per-cell mask marking a near-LE band where launchTransitionTrip injects
+    // turbulent fluctuations every step to force laminar->turbulent transition
+    // (the wall model can't sustain turbulence on a smooth surface unaided).
+    std::uint8_t* tripMask     = nullptr;      ///< Device mask (unpadded, ncells).
+    bool          tripActive   = false;        ///< A band is uploaded + intensity>0.
+    float         tripIntensity = 0.0f;        ///< Fluctuation amplitude (u_lat units).
+
     /// @brief View over one buffer of cascade rung @p depth (0 = fine).
     DeviceLatticeView chainView(int depth, int which) const {
         const FineLevel* L = chain[depth];
@@ -1025,6 +1033,8 @@ struct LBMSolver::Impl {
         freeFine();
         stretch.free();  // ISLBM device mesh (no-op when uniform/cascade).
         stretchWallDist.clear();
+        cudaFree(tripMask); tripMask = nullptr; // transition-strip mask
+        tripActive = false; tripIntensity = 0.0f;
         wmCoarse.free(); // wmFine already died with freeFine(); the wmEnabled
                          // SETTING survives so re-init reapplies the policy.
         qCoarse.free();  // qFine/qFiner died with freeFine(); the setting survives.
@@ -1473,6 +1483,18 @@ cudaError_t LBMSolver::stepN(int n) {
         if (auto err2 = launchRefreshGhostZ(s.f[1 - s.src], s.dims, s.stream);
             err2 != cudaSuccess)
             return err2;
+
+        // Virtual transition strip: inject turbulent fluctuations into the trip
+        // band of the freshly-collided buffer, every step, to force the
+        // boundary layer turbulent (the wall model can't sustain it alone). The
+        // forcing touches real cells on every z plane, so re-sync the ghosts.
+        if (s.tripActive) {
+            launchTransitionTrip(s.view(1 - s.src), s.tripMask, s.tripIntensity,
+                                 s.steps, kSpeckSeed, s.stream);
+            if (auto err3 = launchRefreshGhostZ(s.f[1 - s.src], s.dims, s.stream);
+                err3 != cudaSuccess)
+                return err3;
+        }
 
         // ---- N-level cascade coupling (graded refinement): advance the whole
         // refinement staircase recursively. chain[0] (the fine patch) couples
@@ -2408,6 +2430,50 @@ bool LBMSolver::stretchActive() const {
 
 void LBMSolver::setStretchFastGather(bool fast) {
     if (impl_) impl_->stretch.fastGather = fast;
+}
+
+bool LBMSolver::setTransitionTrip(const std::vector<std::uint8_t>& tripMask,
+                                  float intensity, std::string* error) {
+    Impl& s = *impl_;
+    if (!s.initialized) {
+        if (error) *error = "solver not initialized";
+        return false;
+    }
+    // Disable path: empty mask or non-positive intensity frees the band.
+    if (tripMask.empty() || intensity <= 0.0f) {
+        cudaFree(s.tripMask); s.tripMask = nullptr;
+        s.tripActive = false; s.tripIntensity = 0.0f;
+        return true;
+    }
+    if (tripMask.size() != static_cast<std::size_t>(s.ncells)) {
+        if (error) *error = "trip mask size does not match the grid";
+        return false;
+    }
+    // (Re)allocate the device mask if needed, then upload.
+    if (!s.tripMask) {
+        if (auto e = cudaMalloc(reinterpret_cast<void**>(&s.tripMask),
+                                static_cast<std::size_t>(s.ncells));
+            e != cudaSuccess) {
+            if (error) *error = std::string("trip mask alloc failed: ")
+                              + cudaGetErrorString(e);
+            return false;
+        }
+    }
+    if (auto e = cudaMemcpyAsync(s.tripMask, tripMask.data(),
+                                 static_cast<std::size_t>(s.ncells),
+                                 cudaMemcpyHostToDevice, s.stream);
+        e != cudaSuccess) {
+        if (error) *error = std::string("trip mask upload failed: ")
+                          + cudaGetErrorString(e);
+        return false;
+    }
+    s.tripIntensity = intensity;
+    s.tripActive = true;
+    return true;
+}
+
+bool LBMSolver::transitionTripActive() const {
+    return impl_ && impl_->tripActive;
 }
 
 StretchInfo LBMSolver::stretchInfo() const {

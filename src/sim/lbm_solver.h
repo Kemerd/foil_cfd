@@ -339,6 +339,26 @@ public:
     /// (correct Cl/Cd, ~4-5x the gather cost). No-op when ISLBM is off.
     void setStretchFastGather(bool fast);
 
+    // ------ virtual transition strip (boundary-layer trip) ------
+
+    /// @brief Arm the virtual transition strip: upload a per-cell trip mask
+    /// (nonzero = trip-band cell) and set the fluctuation intensity. Every step
+    /// thereafter, launchTransitionTrip injects localized turbulent fluctuations
+    /// into the flagged cells to force laminar->turbulent transition the wall
+    /// model cannot sustain alone. The mask is typically a thin near-leading-
+    /// edge band over the suction surface (built host-side from the geometry).
+    /// Pass an empty mask or intensity <= 0 to disable. Survives stepping;
+    /// rebuilt on geometry edits by the caller.
+    /// @param tripMask  Per-cell mask, dims().cellCount() bytes (nonzero = trip).
+    /// @param intensity Fluctuation amplitude in lattice units (~0.05*u_lat).
+    /// @param error     On failure, receives a human-readable reason.
+    /// @return True on success (or clean disable).
+    bool setTransitionTrip(const std::vector<std::uint8_t>& tripMask,
+                           float intensity, std::string* error = nullptr);
+
+    /// @brief True when a transition strip is armed (mask uploaded, intensity>0).
+    bool transitionTripActive() const;
+
     /// @brief Stretched-mesh status for the UI (zeroed when ISLBM is off):
     /// dx range, achieved growth, wall/far tau, and the fluid-cell saving.
     StretchInfo stretchInfo() const;

@@ -246,6 +246,19 @@ struct UIParams {
                                            ///< y+ > 2 on the finest level),
                                            ///< 1 = forced On, 2 = forced Off.
 
+    /// Virtual transition strip (boundary-layer trip): a thin near-leading-edge
+    /// band on the suction surface where turbulent fluctuations are injected
+    /// every step to force laminar->turbulent transition the wall model cannot
+    /// sustain on a smooth surface alone (a numerical zig-zag tape). Off by
+    /// default; the band geometry + intensity below are committed on edit.
+    struct TransitionTrip {
+        bool  enabled   = false; ///< Arm the strip.
+        float xc        = 0.08f; ///< Band center, chord fraction (x/c).
+        float widthC    = 0.04f; ///< Streamwise band width [chords].
+        float intensityFrac = 0.05f; ///< Fluctuation amplitude / u_lat.
+    };
+    TransitionTrip trip;
+
     // -- view panel --
     VizSettings viz;
     bool voxelView = false;                ///< Replace the smooth foil/VG mesh
@@ -348,6 +361,10 @@ struct UIReadouts {
     };
     StretchReadout stretch;
 
+    // -- transition strip status --
+    bool tripActive = false; ///< Strip armed (band uploaded + intensity > 0).
+    int  tripCells  = 0;     ///< Fluid cells in the trip band.
+
     // -- pre-convergence status (plan M-refine part 2) --
     float preconvergeProgress = -1.0f; ///< 0..1 while running; < 0 = idle.
 };
@@ -377,6 +394,7 @@ struct UIEvents {
     bool particleCountChanged = false; ///< Pool slider released -> resizeParticlePool.
     bool frameFoilView   = false; ///< "Focus foil" -> camera.frameRegion on the foil.
     bool wallModelChanged = false; ///< Wall-model combo changed -> re-apply policy.
+    bool tripChanged = false;      ///< Transition-strip settings changed -> rebuild band.
 
     /// @brief Clear all events (main.cpp calls after applying).
     void reset() { *this = UIEvents{}; }

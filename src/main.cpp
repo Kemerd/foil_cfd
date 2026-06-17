@@ -516,6 +516,80 @@ void applyWallModelPolicy(App& app) {
     app.solver.setWallModelEnabled(enable);
 }
 
+/// Build + arm (or disable) the virtual transition strip: a thin near-leading-
+/// edge band on the SUCTION surface where the solver injects turbulent
+/// fluctuations every step to trip the boundary layer (the wall model can't
+/// sustain turbulence on a smooth surface alone — the Reddit pain point). The
+/// band is sized in chord fractions from the UI; for each column in the
+/// streamwise window we mark the few fluid cells just above the topmost foil
+/// solid (the suction-side boundary layer), across the full span.
+void applyTransitionTrip(App& app) {
+    const UIParams::TransitionTrip& t = app.params.trip;
+    if (!t.enabled || app.cleanFlags.empty()) {
+        app.solver.setTransitionTrip({}, 0.0f); // disable / free
+        app.readouts.tripActive = false;
+        app.readouts.tripCells = 0;
+        return;
+    }
+    const GridDims& d = app.layout.dims;
+    const int nc = app.layout.chordCells;
+    // Leading-edge x in cells: the quarter-chord anchor minus a quarter chord.
+    const float xLE = app.layout.anchorX() - 0.25f * static_cast<float>(nc);
+    const int x0 = static_cast<int>(std::lround(
+        xLE + (t.xc - 0.5f * t.widthC) * static_cast<float>(nc)));
+    const int x1 = static_cast<int>(std::lround(
+        xLE + (t.xc + 0.5f * t.widthC) * static_cast<float>(nc)));
+    // A few cells of boundary-layer band above the surface (~2% chord, >=3).
+    const int bandCells = std::max(3, static_cast<int>(std::lround(
+        0.02f * static_cast<float>(nc))));
+
+    std::vector<std::uint8_t> mask(static_cast<std::size_t>(d.cellCount()), 0);
+    const auto solid = static_cast<std::uint8_t>(CellFlag::Solid);
+    auto idx = [&d](int x, int y, int z) {
+        return static_cast<std::size_t>(x)
+             + static_cast<std::size_t>(d.nx) * (y + static_cast<long long>(d.ny) * z);
+    };
+    int marked = 0;
+    for (int x = std::max(1, x0); x <= std::min(d.nx - 2, x1); ++x) {
+        // Topmost solid in this column (suction surface) at mid-span; the foil
+        // is span-extruded so the row is the same on every z plane.
+        int topSolid = -1;
+        for (int y = d.ny - 2; y >= 1; --y)
+            if (app.cleanFlags[idx(x, y, d.nz / 2)] == solid) { topSolid = y; break; }
+        if (topSolid < 0) continue; // no surface in this column
+        // Mark the band of fluid cells just above the surface, full span.
+        for (int z = 0; z < d.nz; ++z)
+            for (int y = topSolid + 1; y <= topSolid + bandCells && y < d.ny - 1;
+                 ++y) {
+                const std::size_t c = idx(x, y, z);
+                if (app.cleanFlags[c] != solid) { mask[c] = 1; ++marked; }
+            }
+    }
+    if (marked == 0) {
+        app.solver.setTransitionTrip({}, 0.0f);
+        app.readouts.tripActive = false;
+        app.readouts.tripCells = 0;
+        setStatus(app, "transition strip: no suction surface in the x-band");
+        return;
+    }
+    std::string terr;
+    if (app.solver.setTransitionTrip(mask, t.intensityFrac * app.readouts.scaling.u_lat,
+                                     &terr)) {
+        app.readouts.tripActive = true;
+        app.readouts.tripCells = marked;
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+                      "transition strip: x/c %.2f +/- %.2f, %d cells, "
+                      "intensity %.0f%% u_lat",
+                      t.xc, 0.5f * t.widthC, marked, 100.0f * t.intensityFrac);
+        logLine(msg);
+    } else {
+        app.readouts.tripActive = false;
+        app.readouts.tripCells = 0;
+        setStatus(app, "transition strip failed: " + terr);
+    }
+}
+
 /// Build the q-LIBB sub-cell vane field for one refinement level and hand it to
 /// the solver. Ray-casts every vane link against the analytic slabs
 /// (buildVaneQLinks), densifies to the per-cell device layout (densifyQLinks),
@@ -1342,6 +1416,7 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
     // (uploadRenderGeometry re-derives the normalized STL mesh when needed,
     // so the stlMeshNormalized local above stays voxelization-only).
     applyRefinement(app);
+    applyTransitionTrip(app); // arm/refresh the trip band for the new geometry
     uploadRenderGeometry(app);
     runPreconverge(app);
     return true;
@@ -1673,6 +1748,10 @@ void applyEvents(App& app) {
         logLine(app.solver.wallModelEnabled() ? "wall model ON"
                                               : "wall model off");
     }
+
+    // ---- transition strip: rebuild the trip band live; the flow keeps running.
+    if (ev.tripChanged)
+        applyTransitionTrip(app);
 
     // ---- voxel view toggle: swap the render mesh, nothing else changes ----
     if (ev.voxelViewToggled) {

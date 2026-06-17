@@ -264,6 +264,60 @@ __global__ void spanwisePerturbKernel(FPop* __restrict__ f,
     }
 }
 
+/// @brief Cheap per-cell hashed pseudo-random float in [-1,1] from three integer
+/// seeds (cell, step, channel). A few integer mixes (xorshift-style) — enough
+/// decorrelation for a broadband trip forcing without a real RNG in the kernel.
+__device__ __forceinline__ float tripHash(unsigned int a, unsigned int b,
+                                          unsigned int c) {
+    unsigned int h = a * 0x9e3779b9u + b * 0x85ebca6bu + c * 0xc2b2ae35u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    // Map the 24 high bits to [-1,1).
+    return static_cast<float>(h >> 8) * (1.0f / 8388608.0f) - 1.0f;
+}
+
+/// @brief Virtual transition strip: add a localized, time-varying 3D velocity
+/// fluctuation to every flagged fluid cell each step (boundary-layer trip).
+__global__ void transitionTripKernel(FPop* __restrict__ f,
+                                     const std::uint8_t* __restrict__ flags,
+                                     const std::uint8_t* __restrict__ trip,
+                                     long long ncells, long long ncellsPad,
+                                     long long nxny, int nx, int nz,
+                                     float intensity, unsigned int stepSeed) {
+    const long long cell =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (cell >= ncells) return;
+    if (trip[cell] == 0) return;            // only the trip band
+    const long long pcell = cell + nxny;
+    if (flags[pcell] != kFlagFluid) return; // never force solid/boundary markers
+
+    int x, y, z;
+    unpackCell(cell, nx, nxny, x, y, z);
+
+    // Broadband 3D fluctuation: a hashed random direction (decorrelated per
+    // cell and per step via stepSeed) modulated by an incommensurate spanwise
+    // mode so the disturbance is genuinely 3D (the speck's trick) rather than a
+    // single plane wave. u'_x is left near zero (the trip perturbs the cross-
+    // stream/spanwise components that seed streamwise vortices, like a real
+    // trip wire), while u'_y and u'_z carry the energy.
+    const unsigned int cu = static_cast<unsigned int>(cell);
+    const float tz = 6.2831853f * (static_cast<float>(z) + 0.5f) / nz;
+    const float span = 0.6f * __sinf(5.0f * tz) + 0.4f * __sinf(11.0f * tz);
+    const float upy = intensity * span * tripHash(cu, stepSeed, 1u);
+    const float upz = intensity * span * tripHash(cu, stepSeed, 2u);
+    const float upx = 0.25f * intensity * tripHash(cu, stepSeed, 3u);
+
+    // Inject as momentum: df_q = 3 w_q (c_q . u'). Shifts the first velocity
+    // moment by u' (sum w_q c_a c_b = cs^2 d_ab) without changing density
+    // (sum w_q c_q = 0). Same additive form as the spanwise speck.
+#pragma unroll
+    for (int q = 0; q < kQ; ++q) {
+        const float cqu = d_cx[q] * upx + d_cy[q] * upy + d_cz[q] * upz;
+        if (cqu == 0.0f) continue;
+        const long long idx = static_cast<long long>(q) * ncellsPad + pcell;
+        store_f(f, idx, load_f(f, idx) + 3.0f * d_w[q] * cqu);
+    }
+}
+
 /// @brief f = equilibrium(rho, u) from unpadded macroscopic arrays (compact
 /// snapshot restore). Ghost cells sample the z-wrapped macroscopic cell so
 /// the result is consistent without a separate ghost refresh.
@@ -1010,6 +1064,26 @@ cudaError_t launchSpanwisePerturbation(DeviceLatticeView lattice, float amplitud
     spanwisePerturbKernel<<<gridFor(npad), kBlock, 0, stream>>>(
         lattice.f, lattice.flags, npad, nxny, lattice.dims.nx, lattice.dims.nz,
         amplitude, phaseOf(1u), phaseOf(2u), phaseOf(3u));
+    return cudaGetLastError();
+}
+
+cudaError_t launchTransitionTrip(DeviceLatticeView lattice,
+                                 const std::uint8_t* trip, float intensity,
+                                 long long step, unsigned int seed,
+                                 cudaStream_t stream) {
+    const long long ncells = lattice.dims.cellCount();
+    if (ncells <= 0 || !lattice.f || !lattice.flags || !trip
+        || intensity <= 0.0f)
+        return cudaSuccess; // inactive -> no-op (not an error)
+    const long long nxny =
+        static_cast<long long>(lattice.dims.nx) * lattice.dims.ny;
+    // Fold the step into the seed so the fluctuation field advances each step
+    // (broadband forcing); a Weyl hash keeps successive steps decorrelated.
+    const unsigned int stepSeed =
+        (seed + static_cast<unsigned int>(step)) * 2654435761u;
+    transitionTripKernel<<<gridFor(ncells), kBlock, 0, stream>>>(
+        lattice.f, lattice.flags, trip, ncells, lattice.dims.paddedCellCount(),
+        nxny, lattice.dims.nx, lattice.dims.nz, intensity, stepSeed);
     return cudaGetLastError();
 }
 

@@ -1278,6 +1278,36 @@ void drawSimPanel(UIContext& ctx) {
         }
     }
 
+    // ---- virtual transition strip (boundary-layer trip) ----
+    {
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Transition strip (trip the BL)", &p.trip.enabled))
+            ev.tripChanged = true;
+        helpMarker("A numerical zig-zag tape: a thin near-leading-edge band on "
+                   "the suction surface where the solver injects turbulent "
+                   "fluctuations every step to force laminar->turbulent "
+                   "transition. The wall model assumes a turbulent boundary "
+                   "layer but can't sustain one on a smooth surface at low "
+                   "cell-Reynolds; this trips it, like a wind-tunnel trip wire. "
+                   "Tune the intensity until the boundary layer stays turbulent "
+                   "downstream without over-energizing it.");
+        if (p.trip.enabled) {
+            ImGui::Indent();
+            if (ImGui::SliderFloat("x/c", &p.trip.xc, 0.01f, 0.30f, "%.2f"))
+                ev.tripChanged = true;
+            if (ImGui::SliderFloat("width (chords)", &p.trip.widthC, 0.01f, 0.15f,
+                                   "%.2f"))
+                ev.tripChanged = true;
+            if (ImGui::SliderFloat("intensity (% u_lat)", &p.trip.intensityFrac,
+                                   0.01f, 0.20f, "%.2f"))
+                ev.tripChanged = true;
+            if (r.tripActive)
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
+                                   "armed: %d band cells", r.tripCells);
+            ImGui::Unindent();
+        }
+    }
+
     // ---- live solver numbers ----
     ImGui::Spacing();
     ImGui::Separator();
@@ -1759,22 +1789,24 @@ void drawMeshPanel(UIContext& ctx) {
     {
         static const char* kModeNames[] = {
             "Uniform  (no refinement)",
-            "Cascade  (discrete 2x levels)",
-            "Stretch  (ISLBM continuous gradient)"};
+            "Cascade  (accurate + fast - recommended)",
+            "Stretch  (ISLBM - smooth preview)"};
         int midx = static_cast<int>(p.refine.meshMode);
         ImGui::SetNextItemWidth(-1);
         if (ImGui::Combo("##meshmode", &midx, kModeNames, 3)) {
             p.refine.meshMode = static_cast<UIParams::MeshMode>(midx);
             ev.meshRefinementChanged = true;
         }
-        helpMarker("Cascade: the discrete x2 refinement staircase (fine patch + "
-                   "nested VG box) — proven, exactly conservative. Stretch "
-                   "(ISLBM): a single grid whose cells grow smoothly from finest "
-                   "at the wall to coarsest in the far field — the continuous "
-                   "'gradient' refinement, auto-built from the geometry, with no "
-                   "interface seams. The wall keeps an exact bounce-back collar "
-                   "so lift/drag stay trustworthy; the bulk uses an interpolated "
-                   "gather (~60-70% of uniform throughput).");
+        helpMarker("Cascade (recommended): the discrete x2 refinement staircase "
+                   "(fine patch + nested VG box) — proven, exactly conservative, "
+                   "and the fastest ACCURATE mode. Use this for real numbers. "
+                   "Stretch (ISLBM): a single grid whose cells grow smoothly "
+                   "from finest at the wall to coarsest outward — no interface "
+                   "seams, auto-built from the geometry. Its FAST gather is a "
+                   "great smooth live PREVIEW but the forces are only "
+                   "qualitative; the accurate gather (Fast-gather off) fixes "
+                   "Cl/Cd but runs ~4-5x slower, so Cascade wins for trustworthy "
+                   "numbers at speed.");
 
         // Stretch-mode gather quality: fast preview (default) vs accurate forces.
         if (p.refine.meshMode == UIParams::MeshMode::Stretch) {

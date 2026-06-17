@@ -280,6 +280,35 @@ cudaError_t launchInitEquilibrium(DeviceLatticeView lattice, float uInlet,
 cudaError_t launchSpanwisePerturbation(DeviceLatticeView lattice, float amplitude,
                                        unsigned int seed, cudaStream_t stream);
 
+/// @brief Virtual transition strip (boundary-layer trip): inject localized
+/// turbulent velocity fluctuations into the fluid cells flagged by @p trip,
+/// EVERY step, to force laminar->turbulent transition the way a wind-tunnel
+/// zig-zag tape or trip wire does. The wall model alone cannot sustain
+/// turbulence on a smooth surface at low cell-Reynolds (the wall-model audit's
+/// known limitation); seeding 3D disturbances in a thin near-leading-edge band
+/// trips the boundary layer so the downstream flow develops the turbulent
+/// profile the wall function assumes (Schmidt & Breuer 2017 source-term trip;
+/// Schlatter & Orlu 2012 random near-wall forcing).
+///
+/// Mechanism mirrors the spanwise speck (df_q = 3 w_q c_q . u'), but here the
+/// fluctuation u' is a per-cell, per-step time-varying field: a cheap hashed
+/// pseudo-random direction modulated by spanwise modes, scaled to @p intensity
+/// (a fraction of u_lat). Trip cells stay CellFlag::Fluid (they collide+stream
+/// normally) — the trip is an additive volume forcing, not a boundary, so the
+/// hot kernel is untouched and non-trip runs pay nothing.
+/// @param lattice   Buffer to force in place (the post-collision src each step).
+/// @param trip      Per-cell trip mask (UNPADDED, ncells bytes; nonzero = trip),
+///                  or an inactive view to no-op.
+/// @param intensity Fluctuation amplitude in lattice velocity units (~0.05 u_lat
+///                  typical; tune vs the resulting boundary-layer state).
+/// @param step      Step counter — advances the time-varying fluctuation so the
+///                  forcing is broadband, not a frozen pattern.
+/// @param seed      Deterministic base seed (reproducible runs).
+cudaError_t launchTransitionTrip(DeviceLatticeView lattice,
+                                 const std::uint8_t* trip, float intensity,
+                                 long long step, unsigned int seed,
+                                 cudaStream_t stream);
+
 /// @brief One fused pull-scheme step: read neighbor post-collision values,
 /// compute rho/u, TRT collide with Smagorinsky eddy viscosity, write to dst.
 /// Boundary handling is branchless via neighbor-flag lookup (plan 4.1/4.2).
