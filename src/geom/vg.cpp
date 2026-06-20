@@ -43,6 +43,64 @@ inline void stampCell(std::vector<std::uint8_t>& flags, const GridDims& dims,
     if (flags[idx] == kFluid) flags[idx] = kSolid;
 }
 
+// ===========================================================================
+// Blade-profile geometry. A profile is defined by two per-slice functions of
+// the fractional chordwise position t in [0,1] along the blade (t=0 at the
+// upstream end, t=1 downstream): the local TOP height (fraction of hCells) and
+// the local HALF-THICKNESS (fraction of the nominal halfW). The rasterizer
+// (stampVane) walks t and fills [-embed, top*hCells] x [-thick*halfW, +thick]
+// per slice — so a profile is just a pair of shape curves, nothing else moves.
+// ===========================================================================
+
+/// @brief Local top-height as a FRACTION of hCells at fractional length t.
+/// Rectangle is flat; Delta/Wedge ramp 0->1; Trapezoid ramps then holds a flat
+/// top over the central `taper` fraction; Parabolic is an elliptical cap.
+inline float profileTopFrac(VGProfile profile, float t, float taper) {
+    switch (profile) {
+    case VGProfile::Rectangle:
+    case VGProfile::AirfoilSection:
+    case VGProfile::CustomStl: // unused (stl path), keep full height for slabs
+        return 1.0f;
+    case VGProfile::Delta:
+    case VGProfile::Wedge:
+        // Right triangle: height rises linearly from the upstream point to full
+        // height at the downstream end (the classic delta / Wheeler ramp).
+        return t;
+    case VGProfile::Trapezoid: {
+        // Clipped delta: ramp up over the front ramp-fraction, then a flat top.
+        // taper in [0,1] is the FLAT-TOP fraction; (1-taper) is the front ramp.
+        const float flat = std::clamp(taper, 0.0f, 1.0f);
+        const float ramp = std::max(1e-3f, 1.0f - flat);
+        return std::clamp(t / ramp, 0.0f, 1.0f);
+    }
+    case VGProfile::Parabolic: {
+        // Elliptical cap: tallest at mid-length, tapering smoothly to the ends.
+        // top = sqrt(1 - (2t-1)^2) maps t=0.5 -> 1, t=0 or 1 -> 0.
+        const float u = 2.0f * t - 1.0f;
+        return std::sqrt(std::max(0.0f, 1.0f - u * u));
+    }
+    }
+    return 1.0f;
+}
+
+/// @brief Local half-thickness as a FRACTION of halfW at fractional length t.
+/// Only AirfoilSection tapers thickness — a NACA 4-digit symmetric distribution
+/// so the blade has a rounded leading edge and a sharp trailing edge (a thin
+/// streamlined cross-section instead of a flat plate). All other profiles keep
+/// the constant plate thickness (1.0).
+inline float profileThickFrac(VGProfile profile, float t) {
+    if (profile != VGProfile::AirfoilSection) return 1.0f;
+    // NACA symmetric half-thickness, normalized so its MAX (at t~0.3) is 1.0.
+    // yt(x) = 5*tmax*(0.2969 sqrt(x) - 0.1260 x - 0.3516 x^2 + 0.2843 x^3
+    //                 - 0.1015 x^4); the tmax factor cancels in the ratio.
+    const float x = std::clamp(t, 0.0f, 1.0f);
+    const float yt = 0.2969f * std::sqrt(x) - 0.1260f * x - 0.3516f * x * x
+                   + 0.2843f * x * x * x - 0.1015f * x * x * x * x;
+    // Peak of the bracket is ~0.1015 at x~0.30; divide so the ratio peaks at 1.
+    constexpr float kNacaPeak = 0.1015f;
+    return std::clamp(yt / kNacaPeak, 0.0f, 1.0f);
+}
+
 /// @brief Stamp one vane (or ramp wedge) into the flag field.
 ///
 /// The device is sampled as a parametric slab and rasterized by dense
@@ -72,13 +130,15 @@ inline void stampCell(std::vector<std::uint8_t>& flags, const GridDims& dims,
 /// @param betaRad  Yaw about the surface normal (signed).
 /// @param hCells   Device height in cells (>= 1).
 /// @param lenCells Device length along its own axis in cells.
-/// @param halfW    Half-thickness (vane) or half-width (ramp) in cells.
-/// @param ramp     True for the right-triangular wedge: local height rises
-///                 linearly from 0 at the upstream end to hCells downstream.
+/// @param halfW    Nominal half-thickness (vane) or half-width (wedge) in cells.
+/// @param profile  Blade outline/section (Rectangle/Delta/Trapezoid/Parabolic/
+///                 AirfoilSection/Wedge). The per-slice top-height and thickness
+///                 follow this; placement/yaw/AoA are profile-independent.
+/// @param taper    Trapezoid flat-top fraction (ignored by other profiles).
 void stampVane(const AirfoilGeometry& airfoil, float aoaRad,
                const DomainLayout& layout, std::vector<std::uint8_t>& flags,
                float x_c, float zCenter, float betaRad, float hCells,
-               float lenCells, float halfW, bool ramp,
+               float lenCells, float halfW, VGProfile profile, float taper,
                std::vector<VaneSlab>* slabsOut = nullptr) {
     // Center frame gives the reference tangent used to convert axis distance
     // into a chordwise-station advance (vanes are ~3h long, a few % chord —
@@ -150,16 +210,22 @@ void stampVane(const AirfoilGeometry& airfoil, float aoaRad,
         const Vec3f d3(cosB * tr.x, cosB * tr.y, sinB);          // vane axis
         const Vec3f b3 = normalized(cross(n3, d3));              // thickness
 
-        // Ramp wedge: height ramps 0 -> h from upstream end to downstream
-        // end (right-triangular profile); vanes are full height everywhere.
-        const float top = ramp
-            ? hCells * (s + 0.5f * lenCells) / std::max(lenCells, 1e-3f)
-            : hCells;
+        // Per-slice shape from the blade profile: fractional position t along
+        // the length (0 upstream -> 1 downstream) drives the local top-height
+        // and (AirfoilSection only) the local thickness.
+        const float t   = (s + 0.5f * lenCells) / std::max(lenCells, 1e-3f);
+        const float top = hCells * profileTopFrac(profile, t, taper);
+        // Thickness floors at half a cell so a tapered nose never aliases away
+        // entirely (analytic-stamping rule); the embedded root always stamps
+        // full thickness so the seat stays watertight.
+        const float wHalf = std::max(0.5f, halfW * profileThickFrac(profile, t));
 
         // Rasterize the slice column: height u (embedded root included) by
-        // thickness w. Every sample marks the cell containing it.
+        // thickness w. Below the surface the column keeps full thickness so the
+        // seat seals; above it follows the (possibly tapered) profile thickness.
         for (float u = -kRootEmbed; u <= top + 1e-4f; u += kStep) {
-            for (float w = -halfW; w <= halfW + 1e-4f; w += kStep) {
+            const float colHalf = (u < 0.0f) ? std::max(0.5f, halfW) : wHalf;
+            for (float w = -colHalf; w <= colHalf + 1e-4f; w += kStep) {
                 const Vec3f p = root + n3 * u + b3 * w;
                 stampCell(flags, layout.dims,
                           static_cast<int>(std::floor(p.x)),
@@ -233,10 +299,15 @@ inline void rasterizeTriangleSurface(std::vector<std::uint8_t>& flags,
 /// @param hCells    Device height in cells (>= 1) — the mesh's overall scale.
 /// @param flip      Negate the canonical up-axis (fixes upside-down meshes).
 /// @param rotSteps  Extra 90-deg yaw steps about the canonical up-axis (0..3).
+/// @param mirror    Reflect the blade across its chordwise-vertical plane (negate
+///                  the thickness axis) so the +z blade of a counter-rotating
+///                  pair is a true mirror image of the -z blade, even for an
+///                  asymmetric mesh. Combine with a flipped betaRad for the pair.
 void stampStlVane(const StlMesh& unitMesh, const AirfoilGeometry& airfoil,
                   float aoaRad, const DomainLayout& layout,
                   std::vector<std::uint8_t>& flags, float x_c, float zCenter,
-                  float betaRad, float hCells, bool flip, int rotSteps) {
+                  float betaRad, float hCells, bool flip, int rotSteps,
+                  bool mirror) {
     const SurfaceFrame center = surfaceFrameAt(airfoil, x_c, /*upper=*/true);
     if (!center.valid || unitMesh.triangles.empty()) return;
 
@@ -272,6 +343,10 @@ void stampStlVane(const StlMesh& unitMesh, const AirfoilGeometry& airfoil,
     // fractional height up the device.
     auto toWorld = [&](const Vec3f& vert) {
         float vx = vert.x, vy = vert.y, vz = vert.z;
+        // Mirror across the chordwise-vertical plane (negate thickness) BEFORE
+        // yaw so an asymmetric mesh reflects into a true mirror image for the
+        // counter-rotating pair's far blade.
+        if (mirror) { vx = -vx; }
         // Upside-down fix mirrors about mid-height so the mesh stays in [0,1]
         // (a naive negation would push it below the surface).
         if (flip) { vy = 1.0f - vy; }
@@ -328,11 +403,17 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
     // handles arrays wider than the domain gracefully.
     const float zMid = 0.5f * static_cast<float>(layout.dims.nz);
 
-    // Resolve the CustomStl mesh up-front: an unresolved id (no mesh list, or
-    // an out-of-range / empty handle) contributes nothing — the caller detects
-    // this via vgStlMeshResolved() and logs it once, so we just bail quietly.
+    // Arrangement and blade shape are independent: resolve the real ones from
+    // the (possibly legacy) type/profile fields.
+    const VGType arrangement  = effectiveArrangement(vg);
+    const VGProfile profile   = effectiveProfile(vg);
+
+    // Resolve the CustomStl mesh up-front when the blade is a mesh: an
+    // unresolved id (no mesh list, or an out-of-range / empty handle)
+    // contributes nothing — the caller detects this via warnIfVgMeshMissing and
+    // logs it once, so we just bail quietly.
     const StlMesh* stlMesh = nullptr;
-    if (vg.type == VGType::CustomStl) {
+    if (profile == VGProfile::CustomStl) {
         if (!unitVgMeshes || vg.stlMeshId < 0
             || vg.stlMeshId >= static_cast<int>(unitVgMeshes->size())
             || (*unitVgMeshes)[vg.stlMeshId].triangles.empty()) {
@@ -341,47 +422,65 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
         stlMesh = &(*unitVgMeshes)[vg.stlMeshId];
     }
 
+    // Per-profile nominal half-thickness:
+    //   Wedge          -> half the device height (a chunky ramp prism),
+    //   AirfoilSection -> thicknessRatio * blade length (a real streamlined
+    //                     section whose NACA distribution peaks at this value),
+    //   everything else-> the thin 1-2 cell flat plate.
+    float halfW;
+    if (profile == VGProfile::Wedge) {
+        halfW = std::max(0.5f, 0.5f * h);
+    } else if (profile == VGProfile::AirfoilSection) {
+        halfW = std::max(0.5f, 0.5f * std::clamp(vg.thicknessRatio, 0.02f, 0.4f)
+                                    * len);
+    } else {
+        halfW = 0.5f * thick;
+    }
+
+    // Stamp ONE blade of the configured shape at spanwise center zc, yaw
+    // betaRad, optionally mirror-imaged (the far blade of a counter-rotating
+    // pair). The shape choice (parametric profile vs. user mesh) is orthogonal
+    // to the arrangement, so any arrangement composes with any blade here.
+    auto stampBlade = [&](float zc, float betaRad, bool mirror) {
+        if (profile == VGProfile::CustomStl) {
+            // Mesh blade: no VaneSlab (a single OBB can't model a triangle
+            // soup, so q-LIBB falls back to plain bounce-back — documented).
+            stampStlVane(*stlMesh, airfoil, aoaRad, layout, flags, x_c, zc,
+                         betaRad, h, vg.stlFlip, vg.stlRotSteps, mirror);
+        } else {
+            // Parametric plate/wedge: the profile drives per-slice top-height
+            // and thickness. (Mirror is implicit in the flipped betaRad for the
+            // parametric pair — its plate is symmetric about its own axis.)
+            stampVane(airfoil, aoaRad, layout, flags, x_c, zc, betaRad, h, len,
+                      halfW, profile, vg.taper, slabsOut);
+        }
+    };
+
     for (int i = 0; i < count; ++i) {
         const float zc = zMid
                        + (static_cast<float>(i) - 0.5f * static_cast<float>(count - 1))
                        * pitch;
-        switch (vg.type) {
+        switch (arrangement) {
         case VGType::SingleVane:
         case VGType::CoRotatingArray:
-            // One vane per unit, all yawed the same way — a single vane is
+            // One blade per unit, all yawed the same way — a single vane is
             // just a co-rotating array of count 1.
-            stampVane(airfoil, aoaRad, layout, flags, x_c, zc, beta, h, len,
-                      0.5f * thick, /*ramp=*/false, slabsOut);
+            stampBlade(zc, beta, /*mirror=*/false);
             break;
         case VGType::CounterRotatingPair: {
-            // Two mirrored vanes per unit, centers gap_h device heights
-            // apart. Orientation convention: commonFlowDown=true toes the
-            // trailing edges IN (the -z vane sweeps toward +z and vice
-            // versa), the flight-proven arrangement of the Strausak recipe;
-            // false toes them out (common flow up between the pair).
+            // Two mirror-image blades per unit, centers gap_h device heights
+            // apart. commonFlowDown=true toes the trailing edges IN (the
+            // flight-proven Strausak arrangement); false toes them out. The far
+            // (+z) blade is yawed the opposite way AND geometry-mirrored so an
+            // asymmetric STL blade forms a true mirror pair.
             const float halfGap = 0.5f * vg.gap_h * h;
             const float betaNear = vg.commonFlowDown ? beta : -beta;
-            stampVane(airfoil, aoaRad, layout, flags, x_c, zc - halfGap,
-                      betaNear, h, len, 0.5f * thick, /*ramp=*/false, slabsOut);
-            stampVane(airfoil, aoaRad, layout, flags, x_c, zc + halfGap,
-                      -betaNear, h, len, 0.5f * thick, /*ramp=*/false, slabsOut);
+            stampBlade(zc - halfGap, betaNear, /*mirror=*/false);
+            stampBlade(zc + halfGap, -betaNear, /*mirror=*/true);
             break;
         }
-        case VGType::Ramp:
-            // Right-triangular wedge prism in the same placement frame
-            // (plan 6.1). Wheeler-ramp-like proportions: spanwise width of
-            // one device height (never under one cell), height rising
-            // linearly to h at the downstream end.
-            stampVane(airfoil, aoaRad, layout, flags, x_c, zc, beta, h, len,
-                      std::max(0.5f, 0.5f * h), /*ramp=*/true);
-            break;
-        case VGType::CustomStl:
-            // User mesh as one unit, seated + arrayed exactly like the
-            // parametric vanes (one mesh per unit across the span). No
-            // VaneSlab: a single OBB can't model a triangle soup, so q-LIBB
-            // falls back to plain bounce-back for STL vanes (documented).
-            stampStlVane(*stlMesh, airfoil, aoaRad, layout, flags, x_c, zc,
-                         beta, h, vg.stlFlip, vg.stlRotSteps);
+        default: // Ramp / CustomStl legacy values already mapped to Single above
+            stampBlade(zc, beta, /*mirror=*/false);
             break;
         }
     }

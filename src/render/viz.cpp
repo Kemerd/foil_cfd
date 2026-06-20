@@ -1288,13 +1288,23 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
                                        + Vec3f(0.0f, 0.0f, 1.0f) * std::sin(beta));
             const Vec3f W = normalized(cross(N, L)); // in-surface, across the vane
             const Vec3f root(p2.x, p2.y, zc);
-            if (vg.type == VGType::Ramp) {
+            // Smooth preview shape by profile. The voxel view always shows the
+            // EXACT stamped solid; this preview approximates the parametric
+            // blades (a wedge for Wedge, a plate bounding-box for the others)
+            // and skips Custom STL (its true mesh is shown in the voxel view).
+            const VGProfile prof = effectiveProfile(vg);
+            if (prof == VGProfile::CustomStl) {
+                return; // mesh blade — not previewed in the smooth view
+            }
+            if (prof == VGProfile::Wedge) {
                 // Wedge: toe upstream, full height at the downstream end,
                 // one device-height wide (vg.h convention).
                 appendWedge(verts, root - L * (len * 0.5f) - W * (h * 0.5f),
                             L * len, N * h, W * h, drawColor);
             } else {
-                // Thin plate centered on the station footprint.
+                // Thin plate centered on the station footprint (delta/parabolic/
+                // trapezoid/airfoil-section approximate to this bounding plate
+                // in the smooth view; the voxel view shows their true outline).
                 appendParallelepiped(verts,
                                      root - L * (len * 0.5f) - W * (thick * 0.5f),
                                      L * len, N * h, W * thick, drawColor);
@@ -1306,7 +1316,7 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
             const float zc = 0.5f * spanZ
                            + (static_cast<float>(u)
                               - 0.5f * static_cast<float>(unitCount - 1)) * pitch;
-            switch (vg.type) {
+            switch (effectiveArrangement(vg)) {
                 case VGType::CounterRotatingPair: {
                     // Mirrored incidence; commonFlowDown swaps which side
                     // toes in, flipping the shared-vortex direction.
@@ -1317,7 +1327,7 @@ void Visualizer::uploadGeometry(const AirfoilGeometry& airfoil,
                 }
                 case VGType::SingleVane:
                 case VGType::CoRotatingArray:
-                case VGType::Ramp:
+                default:
                     emitVane(zc, vg.beta_deg);
                     break;
             }

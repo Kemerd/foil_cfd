@@ -22,13 +22,30 @@ namespace foilcfd {
 // are API: the UI panel, voxelizer, and cache flow all bind to them.
 // ===========================================================================
 
-// CustomStl: the vane SHAPE comes from a user-uploaded mesh instead of the
-// parametric slab, but it is still seated on the suction surface at x_c and
-// arrayed across the span exactly like the parametric types (one mesh = one
-// unit). The mesh rides a parametric .dat foil — this is NOT the foil-replacing
-// STL import (that is App::stlActive); the two are independent.
-enum class VGType { SingleVane, CounterRotatingPair, CoRotatingArray, Ramp,
-                    CustomStl };
+// VG configuration is two INDEPENDENT axes, so any arrangement can use any
+// blade shape (a counter-rotating pair of delta blades, a co-rotating array of
+// your custom STL, etc.):
+//
+//   VGType    = the ARRANGEMENT (how units are placed across the span).
+//   VGProfile = the BLADE SHAPE (the outline/section of one blade).
+//
+// VGType::Ramp and VGType::CustomStl are LEGACY values kept so older configs
+// still load; effectiveArrangement()/effectiveProfile() below migrate them to
+// the (arrangement, profile) pair (Ramp -> Single + Wedge, CustomStl -> Single +
+// CustomStl). New code sets `type` to a real arrangement and `profile` to the
+// shape.
+enum class VGType { SingleVane, CounterRotatingPair, CoRotatingArray,
+                    Ramp,      // legacy: migrates to Single + Wedge
+                    CustomStl }; // legacy: migrates to Single + CustomStl
+
+// Blade outline/section. The first five are parametric plates whose top-height
+// (and, for AirfoilSection, thickness) follow a formula along the blade length;
+// Wedge is the right-triangular ramp prism; CustomStl swaps the whole blade for
+// a user mesh. Placement, arraying, yaw, AoA and q-LIBB are identical across
+// profiles — only the per-slice top-height / thickness differ.
+enum class VGProfile { Rectangle, Delta, Trapezoid, Parabolic, AirfoilSection,
+                       Wedge, CustomStl };
+
 struct VGParams {
   VGType type;
   float x_c;        // chordwise station, 0..1 (typical 0.05–0.30)
@@ -41,7 +58,14 @@ struct VGParams {
   bool  commonFlowDown; // pair orientation
   bool  enabled = true; // when false: voxelized and rendered as ghost only
 
-  // ---- CustomStl fields (ignored by the parametric types) ----------------
+  // ---- blade shape (orthogonal to `type`) --------------------------------
+  VGProfile profile = VGProfile::Rectangle; // blade outline/section
+  float taper       = 0.5f;  // Trapezoid only: flat-top fraction of the length
+                             // (0 -> pure delta point, 1 -> rectangle).
+  float thicknessRatio = 0.12f; // AirfoilSection only: NACA max thickness / chord
+                                // of the blade's streamlined cross-section.
+
+  // ---- CustomStl fields (used when profile == CustomStl) -----------------
   // Kept as a copyable POD: the heavy triangle soup lives in App::vgMeshes,
   // and stlMeshId indexes into it, so VGParams stays cheap to copy (the VG
   // list, the sweep cases, and the warm-restart cache all copy it by value).
@@ -50,6 +74,25 @@ struct VGParams {
   bool  stlFlip     = false; // flip upside-down (negate the wall-normal axis)
   StlAxisPreset stlAxis = StlAxisPreset::XYZ; // import-time axis remap
 };
+
+/// @brief The real arrangement of a VG entry, migrating the legacy Ramp /
+/// CustomStl type values to SingleVane (their shape lives in the profile).
+inline VGType effectiveArrangement(const VGParams& vg) {
+    return (vg.type == VGType::Ramp || vg.type == VGType::CustomStl)
+               ? VGType::SingleVane
+               : vg.type;
+}
+
+/// @brief The real blade profile of a VG entry: an explicit non-Rectangle
+/// `profile` wins; otherwise the legacy type values pick the shape (Ramp ->
+/// Wedge, CustomStl -> CustomStl) so old configs render correctly. A modern
+/// entry leaves `type` an arrangement and sets `profile` directly.
+inline VGProfile effectiveProfile(const VGParams& vg) {
+    if (vg.profile != VGProfile::Rectangle) return vg.profile;
+    if (vg.type == VGType::Ramp)      return VGProfile::Wedge;
+    if (vg.type == VGType::CustomStl) return VGProfile::CustomStl;
+    return VGProfile::Rectangle;
+}
 
 /// @brief Sensible starting values matching the plan's "typical" annotations
 /// and the Strausak flight-proven recipe defaults (x/c 0.07, beta ~15-16 deg,

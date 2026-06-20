@@ -722,19 +722,56 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
                  bool& loadMeshRequested) {
     bool edited = false;
 
-    // Type combo — discrete, commits immediately.
+    // Arrangement and blade shape are INDEPENDENT axes. The Type combo picks the
+    // arrangement (how units are placed); the Profile combo picks the blade
+    // shape. Legacy Ramp / CustomStl type values are migrated to (Single +
+    // Wedge/CustomStl profile) the first time the user touches either combo, so
+    // old configs keep working and then become editable on both axes.
     static const char* kTypeNames[] = {"Single vane", "Counter-rotating pair",
-                                       "Co-rotating array", "Ramp",
-                                       "Custom STL mesh"};
-    int typeIdx = static_cast<int>(vg.type);
-    if (ImGui::Combo("Type", &typeIdx, kTypeNames, 5)) {
-        vg.type = static_cast<VGType>(typeIdx);
+                                       "Co-rotating array"};
+    int arrIdx = static_cast<int>(effectiveArrangement(vg)); // 0..2
+    if (ImGui::Combo("Arrangement", &arrIdx, kTypeNames, 3)) {
+        // Migrate the legacy shape into `profile` before overwriting `type`.
+        vg.profile = effectiveProfile(vg);
+        vg.type = static_cast<VGType>(arrIdx);
         edited = true;
     }
 
-    // CustomStl: mesh picker + orientation fix-up controls, shown right under
-    // the type so the user wires the shape before tuning placement.
-    if (vg.type == VGType::CustomStl) {
+    // Blade profile (shape) — works with any arrangement above.
+    static const char* kProfileNames[] = {
+        "Rectangle (flat plate)", "Delta / triangular", "Trapezoid (clipped)",
+        "Parabolic / elliptical", "Airfoil section (NACA)", "Wedge / ramp",
+        "Custom STL mesh"};
+    int profIdx = static_cast<int>(effectiveProfile(vg));
+    if (ImGui::Combo("Profile", &profIdx, kProfileNames, 7)) {
+        // Adopt the chosen profile and normalize the (now-migrated) arrangement
+        // so the legacy type value never lingers.
+        vg.type = effectiveArrangement(vg);
+        vg.profile = static_cast<VGProfile>(profIdx);
+        edited = true;
+    }
+    const VGProfile profile = static_cast<VGProfile>(profIdx);
+
+    // Profile-specific shape knobs.
+    if (profile == VGProfile::Trapezoid) {
+        ImGui::SliderFloat("Flat-top", &vg.taper, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) edited = true;
+        ImGui::SameLine();
+        helpMarker("Fraction of the blade length that holds the full height as a "
+                   "flat top. 0 = a pure triangular delta point, 1 = a full "
+                   "rectangle; in between is a clipped-delta trapezoid.");
+    }
+    if (profile == VGProfile::AirfoilSection) {
+        ImGui::SliderFloat("Thickness", &vg.thicknessRatio, 0.04f, 0.30f, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) edited = true;
+        ImGui::SameLine();
+        helpMarker("Max thickness / chord of the blade's streamlined NACA "
+                   "symmetric cross-section. Thinner = lower device drag but "
+                   "needs more cells to resolve.");
+    }
+
+    // CustomStl profile: mesh picker + orientation fix-up controls.
+    if (profile == VGProfile::CustomStl) {
         const int meshCount =
             vgMeshNames ? static_cast<int>(vgMeshNames->size()) : 0;
         // Mesh combo over the loaded meshes; preview the current selection.
@@ -813,9 +850,9 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
                   "Lin (2002) nominal: h ~ delta99 at the placement station "
                   "(shown in the Guidance panel). Typical range: 0.005–0.020 c.");
 
-    // Length is a parametric-vane concept (the mesh carries its own length);
-    // skip it for CustomStl.
-    if (vg.type != VGType::CustomStl) {
+    // Length is a parametric blade concept (the mesh carries its own length);
+    // skip it only for the custom-STL profile.
+    if (profile != VGProfile::CustomStl) {
         releaseSlider("Length (h)", &vg.length_h, 1.0f, 6.0f, "%.1f",
                       "Vane chord length expressed as multiples of device "
                       "height h. Longer vanes generate stronger vortices but "
@@ -829,11 +866,12 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
                   "use +/- symmetric angles. Strausak: ~16 deg. "
                   "Higher angles produce stronger vortices with more drag penalty.");
 
-    // CustomStl is arrayed across the span like a co-rotating array (one mesh
-    // per unit), so it also exposes Pitch + Units.
-    const bool multiUnit = (vg.type == VGType::CounterRotatingPair
-                            || vg.type == VGType::CoRotatingArray
-                            || vg.type == VGType::CustomStl);
+    // Pitch + Units belong to any arrangement that ARRAYS across the span (a
+    // pair or a co-rotating array); a single vane is one unit. Independent of
+    // the blade profile, so an array/pair of STL or delta blades arrays too.
+    const VGType arrangement = effectiveArrangement(vg);
+    const bool multiUnit = (arrangement == VGType::CounterRotatingPair
+                            || arrangement == VGType::CoRotatingArray);
     if (multiUnit) {
         releaseSlider("Pitch (c)", &vg.pitch_c, 0.01f, 0.20f, "%.3f",
                       "Spanwise spacing between adjacent VG units as a fraction "
@@ -841,7 +879,7 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
                       "re-energisation; too tight and vortices merge. "
                       "Typical: 3–6 h (expressed here in chord units).");
     }
-    if (vg.type == VGType::CounterRotatingPair) {
+    if (arrangement == VGType::CounterRotatingPair) {
         releaseSlider("Gap (h)", &vg.gap_h, 1.0f, 6.0f, "%.1f",
                       "Lateral gap between the two vanes in a counter-rotating "
                       "pair, in multiples of h. Controls the proximity of the "

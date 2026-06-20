@@ -513,7 +513,7 @@ bool resolveAirfoil(App& app, std::string* error) {
 void warnIfVgMeshMissing(App& app) {
     bool missing = false;
     for (const VGParams& vg : app.params.vgs) {
-        if (vg.enabled && vg.type == VGType::CustomStl
+        if (vg.enabled && effectiveProfile(vg) == VGProfile::CustomStl
             && (vg.stlMeshId < 0
                 || vg.stlMeshId >= static_cast<int>(app.vgMeshes.size())
                 || app.vgMeshes[vg.stlMeshId].triangles.empty())) {
@@ -1428,8 +1428,10 @@ void applyVgStlImport(App& app) {
     app.vgMeshes.push_back(std::move(mesh));
     app.vgMeshNames.push_back(name);
 
-    // Attach to the selected VG: if it's already a CustomStl entry, repoint it;
-    // otherwise convert it (or append a fresh one when nothing is selected).
+    // Attach to the selected VG: set its PROFILE to CustomStl (the arrangement —
+    // single / pair / array — is preserved, so the mesh inherits whatever
+    // arrangement the entry already had). Append a fresh entry when nothing is
+    // selected. Clear any legacy type value so effectiveProfile resolves cleanly.
     const int sel = app.params.selectedVG;
     VGParams* target = nullptr;
     if (sel >= 0 && sel < static_cast<int>(app.params.vgs.size())) {
@@ -1439,7 +1441,8 @@ void applyVgStlImport(App& app) {
         app.params.selectedVG = static_cast<int>(app.params.vgs.size()) - 1;
         target = &app.params.vgs.back();
     }
-    target->type      = VGType::CustomStl;
+    target->type      = effectiveArrangement(*target); // drop legacy type value
+    target->profile   = VGProfile::CustomStl;
     target->stlMeshId = newId;
     target->stlAxis   = app.params.stlImport.axisPreset;
 
