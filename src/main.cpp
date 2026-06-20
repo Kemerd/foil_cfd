@@ -25,6 +25,7 @@
 
 #include "app/aircraft_manifest.h"
 #include "app/camera.h"
+#include "app/sweep.h"
 #include "app/ui.h"
 #include "geom/airfoil.h"
 #include "geom/stl.h"
@@ -146,6 +147,38 @@ struct App {
     StlMesh stlMeshRaw;                  ///< As loaded, pre-normalization (kept
                                          ///< so resolution changes re-voxelize).
     bool stlActive = false;
+
+    // -- custom-VG-STL state (2026-06-19) --
+    // Unit-normalized VG meshes (normalizeVgMeshUnit), indexed by
+    // VGParams::stlMeshId. These ride a parametric foil — independent of
+    // stlActive (which replaces the whole foil). Heavy triangle soup lives here,
+    // NOT in UIParams, so VGParams stays a cheap-to-copy POD.
+    std::vector<StlMesh> vgMeshes;       ///< index == VGParams::stlMeshId.
+    std::vector<std::string> vgMeshNames;///< Parallel display names for the combo.
+    bool vgStlPending = false;           ///< Drop/dialog stashed a mesh in
+                                         ///< stlMeshRaw for VG import (the modal
+                                         ///< is showing with StlImportUI::forVg).
+    bool vgMeshMissingLogged = false;    ///< One log line when a CustomStl VG
+                                         ///< references an unresolved mesh id.
+
+    // -- testing-suite run state (2026-06-19) --
+    // The in-frame sweep state machine. It drives the SAME solver one case at a
+    // time (set params -> applyGeometryCold -> step to convergence -> record ->
+    // advance), ticked once per frame so the UI stays live and the user can
+    // watch each case run. See tickSweep().
+    enum class SweepPhase { Idle, Converging, Recording, Done, Cancelled };
+    struct SweepRun {
+        SweepPhase phase = SweepPhase::Idle;
+        SweepParams params;                  ///< Snapshot taken at start.
+        std::vector<SweepCase> cases;
+        std::vector<SweepResult> results;
+        int       current     = -1;          ///< Index of the case in flight.
+        long long caseStartStep = 0;         ///< solver.stepCount() at setup.
+        double    caseStartWall = 0.0;        ///< wall seconds at setup.
+        bool      paused      = false;
+        int       scrubLoadedCase = -1;      ///< Result loaded for live preview.
+    };
+    SweepRun sweep;
 
     // -- frame-loop bookkeeping --
     std::vector<std::string> droppedFiles; ///< Queued by the GLFW drop callback.
@@ -473,6 +506,30 @@ bool resolveAirfoil(App& app, std::string* error) {
     return true;
 }
 
+/// Log once (per session) when any enabled CustomStl VG points at a mesh id we
+/// can't resolve — the vane voxelizes to nothing, so the user needs to know it
+/// silently dropped rather than thinking a small VG just isn't visible. Resets
+/// the latch when everything resolves so a later bad edit warns again.
+void warnIfVgMeshMissing(App& app) {
+    bool missing = false;
+    for (const VGParams& vg : app.params.vgs) {
+        if (vg.enabled && vg.type == VGType::CustomStl
+            && (vg.stlMeshId < 0
+                || vg.stlMeshId >= static_cast<int>(app.vgMeshes.size())
+                || app.vgMeshes[vg.stlMeshId].triangles.empty())) {
+            missing = true;
+            break;
+        }
+    }
+    if (missing && !app.vgMeshMissingLogged) {
+        logLine("warning: a custom-STL VG has no mesh loaded — it voxelizes to "
+                "nothing. Load a VG mesh in the VG editor.");
+        app.vgMeshMissingLogged = true;
+    } else if (!missing) {
+        app.vgMeshMissingLogged = false; // re-arm for the next bad edit
+    }
+}
+
 /// Rebuild clean + active flag fields for the current airfoil/AoA/VG state.
 /// The clean field is kept separately so VG slider ticks never repeat the
 /// O(nx*ny) airfoil parity tests (plan 6.2).
@@ -482,7 +539,9 @@ void rebuildFlagFields(App& app) {
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
-                            app.layout, app.cleanFlags);
+                            app.layout, app.cleanFlags, /*slabsOut=*/nullptr,
+                            &app.vgMeshes);
+    warnIfVgMeshMissing(app);
 }
 
 /// Apply the wall-model policy (UIParams::wallModel) to the solver: forced
@@ -626,13 +685,47 @@ void uploadQLinksForLevel(App& app, const GridDims& dims,
 /// tear the fine level down — the coarse sim continues either way.
 void applyRefinement(App& app) {
     // Effective factor: the user's Mesh-panel setting, raised by the VG
-    // resolution guard when it is on — a vane below kMinVGHeightCells sheds
-    // a systematically weak vortex, and the patch is the cheap fix because
-    // it multiplies resolution only around the geometry. The guard can pull
-    // the patch into existence from factor 1 for the same reason.
+    // resolution target when it is on — a vane below the target sheds a
+    // systematically weak vortex, and the patch is the cheap fix because it
+    // multiplies resolution only around the geometry. The target can pull the
+    // patch into existence from factor 1 for the same reason.
     int factor = std::clamp(app.params.refine.factor, 1, kMaxRefineFactor);
-    if (app.params.refine.autoVGFactor && !app.params.vgs.empty()
-        && !app.stlActive) {
+    const bool vgTargetDrives =
+        app.params.refine.vgTargetAuto && !app.params.vgs.empty()
+        && !app.stlActive;
+    if (vgTargetDrives) {
+        // What the cascade must reach to seat every vane at the target height.
+        // The nested VG box (finerVGPatch) already doubles the fine factor, so
+        // when it is on the FINE patch only needs to supply HALF the target
+        // factor — keeping the expensive whole-foil patch as small as possible
+        // and letting the tiny nested box carry the rest (4x fine x 2x nested =
+        // 8x effective = kMaxVGTargetFactor). Without the nested box the fine
+        // patch must carry the whole target itself.
+        const int needed = recommendedRefineFactorForVGs(
+            app.params.vgs, app.layout.chordCells,
+            app.params.refine.vgTargetCells, kMaxVGTargetFactor);
+        // When the nested box (finerVGPatch) is on it doubles the fine factor,
+        // so the FINE patch supplies ceil(needed/2). But the cascade has no
+        // standalone-2x mode: the nested box only exists ON TOP of a >= 2x fine
+        // patch, so once any refinement is needed the fine patch must be at
+        // least 2x — otherwise factor < 2 below tears the whole cascade (and the
+        // nested box) down and the vane gets 1x. Floor at 2 whenever needed >= 2.
+        int fineNeeded;
+        if (needed <= 1) {
+            fineNeeded = needed;
+        } else if (app.params.refine.finerVGPatch) {
+            fineNeeded = std::max(2, (needed + 1) / 2); // ceil(needed/2), >= 2
+        } else {
+            fineNeeded = needed;
+        }
+        // The single fine patch never exceeds kMaxRefineFactor (4x); the nested
+        // box supplies any remaining factor up to the 8x ceiling. A target that
+        // still can't be met keeps the honest under-resolution warning.
+        factor = std::clamp(std::max(factor, fineNeeded), 1, kMaxRefineFactor);
+    } else if (app.params.refine.autoVGFactor && !app.params.vgs.empty()
+               && !app.stlActive) {
+        // Legacy whole-patch auto-raise (kept for back-compat; the target
+        // driver above is the default path now).
         factor = std::max(factor, recommendedRefineFactorForVGs(
                                       app.params.vgs, app.layout.chordCells));
     }
@@ -730,7 +823,7 @@ void applyRefinement(App& app) {
     std::vector<VaneSlab> fineSlabs;
     for (const VGParams& vg : app.params.vgs)
         voxelizeVG(vg, app.airfoil, app.params.aoaDeg, fineLayout, fine,
-                   &fineSlabs);
+                   &fineSlabs, &app.vgMeshes);
     closeTrailingEdgeGaps(fineLayout.dims, fine);
     stampInterfaceShell(fineLayout.dims, fine);
 
@@ -801,7 +894,7 @@ void applyRefinement(App& app) {
         const int my = vgCellsOf(0.03f); // wall-normal pad
         const PatchBox box2 = deriveVGPatchBoxFine(
             fineLayout, app.params.vgs, app.airfoil, app.params.aoaDeg,
-            mx, mx, my, my);
+            mx, mx, my, my, &app.vgMeshes);
 
         if (box2.valid()) {
             // Level-2 flag field: foil (so the vane roots have a wall + the
@@ -817,7 +910,7 @@ void applyRefinement(App& app) {
             std::vector<VaneSlab> finerSlabs;
             for (const VGParams& vg : app.params.vgs)
                 voxelizeVG(vg, app.airfoil, app.params.aoaDeg, finerLayout, finer,
-                           &finerSlabs);
+                           &finerSlabs, &app.vgMeshes);
             closeTrailingEdgeGaps(finerLayout.dims, finer);
             stampInterfaceShell(finerLayout.dims, finer);
 
@@ -878,7 +971,8 @@ void runPreconverge(App& app) {
         buildCleanFoilFlags(app.airfoil, app.params.aoaDeg, preLayout);
     if (!app.params.vgs.empty()) {
         flags = buildFlagsWithVGs(app.params.vgs, app.airfoil,
-                                  app.params.aoaDeg, preLayout, flags);
+                                  app.params.aoaDeg, preLayout, flags,
+                                  /*slabsOut=*/nullptr, &app.vgMeshes);
     }
 
     PhysicalParams phys;
@@ -1224,8 +1318,10 @@ void handleIncomingFile(App& app, const std::filesystem::path& path) {
         // Stash the mesh; the modal collects normalization choices before
         // any voxelization happens (plan 7.2).
         app.stlMeshRaw = std::move(res.mesh);
+        app.vgStlPending = false; // a dropped .stl is a FOIL import, not a VG
         StlImportUI& ui = app.params.stlImport;
         ui.open          = true;
+        ui.forVg         = false; // clear any stale VG-import flag
         ui.fileName      = fileNameUtf8;
         ui.solidName     = app.stlMeshRaw.name;
         ui.triangleCount = static_cast<std::uint32_t>(app.stlMeshRaw.triangles.size());
@@ -1281,7 +1377,9 @@ bool applyVGEdit(App& app) {
     app.activeFlags = app.params.vgs.empty()
         ? app.cleanFlags
         : buildFlagsWithVGs(app.params.vgs, app.airfoil, app.params.aoaDeg,
-                            app.layout, app.cleanFlags);
+                            app.layout, app.cleanFlags, /*slabsOut=*/nullptr,
+                            &app.vgMeshes);
+    warnIfVgMeshMissing(app);
     // Warm continuation only makes sense from a healthy field — after a NaN
     // trip there is nothing worth keeping, so fall back to the cold path.
     const bool warm = app.params.vgWarmRestart && !app.solver.nanDetected();
@@ -1306,6 +1404,52 @@ bool applyVGEdit(App& app) {
     // the warm path already HAS that flow — re-seeding would throw it away.
     if (!warm) runPreconverge(app);
     return warm;
+}
+
+/// Commit a pending custom-VG-STL import: normalize the stashed raw mesh to
+/// unit space under the chosen axis preset, store it, attach it to the selected
+/// VG (creating a CustomStl entry if the selection isn't already one), and run
+/// the normal VG rebuild. The mesh rides the parametric foil — stlActive stays
+/// false, so the foil + cascade keep working.
+void applyVgStlImport(App& app) {
+    if (!app.vgStlPending || app.stlMeshRaw.triangles.empty()) {
+        app.vgStlPending = false;
+        return;
+    }
+    // Unit-normalize a working copy under the modal's axis preset.
+    StlMesh mesh = app.stlMeshRaw;
+    normalizeVgMeshUnit(mesh, app.params.stlImport.axisPreset);
+
+    const int newId = static_cast<int>(app.vgMeshes.size());
+    std::string name = app.stlMeshRaw.name.empty()
+                           ? app.params.stlImport.fileName
+                           : app.stlMeshRaw.name;
+    if (name.empty()) name = "VG mesh " + std::to_string(newId + 1);
+    app.vgMeshes.push_back(std::move(mesh));
+    app.vgMeshNames.push_back(name);
+
+    // Attach to the selected VG: if it's already a CustomStl entry, repoint it;
+    // otherwise convert it (or append a fresh one when nothing is selected).
+    const int sel = app.params.selectedVG;
+    VGParams* target = nullptr;
+    if (sel >= 0 && sel < static_cast<int>(app.params.vgs.size())) {
+        target = &app.params.vgs[sel];
+    } else {
+        app.params.vgs.push_back(defaultVGParams());
+        app.params.selectedVG = static_cast<int>(app.params.vgs.size()) - 1;
+        target = &app.params.vgs.back();
+    }
+    target->type      = VGType::CustomStl;
+    target->stlMeshId = newId;
+    target->stlAxis   = app.params.stlImport.axisPreset;
+
+    app.vgStlPending = false;
+    app.params.stlImport.forVg = false;
+    app.params.source = AirfoilSource::DatFile; // unchanged; VG rides the foil
+    setStatus(app, "loaded VG mesh: " + name);
+
+    // Rebuild with the new VG via the standard edit path (cold/warm per the UI).
+    applyVGEdit(app);
 }
 
 // ===========================================================================
@@ -1501,6 +1645,34 @@ void updateReadouts(App& app) {
         rr.qlibbActive   = qr.enabled && qr.links > 0;
         rr.qlibbLinks    = qr.links;
         rr.qlibbFallback = qr.fallback;
+
+        // VG resolution target readout: the resolved height the selected (or
+        // first enabled) vane ACTUALLY gets at the live cascade resolution, so
+        // the panel can show "current X cells (target Y)" and colour it by
+        // whether the target was met. The effective chord resolution is the
+        // base chord times the finest level the vanes live in: the nested VG
+        // box when active (factor * finerFactor), else the fine patch, else 1.
+        rr.vgHeightCellsLive = 0.0f;
+        rr.vgTargetCells     = 0;
+        if (!app.params.vgs.empty() && !app.stlActive) {
+            int effFactor = 1;
+            if (ri.finerActive) effFactor = ri.factor * ri.finerFactor;
+            else if (ri.active) effFactor = ri.factor;
+            const int effChord = app.layout.chordCells * std::max(1, effFactor);
+            // Pick the entry the panel's guidance follows: the selected VG, or
+            // the first enabled one when nothing is selected.
+            const VGParams* probe = nullptr;
+            const int sel = app.params.selectedVG;
+            if (sel >= 0 && sel < static_cast<int>(app.params.vgs.size())
+                && app.params.vgs[sel].enabled) {
+                probe = &app.params.vgs[sel];
+            } else {
+                for (const VGParams& vg : app.params.vgs)
+                    if (vg.enabled) { probe = &vg; break; }
+            }
+            if (probe) rr.vgHeightCellsLive = vgHeightCells(*probe, effChord);
+            rr.vgTargetCells = app.params.refine.vgTargetCells;
+        }
     }
 
     // ISLBM stretched-mesh status (mutually exclusive with the cascade above;
@@ -1522,6 +1694,23 @@ void updateReadouts(App& app) {
     // The presolve runs synchronously inside the apply functions, so there is
     // never a mid-flight progress value to report between frames.
     app.readouts.preconvergeProgress = -1.0f;
+
+    // Testing-suite snapshot: a frozen copy so the panel renders a stable table
+    // (the live results vector grows under it as cases finish). Only refreshed
+    // while a sweep is active or finished, so an idle session pays nothing.
+    {
+        auto& sr = app.readouts.sweep;
+        const App::SweepRun& run = app.sweep;
+        sr.running = (run.phase == App::SweepPhase::Converging
+                      || run.phase == App::SweepPhase::Recording);
+        sr.paused  = run.paused;
+        sr.current = run.current + 1; // 1-based for display
+        sr.total   = static_cast<int>(run.cases.size());
+        sr.results = run.results;     // small (tens of rows) — cheap to copy
+        sr.bestIndex = run.results.empty()
+                           ? -1
+                           : rankSweepResults(run.results).front();
+    }
 
     // VRAM fraction (plan 4.6 warn-above-80%) + GPU load: driver queries, so
     // poll at ~2 Hz instead of every frame.
@@ -1631,6 +1820,160 @@ void refreshGuidance(App& app) {
 }
 
 // ===========================================================================
+// Testing suite: in-frame sweep state machine (2026-06-19).
+// ===========================================================================
+
+/// Run the Wendt vortex-strength audit for a converged VG case, reusing the
+/// live delta99 profile (refreshGuidance keeps it current) to find the
+/// boundary-layer sample nearest the first vane's station. Mirrors the
+/// refreshGuidance audit, but anchored on the case's own VGs rather than the
+/// UI selection. Returns an invalid readout when there are no VGs or no usable
+/// BL sample (ranking tolerates that).
+VGAuditReadout runAuditForCase(App& app, const SweepCase& c) {
+    if (!c.hasVgs || c.vgs.empty()) return VGAuditReadout{};
+    const float stationXc = c.vgs.front().x_c;
+    const Delta99Sample* nearest = nullptr;
+    for (const Delta99Sample& s : app.readouts.delta99Profile) {
+        if (!s.valid) continue;
+        if (!nearest
+            || std::fabs(s.x_c - stationXc) < std::fabs(nearest->x_c - stationXc))
+            nearest = &s;
+    }
+    if (!nearest) return VGAuditReadout{};
+    return auditVGVortexStrength(
+        app.solver, c.vgs.front(), app.layout.chordCells, nearest->ueEdge,
+        nearest->delta99_c * static_cast<float>(app.layout.chordCells));
+}
+
+/// Configure the solver for sweep case @p idx and cold-restart it. Reuses the
+/// interactive per-case primitive applyGeometryCold (which rebuilds flags,
+/// applies the VG-resolution refinement, and clears the NaN latch on cold
+/// restart), so a sweep case is set up exactly like a hand edit.
+void setupSweepCase(App& app, int idx) {
+    const SweepCase& c = app.sweep.cases[static_cast<std::size_t>(idx)];
+    app.params.aoaDeg = c.aoaDeg;
+    app.params.vgs    = c.vgs;             // empty for a clean-airfoil case
+    app.params.selectedVG = c.vgs.empty() ? -1 : 0;
+    app.params.running = true;             // make sure the sim steps
+    applyGeometryCold(app);                // rebuild + cold restart + preconverge
+    app.sweep.caseStartStep = app.solver.stepCount();
+    app.sweep.caseStartWall = platform::timerSeconds();
+}
+
+/// Advance the machine to the next case, or finalize when the list is done.
+void advanceSweep(App& app);
+
+/// Snapshot the current (converged or failed) case into the results list.
+void recordSweepCase(App& app, bool diverged, bool converged) {
+    auto& run = app.sweep;
+    SweepResult r;
+    r.config      = run.cases[static_cast<std::size_t>(run.current)];
+    r.forces      = app.solver.forces();
+    r.diverged    = diverged;
+    r.converged   = converged;
+    r.steps       = app.solver.stepCount() - run.caseStartStep;
+    r.wallSeconds = platform::timerSeconds() - run.caseStartWall;
+    if (converged && !diverged) r.audit = runAuditForCase(app, r.config);
+    run.results.push_back(std::move(r));
+}
+
+/// Write @p text to @p path (binary, so the LF line endings survive verbatim),
+/// returning false on open failure. Modeled on logOpen's UTF-8-safe fopen; used
+/// by the sweep CSV export.
+bool writeTextFile(const std::filesystem::path& path, const std::string& text) {
+    std::FILE* f = nullptr;
+#ifdef _WIN32
+    _wfopen_s(&f, path.wstring().c_str(), L"wb");
+#else
+    f = std::fopen(path.string().c_str(), "wb");
+#endif
+    if (!f) return false;
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    return true;
+}
+
+/// Finalize a completed sweep: log a one-line summary pointing at the best case.
+void finalizeSweep(App& app) {
+    auto& run = app.sweep;
+    run.phase = App::SweepPhase::Done;
+    app.params.running = false; // stop on the last case so the user can inspect
+    if (run.results.empty()) { setStatus(app, "sweep finished: no results"); return; }
+    const std::vector<int> order = rankSweepResults(run.results);
+    const SweepResult& best = run.results[static_cast<std::size_t>(order.front())];
+    char msg[200];
+    std::snprintf(msg, sizeof msg,
+                  "sweep finished: %zu cases. Best AoA %.1f deg -> L/D %.2f "
+                  "(Cl %.3f, Cd %.4f)",
+                  run.results.size(), best.config.aoaDeg,
+                  best.converged ? best.forces.ldMedian : best.forces.liftToDrag,
+                  best.converged ? best.forces.clAvg : best.forces.cl,
+                  best.converged ? best.forces.cdAvg : best.forces.cd);
+    logLine(msg);
+    setStatus(app, msg);
+}
+
+void advanceSweep(App& app) {
+    auto& run = app.sweep;
+    ++run.current;
+    if (run.current >= static_cast<int>(run.cases.size())) {
+        finalizeSweep(app);
+        return;
+    }
+    setupSweepCase(app, run.current);
+    run.phase = App::SweepPhase::Converging;
+}
+
+/// Tick the sweep state machine once per frame (after updateReadouts, so
+/// forces() is fresh). Non-blocking: it observes convergence and advances at
+/// most one phase per frame, letting the normal frame loop step the solver and
+/// render each case live.
+void tickSweep(App& app) {
+    auto& run = app.sweep;
+    if (run.phase != App::SweepPhase::Converging
+        && run.phase != App::SweepPhase::Recording)
+        return;
+    if (run.paused) return;
+
+    if (run.phase == App::SweepPhase::Converging) {
+        // A latched CUDA failure is session-fatal — abandon the sweep.
+        if (app.cudaFailure) {
+            recordSweepCase(app, /*diverged=*/true, /*converged=*/false);
+            run.phase = App::SweepPhase::Cancelled;
+            app.params.running = false;
+            setStatus(app, "sweep cancelled: CUDA failure");
+            return;
+        }
+        // NaN divergence: record and move on (the next cold restart clears it).
+        if (app.solver.nanDetected()) {
+            recordSweepCase(app, /*diverged=*/true, /*converged=*/false);
+            advanceSweep(app);
+            return;
+        }
+        // Safety cap: a case that never opens the gate is recorded non-converged.
+        const long long ran = app.solver.stepCount() - run.caseStartStep;
+        if (ran >= run.params.maxStepsPerCase) {
+            recordSweepCase(app, /*diverged=*/false, /*converged=*/false);
+            advanceSweep(app);
+            return;
+        }
+        // Converged when the force gate has been open long enough to also have
+        // collected the requested extra averaging window.
+        const ForceReadout f = app.solver.forces();
+        if (f.valid
+            && f.flowThroughs
+                   >= kForceGateFlowThroughs + run.params.averagingFlowThroughs) {
+            run.phase = App::SweepPhase::Recording;
+        }
+        return;
+    }
+
+    // Recording (one frame): snapshot the converged case, then advance.
+    recordSweepCase(app, /*diverged=*/false, /*converged=*/true);
+    advanceSweep(app);
+}
+
+// ===========================================================================
 // UI event application — the ONE place edit ordering lives
 // (voxelize -> snapshot -> solver, per ui.h's contract).
 // ===========================================================================
@@ -1638,6 +1981,17 @@ void refreshGuidance(App& app) {
 void applyEvents(App& app) {
     UIEvents& ev = app.events;
     std::string err;
+
+    // ---- mid-sweep gating: while a case is in flight the sweep machine OWNS
+    // the geometry/AoA/refinement, so swallow any panel edits that would
+    // restart or re-voxelize the running case out from under it. The sweep's
+    // own controls (start/pause/cancel/export/scrub) are honored below. ----
+    if (app.sweep.phase == App::SweepPhase::Converging
+        || app.sweep.phase == App::SweepPhase::Recording) {
+        ev.aoaChanged = ev.vgEdited = ev.airspeedChanged = false;
+        ev.resolutionChanged = ev.meshRefinementChanged = false;
+        ev.reloadAirfoil = ev.highFidelityToggled = false;
+    }
 
     // ---- catalog + aircraft manifest (plan 15.5: re-read on refresh) ----
     if (ev.refreshAirfoils) {
@@ -1769,7 +2123,93 @@ void applyEvents(App& app) {
     if (ev.stlImportConfirmed) applyStlImport(app);
     if (ev.stlImportCancelled) {
         app.stlMeshRaw = StlMesh{};
+        app.vgStlPending = false;
         setStatus(app, "STL import cancelled");
+    }
+
+    // ---- custom-VG-STL import flow (rides the parametric foil) ----
+    if (ev.loadVgStlRequested) {
+        const auto path = platform::openFileDialog(
+            "Load VG mesh", {{"STL mesh", "*.stl"}});
+        if (path) {
+            // Load directly (NOT handleIncomingFile, which routes .stl to the
+            // foil modal). Stash the raw mesh and open the shared import modal
+            // in forVg mode to collect the axis preset.
+            StlLoadResult res = loadStl(*path);
+            if (!res.ok) {
+                setStatus(app, platform::pathToUtf8(path->filename())
+                                   + " rejected: " + res.rejectionReason);
+            } else {
+                app.stlMeshRaw = std::move(res.mesh);
+                app.vgStlPending = true;
+                StlImportUI& ui = app.params.stlImport;
+                ui.open          = true;
+                ui.forVg         = true;
+                ui.fileName      = platform::pathToUtf8(path->filename());
+                ui.solidName     = app.stlMeshRaw.name;
+                ui.triangleCount =
+                    static_cast<std::uint32_t>(app.stlMeshRaw.triangles.size());
+                ui.bounds        = app.stlMeshRaw.bounds;
+                ui.wasBinary     = app.stlMeshRaw.wasBinary;
+            }
+        }
+    }
+    if (ev.vgStlImportConfirmed) applyVgStlImport(app);
+
+    // ---- testing suite (sweep) controls ----
+    if (ev.sweepStart) {
+        auto& run = app.sweep;
+        run.params = app.params.sweepParams;
+        run.cases  = buildSweepCases(run.params, app.params.vgs);
+        run.results.clear();
+        run.current = -1;
+        run.paused = false;
+        run.scrubLoadedCase = -1;
+        if (run.cases.empty()) {
+            setStatus(app, "sweep: no cases (add at least one AoA)");
+            run.phase = App::SweepPhase::Idle;
+        } else {
+            char msg[120];
+            std::snprintf(msg, sizeof msg, "sweep started: %zu cases",
+                          run.cases.size());
+            setStatus(app, msg);
+            advanceSweep(app); // sets up case 0 and enters Converging
+        }
+    }
+    if (ev.sweepPause) {
+        app.sweep.paused = !app.sweep.paused;
+        // Freeze/resume the sim along with the machine so the case visibly halts.
+        app.params.running = !app.sweep.paused;
+        setStatus(app, app.sweep.paused ? "sweep paused" : "sweep resumed");
+    }
+    if (ev.sweepCancel) {
+        app.sweep.phase = App::SweepPhase::Cancelled;
+        app.params.running = false;
+        setStatus(app, "sweep cancelled (partial results kept)");
+    }
+    if (ev.sweepExportCsv && !app.sweep.results.empty()) {
+        const auto path = platform::saveFileDialog(
+            "Export sweep CSV", {{"CSV", "*.csv"}}, "foilcfd_sweep.csv");
+        if (path) {
+            if (writeTextFile(*path, sweepResultsToCsv(app.sweep.results)))
+                setStatus(app, "exported " + platform::pathToUtf8(path->filename()));
+            else
+                setStatus(app, "CSV export failed (could not open file)");
+        }
+    }
+    if (ev.sweepScrubTo) {
+        const int sel = app.params.sweepSelectedResult;
+        if (sel >= 0 && sel < static_cast<int>(app.sweep.results.size())) {
+            // Load this result's case into the interactive view WITHOUT starting
+            // the machine, so the user can watch it run live and tweak from there.
+            const SweepCase& c = app.sweep.results[static_cast<std::size_t>(sel)].config;
+            app.params.aoaDeg = c.aoaDeg;
+            app.params.vgs    = c.vgs;
+            app.params.selectedVG = c.vgs.empty() ? -1 : 0;
+            applyGeometryCold(app);
+            app.sweep.scrubLoadedCase = sel;
+            setStatus(app, "loaded sweep case into view");
+        }
     }
 
     // ---- sim transport ----
@@ -1930,6 +2370,10 @@ int runInteractive(App& app) {
         if (!app.cudaFailure) {
             refreshGuidance(app);
         }
+        // Tick the testing-suite sweep AFTER readouts/guidance so it sees fresh
+        // forces() and a current delta99 profile (the per-case audit reuses it),
+        // and may cold-restart the next case for the following frame to render.
+        tickSweep(app);
 
         // Status messages decay so stale errors don't linger for the session.
         if (!app.status.empty() && now - app.statusT > kStatusLifetime) {
@@ -1943,6 +2387,7 @@ int runInteractive(App& app) {
         ctx.events = &app.events;
         ctx.airfoilCatalog = &app.catalog;
         ctx.aircraftManifest = &app.aircraft.entries;
+        ctx.vgMeshNames = &app.vgMeshNames;
         ctx.statusMessage = app.status;
         // Camera matrix for world-space line overlays (the patch box): same
         // aspect as drawFrame so the projected lines land exactly on the GL

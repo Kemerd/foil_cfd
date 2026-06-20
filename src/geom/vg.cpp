@@ -170,6 +170,128 @@ void stampVane(const AirfoilGeometry& airfoil, float aoaRad,
     }
 }
 
+/// @brief Surface-sample one triangle into the flag field at sub-cell density.
+///
+/// Walks the triangle in barycentric space at ~0.45-cell steps (the same
+/// strictly-below-half-a-cell guarantee stampVane uses, so a slab thinner than
+/// a cell can never be skipped over) and marks the cell each sample lands in
+/// Solid. Step counts are derived from the triangle's longest edge in cells, so
+/// big facets get more samples and tiny ones stay cheap. This SHELL-stamps the
+/// mesh surface — which is exactly what an LBM bounce-back wall needs; the
+/// interior staying Fluid is correct and matches stampVane's plate stamping.
+inline void rasterizeTriangleSurface(std::vector<std::uint8_t>& flags,
+                                     const GridDims& dims, const Vec3f& a,
+                                     const Vec3f& b, const Vec3f& c) {
+    constexpr float kStep = 0.45f;
+    // Sample density: enough that adjacent samples are < kStep cells apart along
+    // each edge. Longest edge in cells / kStep, with a floor of 1 subdivision.
+    const float e0 = length(b - a);
+    const float e1 = length(c - a);
+    const int nU = std::max(1, static_cast<int>(std::ceil(std::max(e0, e1) / kStep)));
+    // Barycentric sweep: u along (b-a), v along (c-a), u+v <= 1 stays inside.
+    for (int iu = 0; iu <= nU; ++iu) {
+        const float u = static_cast<float>(iu) / static_cast<float>(nU);
+        const int nV = std::max(1, static_cast<int>(std::ceil((1.0f - u)
+                                   * std::max(e0, length(c - b)) / kStep)));
+        for (int iv = 0; iv <= nV; ++iv) {
+            const float v = (static_cast<float>(iv) / static_cast<float>(nV))
+                            * (1.0f - u);
+            const Vec3f p = a + (b - a) * u + (c - a) * v;
+            stampCell(flags, dims, static_cast<int>(std::floor(p.x)),
+                      static_cast<int>(std::floor(p.y)),
+                      static_cast<int>(std::floor(p.z)));
+        }
+    }
+}
+
+/// @brief Stamp one CustomStl VG unit: seat the unit-normalized mesh on the
+/// suction surface at x_c, fix its orientation (flip + 90-deg steps), scale it
+/// to the device height, map it into the seated surface frame, and shell-stamp
+/// every transformed triangle.
+///
+/// The seating frame is built IDENTICALLY to stampVane (vg.cpp center-slice
+/// block) so an STL vane sits and rotates exactly like a parametric one at any
+/// AoA, with beta yaw already baked into the d3/b3 axes. The stored mesh is
+/// unit longest-extent centered at origin (normalizeVgMeshUnit), so scaling by
+/// hCells re-seats it correctly at ANY level's chord resolution with no
+/// per-level state — the same property that lets parametric hCells grow with
+/// the patch.
+///
+/// Canonical mesh axis convention (after import normalization): x = thickness
+/// (-> b3), y = up/height (-> n3 wall-normal), z = length/chord (-> d3 vane
+/// axis). The import axis-preset dropdown lets the user pick which file axes map
+/// to these; flip/rotSteps fix the leftover wrong-facing cases here.
+///
+/// @param unitMesh  Unit-normalized VG mesh (App::vgMeshes[stlMeshId]).
+/// @param airfoil   Section supplying the surface frame.
+/// @param aoaRad    Angle of attack in radians.
+/// @param layout    Grid placement/scale.
+/// @param flags     Flag field, modified in place (Fluid -> Solid only).
+/// @param x_c       Chordwise station of the unit center.
+/// @param zCenter   Spanwise center of the unit in lattice cells.
+/// @param betaRad   Yaw about the surface normal (signed).
+/// @param hCells    Device height in cells (>= 1) — the mesh's overall scale.
+/// @param flip      Negate the canonical up-axis (fixes upside-down meshes).
+/// @param rotSteps  Extra 90-deg yaw steps about the canonical up-axis (0..3).
+void stampStlVane(const StlMesh& unitMesh, const AirfoilGeometry& airfoil,
+                  float aoaRad, const DomainLayout& layout,
+                  std::vector<std::uint8_t>& flags, float x_c, float zCenter,
+                  float betaRad, float hCells, bool flip, int rotSteps) {
+    const SurfaceFrame center = surfaceFrameAt(airfoil, x_c, /*upper=*/true);
+    if (!center.valid || unitMesh.triangles.empty()) return;
+
+    // Seated surface frame at the unit center — same construction as stampVane.
+    const float cosB = std::cos(betaRad);
+    const float sinB = std::sin(betaRad);
+    const float chord = static_cast<float>(layout.chordCells);
+    const float ax = layout.anchorX();
+    const float ay = layout.anchorY();
+    const Vec2f quarterChord(0.25f, 0.0f);
+    constexpr float kRootEmbed = 1.5f; // bury the root like the parametric vane
+
+    const Vec2f pr = rotated(center.point - quarterChord, -aoaRad);
+    const Vec2f nr = rotated(center.normal, -aoaRad);
+    const Vec2f tr = rotated(center.tangent, -aoaRad);
+    // Surface point (the vane BASE seats here); the embed is applied per-vertex
+    // in the up direction below, not baked into the root, so the crest still
+    // reaches surface + hCells exactly like the parametric column.
+    const Vec3f n3 = normalized(Vec3f(nr.x, nr.y, 0.0f));        // wall-normal
+    const Vec3f root = Vec3f(ax + pr.x * chord, ay + pr.y * chord, zCenter);
+    const Vec3f d3 = normalized(Vec3f(cosB * tr.x, cosB * tr.y, sinB)); // length
+    const Vec3f b3 = normalized(cross(n3, d3));                  // thickness
+
+    // Local orientation fix applied in canonical mesh space BEFORE the frame
+    // map: rotSteps*90 deg about the up-axis (y), then optional upside-down
+    // flip. Precompute the in-plane (x,z) rotation for the chosen step.
+    const int steps = ((rotSteps % 4) + 4) % 4;
+    const float rotRad = static_cast<float>(steps) * (kPi * 0.5f);
+    const float rc = std::cos(rotRad), rs = std::sin(rotRad);
+
+    // Transform + shell-stamp every triangle. The canonical mesh has its BASE at
+    // y = 0 and UP extent = 1 (normalizeVgMeshUnit), so vy in [0,1] is the
+    // fractional height up the device.
+    auto toWorld = [&](const Vec3f& vert) {
+        float vx = vert.x, vy = vert.y, vz = vert.z;
+        // Upside-down fix mirrors about mid-height so the mesh stays in [0,1]
+        // (a naive negation would push it below the surface).
+        if (flip) { vy = 1.0f - vy; }
+        // Yaw about up-axis y: rotate the (x,z) plane.
+        const float rx = vx * rc + vz * rs;
+        const float rz = -vx * rs + vz * rc;
+        vx = rx; vz = rz;
+        // Map canonical axes -> seated frame. Thickness (x->b3) and length
+        // (z->d3) scale by hCells (the device's overall size). Height maps the
+        // base to -kRootEmbed (buried) and the crest to +hCells, reproducing the
+        // parametric vane's embedded skirt + full protruding height.
+        const float up = -kRootEmbed + vy * (hCells + kRootEmbed);
+        return root + b3 * (vx * hCells) + n3 * up + d3 * (vz * hCells);
+    };
+    for (const StlTriangle& t : unitMesh.triangles) {
+        rasterizeTriangleSurface(flags, layout.dims, toWorld(t.v0),
+                                 toWorld(t.v1), toWorld(t.v2));
+    }
+}
+
 } // namespace
 
 SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil,
@@ -181,7 +303,8 @@ SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil,
 void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
                 float aoa_deg, const DomainLayout& layout,
                 std::vector<std::uint8_t>& flags,
-                std::vector<VaneSlab>* slabsOut) {
+                std::vector<VaneSlab>* slabsOut,
+                const std::vector<StlMesh>* unitVgMeshes) {
     // Disabled VGs are skipped entirely — they contribute no solid cells.
     if (!vg.enabled) return;
     if (!airfoil.isValid() || layout.dims.nz < 1) return;
@@ -204,6 +327,19 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
     // Units are centered on the mid-span; the periodic z wrap in stampCell
     // handles arrays wider than the domain gracefully.
     const float zMid = 0.5f * static_cast<float>(layout.dims.nz);
+
+    // Resolve the CustomStl mesh up-front: an unresolved id (no mesh list, or
+    // an out-of-range / empty handle) contributes nothing — the caller detects
+    // this via vgStlMeshResolved() and logs it once, so we just bail quietly.
+    const StlMesh* stlMesh = nullptr;
+    if (vg.type == VGType::CustomStl) {
+        if (!unitVgMeshes || vg.stlMeshId < 0
+            || vg.stlMeshId >= static_cast<int>(unitVgMeshes->size())
+            || (*unitVgMeshes)[vg.stlMeshId].triangles.empty()) {
+            return;
+        }
+        stlMesh = &(*unitVgMeshes)[vg.stlMeshId];
+    }
 
     for (int i = 0; i < count; ++i) {
         const float zc = zMid
@@ -239,6 +375,14 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil,
             stampVane(airfoil, aoaRad, layout, flags, x_c, zc, beta, h, len,
                       std::max(0.5f, 0.5f * h), /*ramp=*/true);
             break;
+        case VGType::CustomStl:
+            // User mesh as one unit, seated + arrayed exactly like the
+            // parametric vanes (one mesh per unit across the span). No
+            // VaneSlab: a single OBB can't model a triangle soup, so q-LIBB
+            // falls back to plain bounce-back for STL vanes (documented).
+            stampStlVane(*stlMesh, airfoil, aoaRad, layout, flags, x_c, zc,
+                         beta, h, vg.stlFlip, vg.stlRotSteps);
+            break;
         }
     }
 }
@@ -247,14 +391,15 @@ std::vector<std::uint8_t> buildFlagsWithVGs(
     const std::vector<VGParams>& vgs, const AirfoilGeometry& airfoil,
     float aoa_deg, const DomainLayout& layout,
     const std::vector<std::uint8_t>& cleanFoilFlags,
-    std::vector<VaneSlab>* slabsOut) {
+    std::vector<VaneSlab>* slabsOut,
+    const std::vector<StlMesh>* unitVgMeshes) {
     // Plan 6.2 flow: copy the cached clean mask, OR every VG in, run the TE
     // closure once at the end so vane roots get the same single-cell-gap
     // sealing the foil TE does. The clean flags are never modified — they are
     // the warm-start cache key's geometry half.
     std::vector<std::uint8_t> flags = cleanFoilFlags;
     for (const VGParams& vg : vgs) {
-        voxelizeVG(vg, airfoil, aoa_deg, layout, flags, slabsOut);
+        voxelizeVG(vg, airfoil, aoa_deg, layout, flags, slabsOut, unitVgMeshes);
     }
     closeTrailingEdgeGaps(layout.dims, flags);
     return flags;

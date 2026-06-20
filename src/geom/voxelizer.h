@@ -17,6 +17,9 @@ namespace foilcfd {
 // VG model lives in vg.h, which includes THIS header — forward-declare to keep
 // the dependency one-directional (deriveVGPatchBoxFine takes VGParams by ref).
 struct VGParams;
+// StlMesh lives in stl.h; forward-declare so the nested-VG-box derivation can
+// forward custom-STL VG meshes to voxelizeVG without pulling stl.h in here.
+struct StlMesh;
 
 /// @brief Where the foil sits inside the lattice and how big it is. The
 /// defaults reproduce the plan 4.6 layout: chord = N_c cells, quarter-chord
@@ -240,10 +243,13 @@ PatchBox derivePatchBox(const GridDims& dims,
 /// @param marginY1   Fine cells added above (+y).
 /// @return Box in FINE cells; .valid() is false when there are no VGs or the
 ///         padded box is below the coupling minimum (caller skips level 2).
+/// @param unitVgMeshes Optional unit-normalized meshes for CustomStl VG entries
+///                     (App::vgMeshes), so the box also encloses STL vanes.
 PatchBox deriveVGPatchBoxFine(const DomainLayout& fineLayout,
                               const std::vector<VGParams>& vgs,
                               const AirfoilGeometry& airfoil, float aoa_deg,
                               int marginX0, int marginX1,
-                              int marginY0, int marginY1);
+                              int marginY0, int marginY1,
+                              const std::vector<StlMesh>* unitVgMeshes = nullptr);
 
 } // namespace foilcfd

@@ -17,6 +17,7 @@
 #include "../sim/lbm_solver.h"
 #include "../sim/units.h"
 #include "aircraft_manifest.h"
+#include "sweep.h"
 
 struct GLFWwindow; // forward-declared; only init/shutdown touch the window.
 
@@ -69,6 +70,12 @@ struct StlImportUI {
     bool zFreeSlipWalls = false;  ///< Plan 7.4 z-boundary mode: false =
                                   ///< spanwise-periodic (airfoil-like), true =
                                   ///< free-slip walls (full 3D object).
+    // -- custom-VG-STL reuse (2026-06-19) --
+    bool forVg = false;           ///< This modal is collecting a VG mesh, not a
+                                  ///< foil. When true the chord-cells + z-wall
+                                  ///< fields are hidden (a VG rides the foil and
+                                  ///< is scaled by height, not chord), and the
+                                  ///< confirm raises vgStlImportConfirmed.
 };
 
 /// @brief Everything the panels EDIT. main.cpp owns one instance; the sim is
@@ -182,6 +189,18 @@ struct UIParams {
                                  ///< would stack on top of the nested 2x and
                                  ///< over-refine (e.g. fine auto-raised to 4x,
                                  ///< then nested 2x -> an 8x VG box).
+
+        // ---- VG resolution target (2026-06-19) ----------------------------
+        // The user sets a desired RESOLVED vane height in cells; the frame
+        // loop then auto-scales the cascade (fine patch up to 4x, the nested
+        // VG box doubling it to an effective 8x) until every vane meets that
+        // target — the high-res zone genuinely GROWS to hit the number rather
+        // than stalling at 4x and only warning. Stretch mode can't honour this
+        // (its grid keeps the base cell count), so the panel directs the user
+        // to Cascade there.
+        bool  vgTargetAuto  = true; ///< Drive the patch factor from vgTargetCells.
+        int   vgTargetCells = kMinVGHeightCells; ///< Desired resolved vane
+                                 ///< height [cells]; slider range 8..24.
         bool  finerVGPatch = true; ///< Build the nested 4x box hugging the VGs
                                  ///< (2x the fine factor) when VGs are on. Only
                                  ///< effective with VGs + an active fine patch;
@@ -272,6 +291,13 @@ struct UIParams {
                                            ///< right edge of the render (on by
                                            ///< default; collapses to a small
                                            ///< re-show button when hidden).
+
+    // -- testing suite (2026-06-19) --
+    // Editable sweep definition; the heavy run-state (cases, results, the phase
+    // machine) lives on App::SweepRun, not here. main.cpp snapshots results into
+    // UIReadouts::sweep each frame so the panel renders from a frozen copy.
+    SweepParams sweepParams;               ///< The sweep the user is editing.
+    int sweepSelectedResult = -1;          ///< Row selected in the results table.
 };
 
 /// @brief Read-only live numbers the panels DISPLAY each frame.
@@ -343,6 +369,13 @@ struct UIReadouts {
         bool     qlibbActive   = false; ///< Interpolated bounce-back live.
         int      qlibbLinks    = 0;     ///< Vane links with a sub-cell cut.
         int      qlibbFallback = 0;     ///< Thin-vane links left at half-way.
+
+        // -- VG resolution target readout (2026-06-19) --
+        float    vgHeightCellsLive = 0.0f; ///< Resolved height of the selected/
+                                       ///< first enabled vane at the EFFECTIVE
+                                       ///< (post-cascade) resolution — what the
+                                       ///< vane actually gets, not the base grid.
+        int      vgTargetCells     = 0;    ///< The active target (0 = no VGs).
     };
     RefinementReadout refine;
 
@@ -367,6 +400,19 @@ struct UIReadouts {
 
     // -- pre-convergence status (plan M-refine part 2) --
     float preconvergeProgress = -1.0f; ///< 0..1 while running; < 0 = idle.
+
+    // -- testing suite status (2026-06-19) --
+    // A frozen per-frame snapshot of App::SweepRun so the panel renders a
+    // consistent results table without reaching into live run-state.
+    struct SweepReadout {
+        bool running = false;  ///< A sweep is in progress (any non-idle phase).
+        bool paused  = false;  ///< User paused the sweep.
+        int  current = 0;      ///< 1-based index of the case being run.
+        int  total   = 0;      ///< Total cases in the sweep.
+        int  bestIndex = -1;   ///< Index into results of the best case so far.
+        std::vector<SweepResult> results; ///< Recorded so far (grows live).
+    };
+    SweepReadout sweep;
 };
 
 /// @brief One-frame edge-triggered commands the panels raise; main.cpp
@@ -386,6 +432,10 @@ struct UIEvents {
     bool loadStlRequested = false;///< "Load STL..." button -> open file dialog.
     bool stlImportConfirmed = false; ///< Modal "Import": voxelize the pending STL.
     bool stlImportCancelled = false; ///< Modal "Cancel": drop the pending STL.
+    bool loadVgStlRequested = false; ///< "Load VG mesh..." -> open file dialog
+                                     ///< then the import modal in forVg mode.
+    bool vgStlImportConfirmed = false; ///< VG-mesh modal "Import": normalize +
+                                     ///< store the mesh, attach to the VG entry.
     bool screenshot      = false; ///< Screenshot button -> Visualizer::screenshotPNG.
     bool voxelViewToggled = false; ///< Voxel-view checkbox -> rebuild + upload
                                    ///< the render mesh (voxel soup or smooth).
@@ -395,6 +445,14 @@ struct UIEvents {
     bool frameFoilView   = false; ///< "Focus foil" -> camera.frameRegion on the foil.
     bool wallModelChanged = false; ///< Wall-model combo changed -> re-apply policy.
     bool tripChanged = false;      ///< Transition-strip settings changed -> rebuild band.
+
+    // -- testing suite (2026-06-19) --
+    bool sweepStart     = false;   ///< "Run sweep": build cases + start case 0.
+    bool sweepPause     = false;   ///< Pause/Resume the running sweep.
+    bool sweepCancel    = false;   ///< Stop the sweep, keep partial results.
+    bool sweepExportCsv = false;   ///< Save the results table to a CSV file.
+    bool sweepScrubTo   = false;   ///< Load the selected result's case into the
+                                   ///< interactive view (no machine restart).
 
     /// @brief Clear all events (main.cpp calls after applying).
     void reset() { *this = UIEvents{}; }
@@ -409,6 +467,9 @@ struct UIContext {
     const std::vector<AircraftEntry>* aircraftManifest = nullptr; ///< Plan 15.5
                                     ///< Aircraft section rows (resolved +
                                     ///< catalog-linked); null/empty hides it.
+    const std::vector<std::string>* vgMeshNames = nullptr; ///< Loaded custom-VG
+                                    ///< mesh names (App::vgMeshNames) for the
+                                    ///< CustomStl mesh-picker combo.
     std::string statusMessage;      ///< Transient status line (load errors etc.).
     const Mat4f* viewProj = nullptr; ///< Camera view-projection for world-space
                                     ///< line overlays (the patch bounding box);

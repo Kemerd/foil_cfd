@@ -714,16 +714,75 @@ void drawAirfoilPanel(UIContext& ctx) {
 /// sim-affecting edit was committed this frame.
 /// @param xcMin  Lower x/c bound for the Station slider (user-configured range).
 /// @param xcMax  Upper x/c bound for the Station slider.
-bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
+/// @param vgMeshNames  Loaded custom-VG mesh names for the CustomStl picker
+///                     (null/empty -> the picker shows "no mesh loaded").
+/// @param loadMeshRequested  Set true when the user clicks "Load VG mesh...".
+bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
+                 const std::vector<std::string>* vgMeshNames,
+                 bool& loadMeshRequested) {
     bool edited = false;
 
     // Type combo — discrete, commits immediately.
     static const char* kTypeNames[] = {"Single vane", "Counter-rotating pair",
-                                       "Co-rotating array", "Ramp"};
+                                       "Co-rotating array", "Ramp",
+                                       "Custom STL mesh"};
     int typeIdx = static_cast<int>(vg.type);
-    if (ImGui::Combo("Type", &typeIdx, kTypeNames, 4)) {
+    if (ImGui::Combo("Type", &typeIdx, kTypeNames, 5)) {
         vg.type = static_cast<VGType>(typeIdx);
         edited = true;
+    }
+
+    // CustomStl: mesh picker + orientation fix-up controls, shown right under
+    // the type so the user wires the shape before tuning placement.
+    if (vg.type == VGType::CustomStl) {
+        const int meshCount =
+            vgMeshNames ? static_cast<int>(vgMeshNames->size()) : 0;
+        // Mesh combo over the loaded meshes; preview the current selection.
+        const char* current = (vg.stlMeshId >= 0 && vg.stlMeshId < meshCount)
+                                  ? (*vgMeshNames)[vg.stlMeshId].c_str()
+                                  : "(no mesh loaded)";
+        if (ImGui::BeginCombo("Mesh", current)) {
+            for (int m = 0; m < meshCount; ++m) {
+                const bool sel = (vg.stlMeshId == m);
+                if (ImGui::Selectable((*vgMeshNames)[m].c_str(), sel)) {
+                    vg.stlMeshId = m;
+                    edited = true;
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load VG mesh...")) loadMeshRequested = true;
+
+        // Orientation fix-ups for wrong-facing CAD exports. The axis preset
+        // (which file axes are thickness/up/length) is baked into the mesh at
+        // import time — change it by re-importing — so only the LIVE controls
+        // are here: 90-deg yaw steps about the mount normal and an upside-down
+        // flip, both re-stamped on edit.
+        static const char* kRotNames[] = {"0 deg", "90 deg", "180 deg", "270 deg"};
+        int rot = std::clamp(vg.stlRotSteps, 0, 3);
+        ImGui::SetNextItemWidth(110);
+        if (ImGui::Combo("Rotate", &rot, kRotNames, 4)) {
+            vg.stlRotSteps = rot;
+            edited = true;
+        }
+        ImGui::SameLine();
+        bool flip = vg.stlFlip;
+        if (ImGui::Checkbox("Flip upside-down", &flip)) {
+            vg.stlFlip = flip;
+            edited = true;
+        }
+        helpMarker("If the mesh sits sideways or upside-down, fix it here: "
+                   "Rotate yaws it about the mount normal in 90-deg steps and "
+                   "Flip turns it over. To change which file axes are up/length/"
+                   "thickness, re-import with a different axis preset. The mesh "
+                   "is sized by Height and arrayed by Pitch / Units like a "
+                   "parametric VG.");
+        if (vg.stlMeshId < 0 || vg.stlMeshId >= meshCount) {
+            ImGui::TextColored(kColWarn, "No mesh loaded — this VG voxelizes to "
+                                         "nothing until you load one.");
+        }
     }
 
     // Helper: slider that fires on release, followed by a tooltip marker.
@@ -754,10 +813,15 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
                   "Lin (2002) nominal: h ~ delta99 at the placement station "
                   "(shown in the Guidance panel). Typical range: 0.005–0.020 c.");
 
-    releaseSlider("Length (h)", &vg.length_h, 1.0f, 6.0f, "%.1f",
-                  "Vane chord length expressed as multiples of device height h. "
-                  "Longer vanes generate stronger vortices but increase drag. "
-                  "Strausak flight-proven value: 3 h. Typical range: 2–4 h.");
+    // Length is a parametric-vane concept (the mesh carries its own length);
+    // skip it for CustomStl.
+    if (vg.type != VGType::CustomStl) {
+        releaseSlider("Length (h)", &vg.length_h, 1.0f, 6.0f, "%.1f",
+                      "Vane chord length expressed as multiples of device "
+                      "height h. Longer vanes generate stronger vortices but "
+                      "increase drag. Strausak flight-proven value: 3 h. "
+                      "Typical range: 2–4 h.");
+    }
 
     releaseSlider("Incidence", &vg.beta_deg, -30.0f, 30.0f, "%.1f deg",
                   "Vane incidence angle relative to the freestream [degrees]. "
@@ -765,8 +829,11 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
                   "use +/- symmetric angles. Strausak: ~16 deg. "
                   "Higher angles produce stronger vortices with more drag penalty.");
 
+    // CustomStl is arrayed across the span like a co-rotating array (one mesh
+    // per unit), so it also exposes Pitch + Units.
     const bool multiUnit = (vg.type == VGType::CounterRotatingPair
-                            || vg.type == VGType::CoRotatingArray);
+                            || vg.type == VGType::CoRotatingArray
+                            || vg.type == VGType::CustomStl);
     if (multiUnit) {
         releaseSlider("Pitch (c)", &vg.pitch_c, 0.01f, 0.20f, "%.3f",
                       "Spanwise spacing between adjacent VG units as a fraction "
@@ -802,16 +869,18 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax) {
     }
 
     // Under-resolution guard (plan 6.1): warn instead of rendering noise.
-    // With the Mesh panel's auto-raise on, this only still fires when even
-    // the 4x patch can't lift the vane to height — say so.
+    // This reads the BASE grid; the Mesh panel's "Resolve VGs to target" grows
+    // the refinement zone to fix it (and shows the EFFECTIVE post-cascade
+    // height), so when the base vane is short, point the user there.
     if (vgUnderResolved(vg, chordCells)) {
         ImGui::TextColored(kColWarn,
-                           "VG under-resolved (%.1f cells tall, need %d) —\n"
-                           "increase chord resolution or VG size\n"
-                           "(or enable the Mesh panel's refinement patch)",
+                           "VG under-resolved on the base grid (%.1f cells "
+                           "tall, need %d) —\nenable \"Resolve VGs to target\" "
+                           "in the Mesh panel, or\nincrease chord resolution or "
+                           "VG size",
                            vgHeightCells(vg, chordCells), kMinVGHeightCells);
     } else {
-        ImGui::TextDisabled("vane height: %.1f cells",
+        ImGui::TextDisabled("vane height: %.1f cells (base grid)",
                             vgHeightCells(vg, chordCells));
     }
     return edited;
@@ -943,9 +1012,15 @@ void drawVGEditorPanel(UIContext& ctx) {
                        "but kept in the list and shown as a grey ghost in the "
                        "3D view — useful for quick on/off comparisons without "
                        "losing the placement.");
-            if (drawVGEntry(vg, chordCells, p.vgXcMin, p.vgXcMax)) {
+            bool loadMeshRequested = false;
+            if (drawVGEntry(vg, chordCells, p.vgXcMin, p.vgXcMax,
+                            ctx.vgMeshNames, loadMeshRequested)) {
                 p.selectedVG = i;
                 ev.vgEdited = true;
+            }
+            if (loadMeshRequested) {
+                p.selectedVG = i;          // attach the loaded mesh to THIS entry
+                ev.loadVgStlRequested = true;
             }
             if (ImGui::SmallButton("Duplicate")) duplicateIdx = i;
             ImGui::SameLine();
@@ -1863,25 +1938,50 @@ void drawMeshPanel(UIContext& ctx) {
                    "~m^3. 2x is the engineering sweet spot; 4x is for final "
                    "VG-comparison runs on big cards.");
 
-        // VG resolution guard: the frame loop raises the live factor to
-        // whatever lifts every vane to its minimum resolved height, so the
-        // shed vortex strength stays trustworthy without babysitting this
-        // panel. Surfacing the override here keeps the setting honest.
-        if (ImGui::Checkbox("Auto-raise for VGs", &p.refine.autoVGFactor)) {
+        // VG resolution target: the user sets a desired RESOLVED vane height
+        // in cells, and the frame loop auto-scales the cascade (fine patch up
+        // to 4x, the nested VG box doubling it to an effective 8x) until every
+        // vane meets it. The high-res zone genuinely grows to hit the number
+        // rather than stalling at 4x and only warning.
+        if (ImGui::Checkbox("Resolve VGs to target", &p.refine.vgTargetAuto)) {
             ev.meshRefinementChanged = true;
         }
-        helpMarker("Raises the WHOLE fine patch (up to 4x) when a vane would be "
-                   "under 8 cells tall. Off by default: the nested VG patch "
-                   "below already gives the vanes the finest resolution "
-                   "locally, so turning this on stacks on top of it and "
-                   "over-refines (a 4x auto-raised patch + the nested 2x = an "
-                   "8x VG box). Use it only if you want the whole foil refined, "
-                   "not just the vane region.");
-        if (p.refine.autoVGFactor && r.refine.active
-            && r.refine.factor > p.refine.factor) {
-            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f),
-                               "auto-raised to %dx for VG resolution",
-                               r.refine.factor);
+        helpMarker("Grows the refinement zone around the vortex generators "
+                   "until each vane is at least the target number of cells "
+                   "tall, so its shed vortex strength is trustworthy. Prefers "
+                   "the small nested VG box over refining the whole foil, and "
+                   "reaches up to an effective 8x (4x fine patch x 2x nested). "
+                   "If a vane still can't reach the target at 8x, raise the "
+                   "chord resolution or the vane height instead.");
+        if (p.refine.vgTargetAuto) {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##vgtarget", &p.refine.vgTargetCells, 8, 24,
+                             "VG height target: %d cells");
+            // Commit on release only (the rebuild is heavy — same pattern the
+            // VG sliders and patch margins use).
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ev.meshRefinementChanged = true;
+            // Live readout: what the selected/first vane ACTUALLY gets vs the
+            // target, coloured green when met, amber when still short.
+            if (r.refine.vgTargetCells > 0 && r.refine.vgHeightCellsLive > 0.0f) {
+                const bool met = r.refine.vgHeightCellsLive
+                                 >= static_cast<float>(r.refine.vgTargetCells);
+                ImGui::TextColored(
+                    met ? ImVec4(0.55f, 0.85f, 0.55f, 1.0f)
+                        : ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
+                    "current VG height: %.1f cells (target %d)%s",
+                    r.refine.vgHeightCellsLive, r.refine.vgTargetCells,
+                    met ? "" : " — increase chord res or vane height");
+            }
+            // Stretch mode can't honour the target: its grid keeps the base
+            // cell count (only the fluid spacing varies), so the vane stays at
+            // base resolution no matter what. Direct the user to Cascade.
+            if (p.refine.meshMode == UIParams::MeshMode::Stretch
+                && !p.vgs.empty()) {
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
+                                   "Stretch mesh keeps base VG resolution — "
+                                   "switch to Cascade to resolve VGs.");
+            }
         }
 
         // Nested VG patch: a tiny box at 2x the fine factor hugging only the
@@ -2113,9 +2213,12 @@ void drawStlImportModal(UIContext& ctx) {
     StlImportUI& s = p.stlImport;
     if (!s.open) return;
 
-    ImGui::OpenPopup("Import STL");
+    // The same modal serves both flows; forVg switches the title, hides the
+    // foil-only fields (chord scale, z-boundary), and re-targets the confirm.
+    const char* title = s.forVg ? "Import VG mesh" : "Import STL";
+    ImGui::OpenPopup(title);
     ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Import STL", nullptr,
+    if (!ImGui::BeginPopupModal(title, nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
@@ -2138,25 +2241,34 @@ void drawStlImportModal(UIContext& ctx) {
     if (ImGui::Combo("##axis", &axisIdx, kAxisPresets, 3))
         s.axisPreset = static_cast<StlAxisPreset>(axisIdx);
 
-    // ---- uniform scale: longest x-extent -> chosen chord in cells ----
-    ImGui::SliderInt("Chord (cells)", &s.chordCells, 32, 512);
-    helpMarker("The mesh is uniformly scaled so its streamwise extent spans "
-               "this many lattice cells, then centered at the standard foil "
-               "position. Match the grid's chord resolution unless the object "
-               "is intentionally smaller than a full chord.");
+    if (!s.forVg) {
+        // ---- uniform scale: longest x-extent -> chosen chord in cells ----
+        ImGui::SliderInt("Chord (cells)", &s.chordCells, 32, 512);
+        helpMarker("The mesh is uniformly scaled so its streamwise extent spans "
+                   "this many lattice cells, then centered at the standard foil "
+                   "position. Match the grid's chord resolution unless the "
+                   "object is intentionally smaller than a full chord.");
 
-    // ---- z-boundary mode (plan 7.4) ----
-    ImGui::Spacing();
-    ImGui::TextDisabled("SPANWISE (z) BOUNDARY");
-    int zMode = s.zFreeSlipWalls ? 1 : 0;
-    ImGui::RadioButton("Periodic — 2.5D section (airfoil-like geometry)",
-                       &zMode, 0);
-    ImGui::RadioButton("Free-slip walls — full 3D object", &zMode, 1);
-    s.zFreeSlipWalls = (zMode == 1);
-    helpMarker("Spanwise-periodic boundaries pretend the geometry repeats "
-               "forever along the span — right for wing sections, wrong for "
-               "a finite 3D body. Free-slip walls box the object in without "
-               "adding wall boundary layers.");
+        // ---- z-boundary mode (plan 7.4) ----
+        ImGui::Spacing();
+        ImGui::TextDisabled("SPANWISE (z) BOUNDARY");
+        int zMode = s.zFreeSlipWalls ? 1 : 0;
+        ImGui::RadioButton("Periodic — 2.5D section (airfoil-like geometry)",
+                           &zMode, 0);
+        ImGui::RadioButton("Free-slip walls — full 3D object", &zMode, 1);
+        s.zFreeSlipWalls = (zMode == 1);
+        helpMarker("Spanwise-periodic boundaries pretend the geometry repeats "
+                   "forever along the span — right for wing sections, wrong for "
+                   "a finite 3D body. Free-slip walls box the object in without "
+                   "adding wall boundary layers.");
+    } else {
+        // VG mesh: no chord scale (it is sized by the VG height in the editor)
+        // and no z-boundary (it rides the foil's periodic span). Only the axis
+        // remap matters here; finer flip/rotation tweaks live on the VG entry.
+        ImGui::TextDisabled("Sized by VG height and arrayed across the span "
+                            "from the\nVG editor. Use flip / rotate there if it "
+                            "still faces wrong.");
+    }
 
     ImGui::Spacing();
     ImGui::TextColored(kColWarn, "Non-watertight meshes voxelize badly —\n"
@@ -2164,7 +2276,8 @@ void drawStlImportModal(UIContext& ctx) {
     ImGui::Separator();
 
     if (ImGui::Button("Import", ImVec2(140, 0))) {
-        ev.stlImportConfirmed = true;
+        if (s.forVg) ev.vgStlImportConfirmed = true;
+        else         ev.stlImportConfirmed = true;
         s.open = false;
         ImGui::CloseCurrentPopup();
     }
@@ -2391,6 +2504,186 @@ void drawStatusOverlay(const UIContext& ctx) {
     ImGui::End();
 }
 
+// ===========================================================================
+// Panel: Testing Suite (2026-06-19). A general, configurable sweep runner —
+// edit an AoA set (and optionally one VG parameter to vary), run every case to
+// convergence on the SAME solver, and read a ranked results table. Works on a
+// clean airfoil (a polar) or any VG config. The run itself is the in-frame
+// state machine in main.cpp; this panel only edits SweepParams and renders the
+// frozen results snapshot.
+// ===========================================================================
+void drawTestingPanel(UIContext& ctx) {
+    UIParams& p = *ctx.params;
+    UIEvents& ev = *ctx.events;
+    const UIReadouts::SweepReadout& sr = ctx.readouts->sweep;
+    SweepParams& sp = p.sweepParams;
+
+    if (!ImGui::Begin("Testing Suite")) { ImGui::End(); return; }
+
+    const bool busy = sr.running; // a case is in flight — lock the inputs
+
+    // ---- AoA set: an editable list of angles, add/remove like the VG list ----
+    ImGui::TextDisabled("ANGLES OF ATTACK [deg]");
+    ImGui::BeginDisabled(busy);
+    int removeAoa = -1;
+    for (int i = 0; i < static_cast<int>(sp.aoaDegs.size()); ++i) {
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputFloat("##aoa", &sp.aoaDegs[i], 0.0f, 0.0f, "%.1f");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) removeAoa = i;
+        if ((i % 3) != 2 && i + 1 < static_cast<int>(sp.aoaDegs.size()))
+            ImGui::SameLine();
+        ImGui::PopID();
+    }
+    if (removeAoa >= 0 && sp.aoaDegs.size() > 1)
+        sp.aoaDegs.erase(sp.aoaDegs.begin() + removeAoa);
+    if (ImGui::SmallButton("+ Add AoA")) sp.aoaDegs.push_back(16.0f);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Cruise+stall preset")) {
+        sp.aoaDegs = {4.0f, 15.0f, 16.0f, 17.0f, 18.0f, 20.0f};
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // ---- VG sweep dimension (optional) ----
+    ImGui::Checkbox("Include VGs", &sp.includeVgs);
+    helpMarker("Apply the VG configuration from the VG editor to every case. "
+               "Off = a clean-airfoil polar. The VG axis below then sweeps one "
+               "VG parameter across each angle.");
+    if (sp.includeVgs) {
+        static const char* kAxisNames[] = {"None (fixed VGs)", "Pitch (c)",
+                                           "Incidence (deg)", "Station (x/c)"};
+        int axisIdx = static_cast<int>(sp.vgAxis);
+        ImGui::SetNextItemWidth(180);
+        if (ImGui::Combo("Vary", &axisIdx, kAxisNames, 4))
+            sp.vgAxis = static_cast<SweepVgAxis>(axisIdx);
+        if (sp.vgAxis != SweepVgAxis::None) {
+            ImGui::SetNextItemWidth(90);
+            ImGui::InputFloat("min", &sp.vgMin, 0.0f, 0.0f, "%.3f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90);
+            ImGui::InputFloat("max", &sp.vgMax, 0.0f, 0.0f, "%.3f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::SliderInt("steps", &sp.vgSteps, 1, 12);
+        }
+    }
+
+    ImGui::Spacing();
+    // ---- run length / safety ----
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat("Averaging (flow-throughs)", &sp.averagingFlowThroughs,
+                       1.0f, 10.0f, "%.1f");
+    helpMarker("Extra flow-throughs to average past the force gate before a "
+               "case is recorded. Longer = steadier numbers, slower sweep.");
+    ImGui::EndDisabled();
+
+    // ---- run/pause/cancel/export controls ----
+    ImGui::Spacing();
+    ImGui::Separator();
+    const int total = static_cast<int>(buildSweepCases(sp, p.vgs).size());
+    if (!busy && sr.results.empty()) {
+        if (ImGui::Button("Run sweep", ImVec2(120, 0))) ev.sweepStart = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d cases queued", total);
+    } else if (busy) {
+        if (ImGui::Button(sr.paused ? "Resume" : "Pause", ImVec2(110, 0)))
+            ev.sweepPause = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110, 0))) ev.sweepCancel = true;
+        ImGui::SameLine();
+        ImGui::Text("case %d / %d%s", sr.current, sr.total,
+                    sr.paused ? "  (paused)" : "");
+        ImGui::ProgressBar(sr.total > 0
+                               ? static_cast<float>(sr.current - 1) / sr.total
+                               : 0.0f,
+                           ImVec2(-1, 0));
+    } else {
+        // Finished / cancelled: offer re-run + export.
+        if (ImGui::Button("Run again", ImVec2(120, 0))) ev.sweepStart = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Export CSV", ImVec2(120, 0))) ev.sweepExportCsv = true;
+    }
+
+    // ---- results table ----
+    if (!sr.results.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("RESULTS (%zu)", sr.results.size());
+        const ImGuiTableFlags flags = ImGuiTableFlags_Borders
+                                      | ImGuiTableFlags_RowBg
+                                      | ImGuiTableFlags_ScrollY
+                                      | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##sweepresults", 7, flags,
+                              ImVec2(0, 220))) {
+            ImGui::TableSetupColumn("#");
+            ImGui::TableSetupColumn("AoA");
+            ImGui::TableSetupColumn("VG val");
+            ImGui::TableSetupColumn("Cl");
+            ImGui::TableSetupColumn("Cd");
+            ImGui::TableSetupColumn("L/D");
+            ImGui::TableSetupColumn("status");
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < static_cast<int>(sr.results.size()); ++i) {
+                const SweepResult& r = sr.results[static_cast<std::size_t>(i)];
+                ImGui::TableNextRow();
+                if (i == sr.bestIndex)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           ImGui::GetColorU32(ImVec4(
+                                               0.15f, 0.35f, 0.18f, 0.55f)));
+                ImGui::TableNextColumn();
+                // Row is selectable to pick a case for scrub-back.
+                ImGui::PushID(i);
+                const bool selected = (p.sweepSelectedResult == i);
+                if (ImGui::Selectable(std::to_string(i).c_str(), selected,
+                                      ImGuiSelectableFlags_SpanAllColumns))
+                    p.sweepSelectedResult = i;
+                ImGui::PopID();
+                const float cl = r.converged ? r.forces.clAvg : r.forces.cl;
+                const float cd = r.converged ? r.forces.cdAvg : r.forces.cd;
+                const float ld = r.converged ? r.forces.ldMedian
+                                             : r.forces.liftToDrag;
+                ImGui::TableNextColumn(); ImGui::Text("%.1f", r.config.aoaDeg);
+                ImGui::TableNextColumn();
+                if (r.config.hasVgs && r.config.vgAxisValue != 0.0f)
+                    ImGui::Text("%.3f", r.config.vgAxisValue);
+                else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); ImGui::Text("%+.3f", cl);
+                ImGui::TableNextColumn(); ImGui::Text("%.4f", cd);
+                ImGui::TableNextColumn(); ImGui::Text("%.2f", ld);
+                ImGui::TableNextColumn();
+                if (r.diverged) ImGui::TextColored(kColBad, "diverged");
+                else if (!r.converged) ImGui::TextColored(kColWarn, "timeout");
+                else ImGui::TextColored(kColGood, "ok");
+            }
+            ImGui::EndTable();
+        }
+        // Best-config callout + scrub-back.
+        if (sr.bestIndex >= 0
+            && sr.bestIndex < static_cast<int>(sr.results.size())) {
+            const SweepResult& b =
+                sr.results[static_cast<std::size_t>(sr.bestIndex)];
+            ImGui::TextColored(kColGood,
+                               "Best: AoA %.1f deg, L/D %.2f%s",
+                               b.config.aoaDeg,
+                               b.converged ? b.forces.ldMedian
+                                           : b.forces.liftToDrag,
+                               (b.config.hasVgs && b.config.vgAxisValue != 0.0f)
+                                   ? "" : "");
+        }
+        ImGui::BeginDisabled(p.sweepSelectedResult < 0 || busy);
+        if (ImGui::Button("Load selected into view"))
+            ev.sweepScrubTo = true;
+        ImGui::EndDisabled();
+        helpMarker("Loads the selected case (AoA + VGs) into the live sim so "
+                   "you can watch it run and tweak from there — without "
+                   "disturbing the recorded results.");
+    }
+
+    ImGui::End();
+}
+
 } // namespace
 
 // ===========================================================================
@@ -2434,6 +2727,7 @@ void drawUI(UIContext& ctx) {
     drawVGGuidancePanel(ctx);
     drawSimPanel(ctx);
     drawReadoutsPanel(ctx);
+    drawTestingPanel(ctx);
     drawViewPanel(ctx);
     drawMeshPanel(ctx);
     drawPatchBoxOverlay(ctx);

@@ -401,7 +401,8 @@ PatchBox deriveVGPatchBoxFine(const DomainLayout& fineLayout,
                               const std::vector<VGParams>& vgs,
                               const AirfoilGeometry& airfoil, float aoa_deg,
                               int marginX0, int marginX1,
-                              int marginY0, int marginY1) {
+                              int marginY0, int marginY1,
+                              const std::vector<StlMesh>* unitVgMeshes) {
     // No vanes -> no nested level. Return the default-invalid box so the caller
     // tears down (or never builds) level 2.
     if (vgs.empty()) return PatchBox{};
@@ -410,11 +411,13 @@ PatchBox deriveVGPatchBoxFine(const DomainLayout& fineLayout,
     // vanes. We deliberately skip the airfoil, TE closure, and Interface shell —
     // derivePatchBox keys off Solid cells, and the only Solid we want measured
     // here is the vane envelope (the foil under the vanes is covered separately
-    // in the level-2 flag field the solver actually steps).
+    // in the level-2 flag field the solver actually steps). CustomStl vanes
+    // need their mesh list forwarded so the box encloses them too.
     std::vector<std::uint8_t> vgOnly(
         static_cast<std::size_t>(fineLayout.dims.cellCount()), kFluid);
     for (const VGParams& vg : vgs)
-        voxelizeVG(vg, airfoil, aoa_deg, fineLayout, vgOnly);
+        voxelizeVG(vg, airfoil, aoa_deg, fineLayout, vgOnly, nullptr,
+                   unitVgMeshes);
 
     // Keep at least kInterfaceShellFine + 3 fine cells between the box and every
     // fine-domain face: the fine Interface shell carries one-sub-step-old

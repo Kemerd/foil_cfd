@@ -149,4 +149,14 @@ StlNormalization computeAutoNormalization(const StlMesh& mesh,
 /// (voxelizer_stl.cuh). Normals are remapped/renormalized, bounds recomputed.
 void applyNormalization(StlMesh& mesh, const StlNormalization& norm);
 
+/// @brief Canonicalize a mesh as a UNIT custom-VG shape in place: apply the
+/// axis remap, then center at the origin and scale so the longest extent spans
+/// one unit. Unlike applyNormalization (which targets a chord-cell count and the
+/// foil anchor), this leaves the mesh in unit space so stampStlVane can scale it
+/// by the device height and seat it on the surface at any refinement level with
+/// no per-level state. Bounds are recomputed; normals are remap-only.
+/// @param mesh       Loaded mesh (modified in place).
+/// @param axisPreset Which file axes map to the canonical thickness/up/length.
+void normalizeVgMeshUnit(StlMesh& mesh, StlAxisPreset axisPreset);
+
 } // namespace foilcfd

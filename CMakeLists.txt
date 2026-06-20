@@ -93,6 +93,7 @@ add_executable(FoilCFD
     src/main.cpp
     src/app/aircraft_manifest.cpp
     src/app/camera.cpp
+    src/app/sweep.cpp
     src/app/ui.cpp
     src/geom/airfoil.cpp
     src/geom/stl.cpp

@@ -12,6 +12,7 @@
 
 #include "../sim/lbm_core.cuh"
 #include "airfoil.h"
+#include "stl.h"        // StlMesh + StlAxisPreset for custom-STL VGs
 #include "voxelizer.h"
 
 namespace foilcfd {
@@ -21,7 +22,13 @@ namespace foilcfd {
 // are API: the UI panel, voxelizer, and cache flow all bind to them.
 // ===========================================================================
 
-enum class VGType { SingleVane, CounterRotatingPair, CoRotatingArray, Ramp };
+// CustomStl: the vane SHAPE comes from a user-uploaded mesh instead of the
+// parametric slab, but it is still seated on the suction surface at x_c and
+// arrayed across the span exactly like the parametric types (one mesh = one
+// unit). The mesh rides a parametric .dat foil — this is NOT the foil-replacing
+// STL import (that is App::stlActive); the two are independent.
+enum class VGType { SingleVane, CounterRotatingPair, CoRotatingArray, Ramp,
+                    CustomStl };
 struct VGParams {
   VGType type;
   float x_c;        // chordwise station, 0..1 (typical 0.05–0.30)
@@ -33,6 +40,15 @@ struct VGParams {
   int   count;      // number of units across the span
   bool  commonFlowDown; // pair orientation
   bool  enabled = true; // when false: voxelized and rendered as ghost only
+
+  // ---- CustomStl fields (ignored by the parametric types) ----------------
+  // Kept as a copyable POD: the heavy triangle soup lives in App::vgMeshes,
+  // and stlMeshId indexes into it, so VGParams stays cheap to copy (the VG
+  // list, the sweep cases, and the warm-restart cache all copy it by value).
+  int   stlMeshId  = -1;   // index into App::vgMeshes (-1 = none configured yet)
+  int   stlRotSteps = 0;   // extra 0/90/180/270 deg yaw about the mount normal
+  bool  stlFlip     = false; // flip upside-down (negate the wall-normal axis)
+  StlAxisPreset stlAxis = StlAxisPreset::XYZ; // import-time axis remap
 };
 
 /// @brief Sensible starting values matching the plan's "typical" annotations
@@ -84,9 +100,16 @@ SurfaceFrame vgPlacementFrame(const AirfoilGeometry& airfoil, const VGParams& pa
 ///                 analytic side-face descriptor the q-LIBB build ray-intersects
 ///                 — see voxelizer.h). nullptr (default) keeps the legacy
 ///                 stamp-only behavior, so existing call sites are untouched.
+///                 CustomStl vanes emit NO slab (q-LIBB falls back to plain
+///                 bounce-back for them — a single OBB can't model a mesh).
+/// @param unitVgMeshes Optional: the unit-normalized VG meshes (App::vgMeshes)
+///                 a CustomStl entry's stlMeshId indexes into. nullptr (default)
+///                 means parametric-only; a CustomStl entry with an unresolved
+///                 id is skipped (the caller logs it once).
 void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil, float aoa_deg,
                 const DomainLayout& layout, std::vector<std::uint8_t>& flags,
-                std::vector<VaneSlab>* slabsOut = nullptr);
+                std::vector<VaneSlab>* slabsOut = nullptr,
+                const std::vector<StlMesh>* unitVgMeshes = nullptr);
 
 /// @brief Stamp a whole VG configuration: copy of the cached clean-foil flags
 /// + every entry voxelized + one TE-closure pass at the end. This is the
@@ -98,12 +121,15 @@ void voxelizeVG(const VGParams& vg, const AirfoilGeometry& airfoil, float aoa_de
 /// @param cleanFoilFlags The cached clean-foil flag field (NOT modified).
 /// @param slabsOut Optional: appends the analytic VaneSlab OBBs of every stamped
 ///                 vane (for q-LIBB). nullptr keeps legacy behavior.
+/// @param unitVgMeshes Optional: unit-normalized meshes for CustomStl entries
+///                 (App::vgMeshes). nullptr = parametric-only.
 /// @return New flag field = clean foil mask OR all VG voxels.
 std::vector<std::uint8_t> buildFlagsWithVGs(
     const std::vector<VGParams>& vgs, const AirfoilGeometry& airfoil,
     float aoa_deg, const DomainLayout& layout,
     const std::vector<std::uint8_t>& cleanFoilFlags,
-    std::vector<VaneSlab>* slabsOut = nullptr);
+    std::vector<VaneSlab>* slabsOut = nullptr,
+    const std::vector<StlMesh>* unitVgMeshes = nullptr);
 
 // ===========================================================================
 // Interpolated bounce-back (q-LIBB) link list. For every fluid cell whose pull
@@ -175,7 +201,18 @@ void densifyQLinks(const QLinkList& links, long long ncells,
 // ===========================================================================
 
 /// Minimum resolved vane height in cells before the under-resolution warning.
+/// This is the FLOOR the honesty meter still warns below; the user-facing
+/// "VG height target" (RefinementUIParams::vgTargetCells) drives the auto
+/// refinement separately and can ask for more.
 inline constexpr int kMinVGHeightCells = 8;
+
+/// Ceiling the VG-resolution target can drive the cascade to. The fine patch
+/// itself caps at kMaxRefineFactor (4x); the nested VG box doubles that to an
+/// effective 8x over the coarse grid, which is the most resolution a vane can
+/// usefully be given before the patch cost (m^4 time / m^3 VRAM, even on the
+/// tiny nested box) stops paying off. Targets that would need more than this
+/// keep the honest under-resolution warning instead of refining further.
+inline constexpr int kMaxVGTargetFactor = 8;
 
 /// @brief Height of the vane in lattice cells at the given chord resolution.
 inline float vgHeightCells(const VGParams& vg, int chordCells) {
@@ -190,26 +227,36 @@ inline bool vgUnderResolved(const VGParams& vg, int chordCells) {
 }
 
 /// @brief Smallest refinement factor that lifts EVERY configured vane to at
-/// least kMinVGHeightCells of resolved height (vortex circulation is what a
-/// vane sheds, and an under-resolved vane sheds it weak — the patch is the
-/// cheap fix because it multiplies resolution only around the geometry).
-/// Returns 1 when no patch is needed (no VGs, or all tall enough at the
-/// base grid); never exceeds kMaxRefineFactor — a vane that stays short
-/// even at 4x needs a chord-resolution or height change instead, which the
-/// under-resolution warning continues to say.
+/// least @p targetCells of resolved height (vortex circulation is what a vane
+/// sheds, and an under-resolved vane sheds it weak — the patch is the cheap fix
+/// because it multiplies resolution only around the geometry). Returns 1 when
+/// no patch is needed (no VGs, or all tall enough at the base grid); never
+/// exceeds @p cap — a vane that stays short even at the cap needs a
+/// chord-resolution or height change instead, which the under-resolution
+/// warning continues to say.
+///
+/// The two trailing parameters generalize the old fixed behaviour: by default
+/// the target is kMinVGHeightCells and the cap is kMaxRefineFactor, so every
+/// legacy call site is unchanged. The VG-resolution slider passes the user's
+/// target and the larger kMaxVGTargetFactor cap so the high-res zone actually
+/// grows to MEET the requested cell count instead of stalling at 4x.
 /// @param vgs        Configured VG entries.
 /// @param chordCells BASE-grid chord resolution N_c.
+/// @param targetCells Desired resolved vane height in cells (>= 1).
+/// @param cap        Maximum factor this may return.
 inline int recommendedRefineFactorForVGs(const std::vector<VGParams>& vgs,
-                                         int chordCells) {
+                                         int chordCells,
+                                         int targetCells = kMinVGHeightCells,
+                                         int cap = kMaxRefineFactor) {
     int rec = 1;
+    const float target = static_cast<float>(std::max(1, targetCells));
     for (const VGParams& vg : vgs) {
         if (!vg.enabled) continue; // disabled VGs don't drive refinement
         const float h = vgHeightCells(vg, chordCells);
         if (h <= 0.0f) continue;
-        rec = std::max(rec, static_cast<int>(std::ceil(
-                                static_cast<float>(kMinVGHeightCells) / h)));
+        rec = std::max(rec, static_cast<int>(std::ceil(target / h)));
     }
-    return std::min(rec, kMaxRefineFactor);
+    return std::min(rec, std::max(1, cap));
 }
 
 // ===========================================================================

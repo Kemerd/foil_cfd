@@ -513,6 +513,49 @@ void applyNormalization(StlMesh& mesh, const StlNormalization& norm) {
     mesh.bounds = computeBounds(mesh.triangles);
 }
 
+void normalizeVgMeshUnit(StlMesh& mesh, StlAxisPreset axisPreset) {
+    // Custom-VG-STL canonicalization: unlike the foil import (which scales to a
+    // chord-cell count and recenters at the foil anchor), a VG mesh is stored in
+    // a UNIT, HEIGHT-DRIVEN frame so stampStlVane can scale it by the device
+    // height (height_c * chordCells) and seat its BASE on the surface at any
+    // refinement level with no per-level state. The convention the seating math
+    // (and the resolved-height target / audit) relies on:
+    //   - the UP axis (y) spans exactly 1 unit, so scaling by hCells yields a
+    //     vane exactly hCells tall (length/thickness follow the mesh aspect),
+    //   - the mesh BASE sits at y = 0 and is centered at x = z = 0, so the seat
+    //     transform (root = surface - n3*embed) puts the base on the surface
+    //     rather than burying the mesh center half-height.
+    if (mesh.triangles.empty()) return;
+
+    // Remap first: the user picks which file axes are thickness/up/length, and
+    // the remap is what makes the canonical frame (x = thickness, y = up,
+    // z = length) line up with the mesh.
+    for (StlTriangle& t : mesh.triangles) {
+        t.v0 = remapAxes(t.v0, axisPreset);
+        t.v1 = remapAxes(t.v1, axisPreset);
+        t.v2 = remapAxes(t.v2, axisPreset);
+        t.normal = normalized(remapAxes(t.normal, axisPreset));
+    }
+    mesh.bounds = computeBounds(mesh.triangles);
+
+    // Scale so the UP (y) extent spans 1 unit — NOT the longest axis — so the
+    // protruding height equals hCells regardless of the mesh's length/thickness
+    // aspect. A degenerate (zero-height) mesh leaves the scale at 1.
+    const Vec3f ext = mesh.bounds.size();
+    const float scale = (ext.y > 1e-9f) ? (1.0f / ext.y) : 1.0f;
+    // Translation: center x/z on the mount axis, and put the BASE (min y) at
+    // y = 0 so the seat transform anchors the base on the surface.
+    const Vec3f center = mesh.bounds.center();
+    const Vec3f anchor(center.x, mesh.bounds.min.y, center.z);
+    for (StlTriangle& t : mesh.triangles) {
+        t.v0 = (t.v0 - anchor) * scale;
+        t.v1 = (t.v1 - anchor) * scale;
+        t.v2 = (t.v2 - anchor) * scale;
+        // Normals are direction-only — center/scale don't change them.
+    }
+    mesh.bounds = computeBounds(mesh.triangles);
+}
+
 // ===========================================================================
 // Watertightness pre-check: edge-pairing census (plan 7.3 import modal).
 // ===========================================================================
