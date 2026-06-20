@@ -29,3 +29,4 @@ screenshots/
 CMakeUserPresets.json
 docs/19810003507.pdf
 docs/2506.03905v2.pdf
+build/Release/imgui.ini
