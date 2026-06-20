@@ -210,24 +210,31 @@ __global__ void coarseToFineFillKernel(
         corner[c] = pIdx(cx, cy, cz, coarseNx, coarseNxny);
     }
 
-    // Solid-aware reweighting: a corner that lands INSIDE a parent solid (a VG
-    // vane, or a stair-step of the foil) holds bounce-back state, NOT a valid
-    // fluid distribution — interpolating through it injects garbage fneq that a
-    // near-floor-tau child grid amplifies into runaway. This bites the nested
-    // VG patch, whose shell hugs the vanes; the foil-bbox patch was solid-free
-    // by its clearance margin and is unaffected. We drop solid corners and
-    // renormalize the weights over the fluid corners so the shell is filled
-    // from fluid neighbours only — the vane itself stays SOLID and is resolved
-    // by the child grid's own bounce-back, exactly as intended.
+    // Valid-source reweighting: a corner is a usable interpolation source ONLY
+    // if it is a collided FLUID cell. Two corner kinds must be dropped:
+    //
+    //   - SOLID  — holds bounce-back state, not a fluid distribution.
+    //   - INTERFACE — a PARENT-level coupling-shell cell. The collide kernel
+    //     never advances Interface cells (their f-buffer is "never read, no
+    //     write"), so they hold populations one sub-step STALE relative to the
+    //     fluid interior. Interpolating through them injects spurious fneq that
+    //     a near-floor-tau child grid amplifies into an acoustic pulse — the
+    //     from-rest "shockwave from the VG" before the freestream even arrives.
+    //     This bites the nested VG cascade, whose parent is the FINE grid (which
+    //     carries both vane solids AND its own Interface shell) and whose box
+    //     hugs the vanes. Dropping BOTH and renormalizing over genuinely
+    //     collided fluid corners sources the fill from valid data only; the vane
+    //     stays SOLID and is resolved by the child's own bounce-back as intended.
     float wsum = 0.0f;
 #pragma unroll
     for (int c = 0; c < 8; ++c) {
-        if (coarseFlags[corner[c]] == kFlagSolid) wgt[c] = 0.0f;
+        const std::uint8_t cf = coarseFlags[corner[c]];
+        if (cf == kFlagSolid || cf == kFlagInterface) wgt[c] = 0.0f;
         wsum += wgt[c];
     }
-    // All 8 corners solid (the target sits deep inside a parent solid): nothing
-    // fluid to pull from — leave the cell's current populations untouched. For
-    // a real shell/fluid target at least one fluid corner always exists.
+    // No valid fluid corner (target sits deep inside parent solid/shell):
+    // nothing to pull from — leave the cell's current populations untouched. A
+    // real fluid/shell target normally has at least one collided fluid corner.
     if (wsum < 1e-6f) return;
     const float invWsum = 1.0f / wsum;
 #pragma unroll
@@ -312,7 +319,13 @@ __device__ __forceinline__ bool childAvgFneq(
             for (int i = 0; i < factor; ++i) {
                 const long long pfc =
                     pIdx(fxc + i, fyc + j, fzc + k, fineNx, fineNxny);
-                if (fineFlags[pfc] == kFlagSolid) continue;
+                // Skip non-collided children: SOLID (bounce-back state) and
+                // INTERFACE (this level's own coupling shell, one sub-step
+                // stale — never advanced by collide). Averaging either back into
+                // the coarse parent feeds the same stale-fneq pulse upward; only
+                // genuinely collided fluid children carry a valid distribution.
+                const std::uint8_t ff_flag = fineFlags[pfc];
+                if (ff_flag == kFlagSolid || ff_flag == kFlagInterface) continue;
                 ++nFluid;
 #pragma unroll
                 for (int q = 0; q < kQ; ++q)

@@ -96,8 +96,9 @@ inline float profileThickFrac(VGProfile profile, float t) {
     const float x = std::clamp(t, 0.0f, 1.0f);
     const float yt = 0.2969f * std::sqrt(x) - 0.1260f * x - 0.3516f * x * x
                    + 0.2843f * x * x * x - 0.1015f * x * x * x * x;
-    // Peak of the bracket is ~0.1015 at x~0.30; divide so the ratio peaks at 1.
-    constexpr float kNacaPeak = 0.1015f;
+    // The bracket peaks at ~0.10003 (at x~0.30); divide so the ratio reaches 1
+    // at the blade's thickest point (NOT 0.1015, which is just the x^4 term).
+    constexpr float kNacaPeak = 0.10003f;
     return std::clamp(yt / kNacaPeak, 0.0f, 1.0f);
 }
 

@@ -305,18 +305,122 @@ std::string configSummary(const App& app) {
                   static_cast<int>(app.params.vgs.size()),
                   app.params.highFidelity.enabled ? "on" : "off");
     std::string line(buf);
-    // Refinement patch state belongs in every incident report: a coupled
-    // fine level changes which grid the forces came from.
+
+    // Mesh mode + refinement depth belong in every incident report: a steep
+    // high-factor VG box is the prime suspect for a from-rest seam blow-up, so
+    // the dump spells out the exact cascade depth / stretch state / VG target.
+    const auto& rp = app.params.refine;
+    const char* modeStr = rp.meshMode == UIParams::MeshMode::Stretch ? "stretch"
+                        : rp.meshMode == UIParams::MeshMode::Uniform ? "uniform"
+                                                                     : "cascade";
+    char mbuf[160];
+    std::snprintf(mbuf, sizeof mbuf,
+                  " | mesh %s (factor %d, finerVG %s, vgTargetAuto %s, target %d"
+                  " cells)",
+                  modeStr, rp.factor, rp.finerVGPatch ? "on" : "off",
+                  rp.vgTargetAuto ? "on" : "off", rp.vgTargetCells);
+    line += mbuf;
+
+    // Live cascade levels (what ACTUALLY allocated, factors and dims) — the
+    // effective VG-box factor is the headline number for a seam divergence.
     if (app.readouts.refine.active) {
-        char rbuf[96];
-        std::snprintf(rbuf, sizeof rbuf, " | refine 2x %dx%dx%d (forces %s)",
+        char rbuf[128];
+        std::snprintf(rbuf, sizeof rbuf, " | fine %dx %dx%dx%d (forces %s)",
+                      app.readouts.refine.factor,
                       app.readouts.refine.fineDims.nx,
                       app.readouts.refine.fineDims.ny,
                       app.readouts.refine.fineDims.nz,
                       app.readouts.refine.forcesFromFine ? "fine" : "coarse");
         line += rbuf;
     }
+    if (app.readouts.refine.finerActive) {
+        char fbuf[96];
+        std::snprintf(fbuf, sizeof fbuf, " | nestedVG %dx (coarse) %dx%dx%d",
+                      app.readouts.refine.finerEffectiveFactor,
+                      app.readouts.refine.finerDims.nx,
+                      app.readouts.refine.finerDims.ny,
+                      app.readouts.refine.finerDims.nz);
+        line += fbuf;
+    }
+    if (app.readouts.stretch.active) {
+        char sbuf[128];
+        std::snprintf(sbuf, sizeof sbuf,
+                      " | stretch dx %.3g->%.3g mm tau %.3f->%.3f%s",
+                      app.readouts.stretch.dxMin * 1e3f,
+                      app.readouts.stretch.dxMax * 1e3f,
+                      app.readouts.stretch.tauWall, app.readouts.stretch.tauFar,
+                      app.readouts.stretch.tauFloorClamped ? " [clamped]" : "");
+        line += sbuf;
+    }
+
+    // Transition trip: it injects fluctuations near the LE/VG, so its state is
+    // load-bearing for a "pulse from the VG" report.
+    if (app.readouts.tripActive) {
+        char tbuf[64];
+        std::snprintf(tbuf, sizeof tbuf, " | trip on (%d cells)",
+                      app.readouts.tripCells);
+        line += tbuf;
+    }
+
+    // Per-VG one-liners: arrangement, profile, station, height — so a divergence
+    // tied to a specific VG (e.g. the Strausak preset) is fully reproducible.
+    for (std::size_t i = 0; i < app.params.vgs.size(); ++i) {
+        const VGParams& vg = app.params.vgs[i];
+        static const char* kArr[] = {"single", "pair", "corot"};
+        static const char* kProf[] = {"rect", "delta", "trap", "parab",
+                                      "airfoil", "wedge", "stl"};
+        const int ai = std::clamp(static_cast<int>(effectiveArrangement(vg)), 0, 2);
+        const int pi = std::clamp(static_cast<int>(effectiveProfile(vg)), 0, 6);
+        char vbuf[128];
+        std::snprintf(vbuf, sizeof vbuf,
+                      " | VG%zu %s/%s x/c %.3f h/c %.4f beta %.0f n %d%s",
+                      i, kArr[ai], kProf[pi], vg.x_c, vg.height_c, vg.beta_deg,
+                      vg.count, vg.enabled ? "" : " [off]");
+        line += vbuf;
+    }
     return line;
+}
+
+/// Append a divergence incident to logs/divergence.log: a timestamped block
+/// with the NaN diagnosis and the full settings line, so the user can paste a
+/// self-contained "here's exactly what blew up" report without digging through
+/// the heartbeat-laden session log. Best-effort — a write failure is silent.
+void writeDivergenceReport(const App& app, const std::string& summary) {
+    const auto dir = platform::executableDirectory() / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto path = dir / "divergence.log";
+
+    // Timestamp the block (local time, like the session log).
+    const std::time_t t = std::time(nullptr);
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char stamp[32];
+    std::snprintf(stamp, sizeof stamp, "%04d-%02d-%02d %02d:%02d:%02d",
+                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour,
+                  tmv.tm_min, tmv.tm_sec);
+
+    std::string block = "==== DIVERGENCE ";
+    block += stamp;
+    block += " ====\n";
+    block += "step: " + std::to_string(app.readouts.stepCount) + "\n";
+    block += "diagnosis: " + app.readouts.nanDiagnosis + "\n";
+    block += summary + "\n\n";
+
+    // Append (don't truncate): keep the history of every blow-up this session.
+    std::FILE* f = nullptr;
+#ifdef _WIN32
+    _wfopen_s(&f, path.wstring().c_str(), L"ab");
+#else
+    f = std::fopen(path.string().c_str(), "ab");
+#endif
+    if (!f) return;
+    std::fwrite(block.data(), 1, block.size(), f);
+    std::fclose(f);
 }
 
 /// Active chord resolution: the HiFi bundle overrides the standard preset.
@@ -1591,7 +1695,13 @@ void updateReadouts(App& app) {
                        + app.readouts.nanDiagnosis);
         // Full reproduction context for the log: the diagnosis alone says
         // WHAT tripped; this says what the user was simulating at the time.
-        logLine(configSummary(app));
+        const std::string summary = configSummary(app);
+        logLine("DIVERGENCE at step " + std::to_string(app.readouts.stepCount)
+                + " (" + app.readouts.nanDiagnosis + ")");
+        logLine(summary);
+        // Also append a dedicated, easy-to-find incident file so the settings
+        // survive the session log's heartbeat noise — the user pastes this back.
+        writeDivergenceReport(app, summary);
     } else if (!app.readouts.nanTripped) {
         app.nanLogged = false; // re-arm after a cold reset clears the latch
     }

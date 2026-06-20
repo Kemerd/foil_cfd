@@ -2,6 +2,18 @@
 build/
 out/
 
+# ...but publish the redistributable bits from build/Release.
+# Whitelist the path step-by-step (a file can't be un-ignored while a
+# parent dir is still excluded), then keep runtime junk out by re-ignoring
+# the cache/logs/screenshots subfolders.
+!build/
+build/*
+!build/Release/
+build/Release/*
+!build/Release/FoilCFD.exe
+!build/Release/imgui.ini
+!build/Release/imgui_lib.lib
+
 # Warm-start snapshot disk cache (generated at runtime)
 cache/
 

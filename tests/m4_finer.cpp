@@ -149,6 +149,72 @@ bool runSlabStability() {
     return true;
 }
 
+/// @brief The reported real-world failure: a VG-like slab in the nested box,
+/// run FROM REST WITH THE STARTUP RAMP ON (so the freestream has not yet reached
+/// the slab), with the nested box hugging the slab tightly near the fine-patch
+/// boundary so the fill stencil's PARENT corners land on fine-grid Interface
+/// (coupling-shell) cells. Those cells are never collided, so before the
+/// Interface-aware fill screen they fed one-sub-step-stale fneq into the
+/// near-floor-tau finest level, which radiated an acoustic "shockwave from the
+/// VG" and diverged within a few hundred steps — before any flow arrived. This
+/// guards that fix: the march must stay NaN-free.
+bool runRampSlabStability() {
+    const GridDims dims{kNx, kNy, kNz};
+    const LatticeScaling scaling = testScaling();
+
+    LBMSolver solver;
+    std::string err;
+    if (!solver.init(dims, scaling, openDomainFlags(dims), nullptr, &err)) {
+        std::printf("rampslab: solver init failed: %s\n", err.c_str());
+        return false;
+    }
+    solver.setStartupRampEnabled(true); // FROM REST — the reported condition
+    solver.reset();
+
+    // The trigger is a STEEP single 4x fine-patch fill (the VG-resolution
+    // target's 8x path = 4x fine x 2x nested), NOT the old gentle 2x staircase.
+    PatchBox box;
+    box.x0 = 60; box.x1 = 130;
+    box.y0 = 30; box.y1 = 66;
+    const GridDims fineDims = fineDimsFor(box, dims, 4); // 4x fine patch
+    if (!solver.initRefinement(box, 4, solidFreeFlags(fineDims), &err)) {
+        std::printf("rampslab: initRefinement failed: %s\n", err.c_str());
+        return false;
+    }
+
+    // Nested box pushed toward the fine patch's lower-x edge so its own fill
+    // pulls from fine cells close to (and including) the fine Interface shell.
+    PatchBox finerBox;
+    finerBox.x0 = 6; finerBox.x1 = 64;
+    finerBox.y0 = 24; finerBox.y1 = 56;
+    const GridDims finerDims = fineDimsFor(finerBox, fineDims, 2);
+    // Slab hugging the finer box's low-x interior, just inside the shell — the
+    // vane-near-the-edge case, now near the fine patch's own boundary too.
+    const std::vector<std::uint8_t> finerSlab =
+        flagsWithSlab(finerDims, /*sx0=*/6, /*sx1=*/14,
+                      /*sy0=*/finerDims.ny / 2 - 6, /*sy1=*/finerDims.ny / 2 + 6);
+    if (!solver.initFinerRefinement(finerBox, 2, finerSlab, &err)) {
+        std::printf("rampslab: initFinerRefinement failed: %s\n", err.c_str());
+        return false;
+    }
+
+    // March past where the reported divergence hit (~300-400 steps).
+    for (int step = 0; step < 4; ++step) {
+        if (solver.stepN(200) != cudaSuccess) {
+            std::printf("rampslab: stepN failed\n");
+            return false;
+        }
+        if (solver.nanDetected()) {
+            std::printf("rampslab: DIVERGED at ~%d steps (ramp+nested+slab): %s\n",
+                        (step + 1) * 200, solver.nanDiagnosis().c_str());
+            return false;
+        }
+    }
+    std::printf("rampslab: stable over 800 from-rest steps (ramp + nested VG "
+                "slab near the fine boundary)\n");
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -255,6 +321,13 @@ int main() {
     TCHECK_MSG(runSlabStability(),
                "nested patch diverged with a solid in the box (fill not "
                "skipping solid parent corners?)");
+
+    // Regression guard for the Interface-aware fill: the reported from-rest
+    // "shockwave from the VG" — a nested slab near the fine boundary, ramp on.
+    // Diverged before the fill/restrict screened parent/child Interface cells.
+    TCHECK_MSG(runRampSlabStability(),
+               "nested VG patch diverged from rest (fill not skipping stale "
+               "Interface parent corners?)");
 
     return finish("m4_finer");
 }
