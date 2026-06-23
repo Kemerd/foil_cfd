@@ -195,12 +195,21 @@ struct UIParams {
         // loop then auto-scales the cascade (fine patch up to 4x, the nested
         // VG box doubling it to an effective 8x) until every vane meets that
         // target — the high-res zone genuinely GROWS to hit the number rather
-        // than stalling at 4x and only warning. Stretch mode can't honour this
-        // (its grid keeps the base cell count), so the panel directs the user
-        // to Cascade there.
+        // than stalling at 4x and only warning. Stretch (ISLBM) mode honours this
+        // too now via the acoustic near-wall re-anchor (the continuous-refine
+        // field puts the finest cells at the VGs / leading edge).
         bool  vgTargetAuto  = true; ///< Drive the patch factor from vgTargetCells.
         int   vgTargetCells = kMinVGHeightCells; ///< Desired resolved vane
                                  ///< height [cells]; slider range 8..24.
+
+        // ISLBM continuous near-wall refinement (2026-06-22): the stretched mesh
+        // can now anchor its FINEST cell BELOW base dx (acoustic re-anchor,
+        // nu_lat ~ k not k^2) so the resolution field smoothly peaks at the VGs
+        // (or the leading edge when no VGs) and coarsens outward. k is the
+        // finest-cell refinement vs base; 1 = legacy base-wall. When
+        // vgTargetAuto + VGs, k is driven by the VG target; otherwise this manual
+        // value applies (LE-anchored).
+        int   islbmNearWallK = 1; ///< Manual ISLBM near-wall refine factor (1..4).
         bool  finerVGPatch = true; ///< Build the nested 4x box hugging the VGs
                                  ///< (2x the fine factor) when VGs are on. Only
                                  ///< effective with VGs + an active fine patch;
@@ -312,6 +321,11 @@ struct UIReadouts {
     long long stepCount = 0;
     float flowThroughs = 0.0f;
     float currentTau = 0.0f;
+    // Zero-wind super-viscous warmup before the wind ramp (2026-06-20): while
+    // active, preStepCurrent/preStepTotal drive a "Pre-Steps N/M" status so the
+    // user sees the settle phase. preStepCurrent < 0 means the wind is on.
+    long long preStepCurrent = -1;
+    long long preStepTotal   = 0;
     int    gpuUtilPercent = -1;            ///< Whole-GPU load [0..100]; -1 =
                                            ///< driver library unavailable.
     double simElapsedMs = 0.0;             ///< PHYSICAL time simulated since

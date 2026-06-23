@@ -265,6 +265,30 @@ inline constexpr float kStartupNuMultiplier = 4.0f;
 /// @brief Ramp length in units of nx (domain lengths of steps).
 inline constexpr int kStartupRampNxFactor = 2;
 
+// ---------------------------------------------------------------------------
+// Pre-steps warmup (2026-06-20): BEFORE the wind is introduced, run a short
+// phase with the inlet held at REST (u = 0) and a deliberately ENORMOUS
+// viscosity, so any startup transient injected by a freshly-voxelized sharp
+// solid (a thin VG vane is a near step-discontinuity in an almost-inviscid
+// lattice) is dissipated while there is literally no flow to convert it into a
+// propagating acoustic pulse. The air physically takes time to reach the
+// geometry from the inlet anyway, so this phase corrupts no real physics — it
+// only damps the from-rest shockwave the VGs were emitting. After the pre-steps
+// the normal velocity + viscosity ramps run, so the wind arrives gently against
+// an already-calm field. kPreStepTau is an ABSOLUTE comfortable relaxation time
+// (NOT a multiple of the near-floor target nu, which would still be ~inviscid).
+// ---------------------------------------------------------------------------
+
+/// @brief Number of zero-wind super-viscous pre-steps before the wind ramp.
+/// Sized so even a deep VG cascade settles; the UI surfaces progress as
+/// "Pre-Steps N/M". 0 disables the phase.
+inline constexpr long long kPreSteps = 100;
+
+/// @brief Absolute relaxation time during the pre-steps (very viscous: ~0.8x
+/// the lattice sound-crossing damping). Far above kMinTau so the lattice is
+/// genuinely diffusive regardless of how clamped the run's steady tau is.
+inline constexpr float kPreStepTau = 0.9f;
+
 /// @brief Effective relaxation time during the startup ramp.
 /// @param scaling   The run's lattice scaling (provides the target tau).
 /// @param step      Current step index since the fresh start (0-based).

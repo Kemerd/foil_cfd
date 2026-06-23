@@ -79,7 +79,7 @@ PolarPoint runPoint(const AirfoilGeometry& foil, float aoa, bool wallModel,
         // foil, built from the wall-distance field. No discrete patch.
         const std::vector<float> wallDist =
             buildWallDistanceField(layout.dims, clean);
-        if (solver.initStretchMode(wallDist, &err))
+        if (solver.initStretchMode(wallDist, 1.0f, &err))
             solver.setStretchFastGather(fastGather);
         else
             std::printf("  (stretch mesh unavailable: %s)\n", err.c_str());

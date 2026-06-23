@@ -77,7 +77,40 @@ constexpr std::uint8_t kCellFlagSlipBack =
 /// rather than drifting with a fixed nx-fraction.
 /// @param chordCells Chord length N_c in cells.
 /// @param m          Per-side fluid margins in chords (see UIParams::domain).
-DomainLayout defaultLayout(int chordCells, const UIParams::DomainMargins& m) {
+/// @brief Spanwise cell count that fits a WHOLE number of VG periods, so the
+/// periodic z-tiling of a VG array is seamless (no partial unit clipped at the
+/// z=0/nz seam). For a periodic slice one period = one UNIT = pitch_c*chord
+/// cells (a counter-rotating pair's gap is INTRA-unit, so a pair is still one
+/// period). We snap to count * round(pitch_cells): integer cells-per-period
+/// first, then multiply, so voxelizeVG's centered array tiles cleanly. Returns 0
+/// (caller keeps the default proportion) when no enabled VG defines a period or
+/// the result would be too thin for 3D vortex resolution.
+int spanCellsForVGs(const std::vector<VGParams>& vgs, int chordCells,
+                    int defaultNz) {
+    // Use the first ENABLED VG's array as the period source (the common case is
+    // a single array; multiple incommensurate arrays can't all tile one nz).
+    const VGParams* arr = nullptr;
+    for (const VGParams& vg : vgs) if (vg.enabled) { arr = &vg; break; }
+    if (!arr) return 0;
+
+    const int count = std::max(1, arr->count);
+    const int cellsPerPeriod =
+        std::max(1, static_cast<int>(std::lround(
+                        arr->pitch_c * static_cast<float>(chordCells))));
+    const int nz = count * cellsPerPeriod;
+    // Guard: never shrink below the default proportion's worth of span — a too-
+    // thin domain starves the 3D vortex and the refinement patch's clearance.
+    // Round UP to whole periods if the snapped span is below the floor.
+    if (nz < defaultNz) {
+        const int periodsNeeded =
+            (defaultNz + cellsPerPeriod - 1) / cellsPerPeriod;
+        return periodsNeeded * cellsPerPeriod;
+    }
+    return nz;
+}
+
+DomainLayout defaultLayout(int chordCells, const UIParams::DomainMargins& m,
+                           const std::vector<VGParams>* vgs = nullptr) {
     DomainLayout layout;
     layout.chordCells = chordCells;
 
@@ -87,8 +120,15 @@ DomainLayout defaultLayout(int chordCells, const UIParams::DomainMargins& m) {
     // cells, +1 so the boundary flag planes never clip the fluid region).
     layout.dims.nx = static_cast<int>(std::lround(m.spanXc() * nc)) + 1;
     layout.dims.ny = static_cast<int>(std::lround(m.spanYc() * nc)) + 1;
-    // Spanwise extent unchanged from the original 0.375*N_c proportion.
-    layout.dims.nz = (3 * chordCells) / 8;
+    // Spanwise extent: the original 0.375*N_c proportion, UNLESS VGs are present
+    // — then snap it to a whole number of VG periods so the periodic z-tiling of
+    // the array is seamless (no clipped partial unit at the seam).
+    const int defaultNz = (3 * chordCells) / 8;
+    layout.dims.nz = defaultNz;
+    if (vgs) {
+        const int vgNz = spanCellsForVGs(*vgs, chordCells, defaultNz);
+        if (vgNz > 0) layout.dims.nz = vgNz;
+    }
 
     // Pin the foil with an ABSOLUTE anchor instead of an nx-fraction so the
     // upstream gap stays exactly `upstreamC` chords regardless of box size.
@@ -782,6 +822,58 @@ void uploadQLinksForLevel(App& app, const GridDims& dims,
     else            app.solver.setFinerQLinks(qFrac, ffMask, links, fallback);
 }
 
+/// Build a coarse flag field holding ONLY the VG solids (no foil) at the live
+/// layout — every VG voxelized into an all-Fluid field. The ISLBM sub-base path
+/// seeds its wall-distance field from this so the FINEST stretched cells land on
+/// the vanes (the foil wall, whose distance to a VG is large, coarsens back to
+/// base). Mirrors deriveVGPatchBoxFine's VG-only voxelization, at the coarse
+/// layout, with the custom-STL meshes threaded through.
+std::vector<std::uint8_t> buildVGOnlyFlags(const App& app) {
+    std::vector<std::uint8_t> vgOnly(
+        static_cast<std::size_t>(app.layout.dims.cellCount()),
+        static_cast<std::uint8_t>(CellFlag::Fluid));
+    for (const VGParams& vg : app.params.vgs)
+        voxelizeVG(vg, app.airfoil, app.params.aoaDeg, app.layout, vgOnly,
+                   nullptr, &app.vgMeshes);
+    return vgOnly;
+}
+
+/// Build a coarse flag field with a single solid marker column at the LEADING
+/// EDGE of the foil. When there are no VGs, the LE is where the action is —
+/// stagnation point, suction peak, the boundary layer's birth — so anchoring the
+/// continuous-refine field there puts the finest stretched cells at the LE and
+/// coarsens smoothly downstream. The marker is a few cells stamped at the LE
+/// surface point (transformed through the same AoA + layout anchor the airfoil
+/// voxelizer uses) so the wall-distance field's global minimum lands there.
+std::vector<std::uint8_t> buildLEAnchorFlags(const App& app) {
+    std::vector<std::uint8_t> mark(
+        static_cast<std::size_t>(app.layout.dims.cellCount()),
+        static_cast<std::uint8_t>(CellFlag::Fluid));
+    if (!app.airfoil.isValid()) return mark;
+    // LE surface point at x/c ~ 0 on the upper surface; transform like stampVane.
+    const SurfaceFrame le = surfaceFrameAt(app.airfoil, 0.0f, /*upper=*/true);
+    if (!le.valid) return mark;
+    const float aoaRad = app.params.aoaDeg * 3.14159265358979f / 180.0f;
+    const float chord  = static_cast<float>(app.layout.chordCells);
+    const Vec2f pr = rotated(le.point - Vec2f(0.25f, 0.0f), -aoaRad);
+    const int lx = static_cast<int>(std::lround(app.layout.anchorX() + pr.x * chord));
+    const int ly = static_cast<int>(std::lround(app.layout.anchorY() + pr.y * chord));
+    const GridDims& d = app.layout.dims;
+    const auto solid = static_cast<std::uint8_t>(CellFlag::Solid);
+    // A small 3x3 marker across the full span at the LE so the distance field
+    // anchors there (span-extruded like the foil, so every z plane is finest).
+    for (int z = 0; z < d.nz; ++z)
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int x = lx + dx, y = ly + dy;
+                if (x < 1 || x >= d.nx - 1 || y < 1 || y >= d.ny - 1) continue;
+                mark[static_cast<std::size_t>(x)
+                     + static_cast<std::size_t>(d.nx)
+                       * (y + static_cast<long long>(d.ny) * z)] = solid;
+            }
+    return mark;
+}
+
 /// (Re)build the two-level refinement patch (plan M-refine) for the current
 /// geometry: derive the box from the VG-merged flags (vanes must sit inside),
 /// voxelize foil + VGs at 2x into the fine flag field, stamp the Interface
@@ -859,19 +951,45 @@ void applyRefinement(App& app) {
         app.patchBox = PatchBox{};
         app.fineFlags.clear();
         clearFiner();
-        const std::vector<float> wallDist =
-            buildWallDistanceField(app.layout.dims, app.activeFlags);
+        // Continuous near-wall refinement (acoustic re-anchor): drive the finest
+        // stretch cell BELOW base dx so a band gets finer-than-base cells (true
+        // "resolve the curve"), with the field smoothly coarsening outward.
+        // WHERE the finest cells land is set by the wall-distance field's anchor:
+        //   - VGs present + target on  -> anchor at the VANES (VG-only field), k
+        //     from the VG resolution target,
+        //   - else, manual k > 1       -> anchor at the LEADING EDGE (where the
+        //     stagnation/suction/BL action is when there are no VGs),
+        //   - else (k == 1)            -> legacy: foil wall at base dx.
+        float nearWallK = 1.0f;
+        std::vector<float> wallDist;
+        const int manualK = std::clamp(app.params.refine.islbmNearWallK, 1, 4);
+        if (app.params.refine.vgTargetAuto && !app.params.vgs.empty()) {
+            nearWallK = static_cast<float>(recommendedRefineFactorForVGs(
+                app.params.vgs, app.layout.chordCells,
+                app.params.refine.vgTargetCells, kMaxVGTargetFactor));
+            // VG-only distance field: only cells near the vanes become finest.
+            wallDist = buildWallDistanceField(app.layout.dims, buildVGOnlyFlags(app));
+        } else if (manualK > 1) {
+            // No VGs (or auto off): anchor the finest cells at the leading edge.
+            nearWallK = static_cast<float>(manualK);
+            wallDist = buildWallDistanceField(app.layout.dims, buildLEAnchorFlags(app));
+        } else {
+            // k == 1: the foil wall stays at base dx (legacy stretch behavior).
+            wallDist = buildWallDistanceField(app.layout.dims, app.activeFlags);
+        }
         std::string serr;
-        if (app.solver.initStretchMode(wallDist, &serr)) {
+        if (app.solver.initStretchMode(wallDist, nearWallK, &serr)) {
             app.solver.setStretchFastGather(app.params.refine.islbmFastGather);
             const StretchInfo si = app.solver.stretchInfo();
-            char msg[200];
+            char msg[220];
             std::snprintf(msg, sizeof msg,
                           "stretched mesh (ISLBM): dx %.3g->%.3g mm (growth "
-                          "x%.4f/y%.4f), tau wall %.3f -> far %.3f%s",
+                          "x%.4f/y%.4f), tau wall %.3f -> far %.3f%s, near-wall "
+                          "k=%.0f",
                           si.dxMin * 1e3f, si.dxMax * 1e3f, si.growthX,
                           si.growthY, si.tauWall, si.tauFar,
-                          si.tauFloorClamped ? " [tau-floor clamped]" : "");
+                          si.tauFloorClamped ? " [tau-floor clamped]" : "",
+                          si.nearWallFactor);
             logLine(msg);
         } else {
             setStatus(app, "stretched mesh unavailable: " + serr
@@ -1067,8 +1185,10 @@ void runPreconverge(App& app) {
         return;
 
     const int nc = std::max(48, currentChordCells(app.params) / 4);
-    // Same margins as the live domain so the companion field upsamples cleanly.
-    const DomainLayout preLayout = defaultLayout(nc, app.params.domain);
+    // Same margins AND span as the live domain so the companion field upsamples
+    // cleanly (VG-aware nz must match the full grid's snapped span).
+    const DomainLayout preLayout = defaultLayout(nc, app.params.domain,
+                                                 &app.params.vgs);
 
     // Voxelize the SAME geometry (foil + VGs) at presolve resolution.
     std::vector<std::uint8_t> flags =
@@ -1594,7 +1714,11 @@ bool initSimulation(App& app, bool reinit, std::string* error) {
     }
 
     const int chordCells = currentChordCells(app.params);
-    app.layout = defaultLayout(chordCells, app.params.domain);
+    // VG-aware span: when parametric VGs are present, snap nz to a whole number
+    // of VG periods so the periodic spanwise tiling has no clipped unit at the
+    // seam. STL-foil mode has no parametric VGs, so it keeps the default span.
+    app.layout = defaultLayout(chordCells, app.params.domain,
+                               app.stlActive ? nullptr : &app.params.vgs);
 
     // Geometry + flags: STL keeps its imported mesh through grid changes;
     // sections re-voxelize from their polygon.
@@ -1683,6 +1807,8 @@ void updateReadouts(App& app) {
     app.readouts.stepCount = app.solver.stepCount();
     app.readouts.flowThroughs = app.solver.flowThroughsCompleted();
     app.readouts.currentTau = app.solver.currentTau();
+    app.readouts.preStepCurrent =
+        app.solver.preStepProgress(app.readouts.preStepTotal);
     app.readouts.nanTripped = app.solver.nanDetected();
     app.readouts.nanDiagnosis = app.solver.nanDiagnosis();
     // A watchdog trip silently freezes stepping (stepN no-ops while latched),
@@ -1768,10 +1894,17 @@ void updateReadouts(App& app) {
         rr.vgHeightCellsLive = 0.0f;
         rr.vgTargetCells     = 0;
         if (!app.params.vgs.empty() && !app.stlActive) {
-            int effFactor = 1;
-            if (ri.finerActive) effFactor = ri.factor * ri.finerFactor;
-            else if (ri.active) effFactor = ri.factor;
-            const int effChord = app.layout.chordCells * std::max(1, effFactor);
+            // Effective near-wall resolution factor: the cascade's finest level
+            // (nested VG box, else fine patch), OR the ISLBM stretch near-wall
+            // re-anchor k when the stretched mesh owns the resolution. Either way
+            // the vane lives in cells `effFactor` times finer than the base grid.
+            float effFactor = 1.0f;
+            const StretchInfo sinfo = app.solver.stretchInfo();
+            if (sinfo.active) effFactor = std::max(1.0f, sinfo.nearWallFactor);
+            else if (ri.finerActive) effFactor = static_cast<float>(ri.factor * ri.finerFactor);
+            else if (ri.active) effFactor = static_cast<float>(ri.factor);
+            const int effChord = static_cast<int>(std::lround(
+                app.layout.chordCells * std::max(1.0f, effFactor)));
             // Pick the entry the panel's guidance follows: the selected VG, or
             // the first enabled one when nothing is selected.
             const VGParams* probe = nullptr;
@@ -2187,12 +2320,27 @@ void applyEvents(App& app) {
     // ---- VG edits: cold restart by default; warm in-place continuation when
     // the VG editor's "Keep flow between edits" option is checked ----
     if (ev.vgEdited && !app.stlActive) {
-        const bool warm = applyVGEdit(app);
-        char msg[64];
-        std::snprintf(msg, sizeof msg, "VG edit — %s (%d VG entries)",
-                      warm ? "warm continue" : "cold restart",
-                      static_cast<int>(app.params.vgs.size()));
-        logLine(msg);
+        // A VG count/pitch change can change the VG-aware spanwise period, which
+        // changes nz — that's a GRID resize the in-place flag swap can't do, so
+        // route those through a full re-init. Other VG edits keep the fast path.
+        const int wantNz = defaultLayout(currentChordCells(app.params),
+                                         app.params.domain, &app.params.vgs)
+                               .dims.nz;
+        if (wantNz != app.layout.dims.nz) {
+            std::string e;
+            if (!initSimulation(app, /*reinit=*/true, &e))
+                setStatus(app, "VG span re-init failed: " + e);
+            else
+                logLine("VG edit — grid span resized to " + std::to_string(wantNz)
+                        + " (whole VG periods), full re-init");
+        } else {
+            const bool warm = applyVGEdit(app);
+            char msg[64];
+            std::snprintf(msg, sizeof msg, "VG edit — %s (%d VG entries)",
+                          warm ? "warm continue" : "cold restart",
+                          static_cast<int>(app.params.vgs.size()));
+            logLine(msg);
+        }
     }
 
     // ---- Refinement patch toggled or margins changed: rebuild the fine
@@ -2623,26 +2771,143 @@ int runSelftest(App& app) {
     return 0;
 }
 
+// ===========================================================================
+// --vgtest: headless VG-stability harness. Reproduces the reported divergence
+// configs (high-factor VG cascade box + ISLBM, from rest, at high AoA) and
+// reports STABLE/DIVERGED per case. Hard-capped on both step count AND wall
+// time so it never monopolizes the GPU. Exists so the from-rest VG shockwave
+// fix can be verified without the interactive UI.
+// ===========================================================================
+int runVgTest(App& app) {
+    using MeshMode = UIParams::MeshMode;
+
+    // One scenario = a named configuration to drive to convergence-or-blowup.
+    struct Scenario {
+        const char* name;
+        float aoaDeg;
+        MeshMode mode;
+        int   vgTargetCells; // drives the cascade depth (8x path) when high
+        bool  finerVGPatch;
+    };
+    // These mirror the two pasted crash reports: a 6x-ish cascade VG box at the
+    // working AoA, and the ISLBM/stretch case at the stall AoA.
+    // target=8 with finerVGPatch gives a 6x cascade box (3x fine + 2x nested) —
+    // exactly the shape the crash reports showed diverging (nested VG patch,
+    // from rest, ~step 200, AoA 4 and 18). The pathological 8x/16x boxes are too
+    // heavy to test interactively (tens of millions of cells) and are not a
+    // config to default to, so the harness verifies the realistic crash shapes.
+    const Scenario scenarios[] = {
+        {"cascade-VG-6x  AoA4",  4.0f,  MeshMode::Cascade, 8, true},
+        {"cascade-VG-6x  AoA18", 18.0f, MeshMode::Cascade, 8, true},
+        {"stretch-VG     AoA18", 18.0f, MeshMode::Stretch, 8, true},
+        // ISLBM continuous-refine: dense at the VG, coarse elsewhere, ONE grid
+        // (no full-span box) — the blazing-real-time high-res VG path. Reports
+        // its MLUPS + effective near-wall k so we see it's both stable AND fast.
+        {"stretch-VG-refine AoA18", 18.0f, MeshMode::Stretch, 16, true},
+    };
+
+    // Budget guards: never exceed these regardless of scenario count. The
+    // reported divergence hit at step ~200-400, so 500 steps past the pre-steps
+    // window is plenty to prove the from-rest pulse no longer forms. Small
+    // batches so the per-case wall cap can actually interrupt a slow box (the
+    // cap is only checked BETWEEN batches).
+    constexpr int    kStepsPerCase   = 500;
+    constexpr int    kBatch          = 25;
+    constexpr double kWallCapSeconds = 360.0; // 6 min hard cap for the WHOLE run
+    constexpr double kPerCaseCap     = 90.0;  // and per-case, so one slow deep
+                                              // cascade can't eat the whole run
+    const double t0 = platform::timerSeconds();
+
+    int diverged = 0, ran = 0;
+    for (const Scenario& sc : scenarios) {
+        if (platform::timerSeconds() - t0 > kWallCapSeconds) {
+            std::printf("vgtest: WALL-TIME CAP hit — stopping early "
+                        "(%d/%zu cases run)\n", ran,
+                        sizeof scenarios / sizeof scenarios[0]);
+            break;
+        }
+        ++ran;
+
+        // Configure: one Strausak-style counter-rotating pair on the suction
+        // surface, the scenario's AoA + mesh mode + VG-resolution target.
+        app.params.aoaDeg = sc.aoaDeg;
+        app.params.refine.meshMode      = sc.mode;
+        app.params.refine.vgTargetAuto  = true;
+        app.params.refine.vgTargetCells = sc.vgTargetCells;
+        app.params.refine.finerVGPatch  = sc.finerVGPatch;
+        app.params.vgs.clear();
+        app.params.vgs.push_back(defaultVGParams()); // counter-rotating pair
+        app.params.selectedVG = 0;
+        applyGeometryCold(app); // rebuild + cold restart (re-arms the ramp)
+
+        // Step in capped batches, watching the NaN watchdog.
+        bool blew = false, timedOut = false;
+        const double caseT0 = platform::timerSeconds();
+        long long startStep = app.solver.stepCount();
+        for (int s = 0; s < kStepsPerCase; s += kBatch) {
+            if (platform::timerSeconds() - t0 > kWallCapSeconds) { timedOut = true; break; }
+            if (platform::timerSeconds() - caseT0 > kPerCaseCap) { timedOut = true; break; }
+            if (app.solver.stepN(kBatch) != cudaSuccess) { blew = true; break; }
+            cudaStreamSynchronize(app.stream);
+            if (app.solver.nanDetected()) { blew = true; break; }
+        }
+        const long long did = app.solver.stepCount() - startStep;
+        const double caseSec = platform::timerSeconds() - caseT0;
+        // Real-time proof: MLUPS over this case + the effective near-wall
+        // resolution the VG actually got (stretch k, or cascade factor).
+        const double cells = static_cast<double>(app.layout.dims.cellCount());
+        const double mlups = (caseSec > 1e-6)
+            ? (cells * static_cast<double>(did)) / caseSec / 1e6 : 0.0;
+        const StretchInfo si = app.solver.stretchInfo();
+        const RefinementInfo ri = app.solver.refinementInfo();
+        float vgK = 1.0f;
+        if (si.active) vgK = si.nearWallFactor;
+        else if (ri.finerActive) vgK = static_cast<float>(ri.factor * ri.finerFactor);
+        else if (ri.active) vgK = static_cast<float>(ri.factor);
+        const float vgCells = defaultVGParams().height_c
+                            * static_cast<float>(app.layout.chordCells) * vgK;
+        if (blew) {
+            ++diverged;
+            std::printf("vgtest: [DIVERGED] %-22s at step %lld — %s\n", sc.name,
+                        did, app.solver.nanDiagnosis().c_str());
+        } else {
+            std::printf("vgtest: [stable%s]  %-22s %lld steps  %.0f MLUPS  "
+                        "VG k=%.1f (~%.1f cells)\n",
+                        timedOut ? "*" : " ", sc.name, did, mlups, vgK, vgCells);
+        }
+        std::fflush(stdout); // live progress even when piped/redirected
+    }
+
+    std::printf("vgtest: %d/%d cases ran, %d diverged. %s\n", ran,
+                static_cast<int>(sizeof scenarios / sizeof scenarios[0]),
+                diverged, diverged == 0 ? "PASS" : "FAIL");
+    return diverged == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     bool selftest = false;
+    bool vgtest   = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
+        if (std::strcmp(argv[i], "--vgtest") == 0)   vgtest   = true;
     }
+    // The VG stability harness runs headless like selftest (hidden window).
+    const bool headless = selftest || vgtest;
 
     // Session log first: everything from here on (statuses, errors, NaN
     // trips) lands in logs/foilcfd.log so issues are diagnosable after the
     // fact even when the on-screen status line has already decayed.
     logOpen();
     logLine(std::string("FoilCFD starting (")
-            + (selftest ? "selftest" : "interactive") + ")");
+            + (selftest ? "selftest" : vgtest ? "vgtest" : "interactive") + ")");
 
     App app;
     std::string error;
     // Init order matters: GL context first (interop registration needs it
     // current), then CUDA, then sim + renderer.
-    if (!initWindowAndGL(app, /*visible=*/!selftest, &error) ||
+    if (!initWindowAndGL(app, /*visible=*/!headless, &error) ||
         !initCuda(app, &error)) {
         logLine("FATAL: init failed: " + error);
         glfwTerminate();
@@ -2658,7 +2923,8 @@ int main(int argc, char** argv) {
 
     // Default geometry: the Glasair III's airfoil (NASA LS(1)-0413MOD) from
     // the bundled catalog. Selftest keeps the deterministic NACA section so
-    // its golden screenshot/forces stay reproducible.
+    // its golden screenshot/forces stay reproducible; vgtest wants the real
+    // LS(1)-0413 to reproduce the reported VG divergence faithfully.
     if (!selftest) tryLoadDefaultAirfoil(app);
 
     if (!initSimulation(app, /*reinit=*/false, &error)) {
@@ -2682,7 +2948,9 @@ int main(int argc, char** argv) {
     // Baseline configuration line: incident reports begin with a known state.
     logLine(configSummary(app));
 
-    const int rc = selftest ? runSelftest(app) : runInteractive(app);
+    const int rc = selftest ? runSelftest(app)
+                 : vgtest   ? runVgTest(app)
+                            : runInteractive(app);
 
     // Orderly teardown: GPU resources before the GL context dies.
     app.viz.shutdown();

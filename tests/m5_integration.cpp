@@ -95,6 +95,12 @@ CaseResult runCase(const AirfoilGeometry& foil, float aoaDeg,
     }
     solver.setSurfaceReference(clean);
     solver.setWallModelEnabled(wallModel);
+    // Steady-state physics gate: measure the CONVERGED separation state, not the
+    // startup transient. Disable the from-rest ramp (and its zero-wind pre-steps)
+    // — instant start — like the other milestone tests (m2/m3/m4/m6); otherwise
+    // the pre-steps eat the fixed settle budget and the flow reads under-developed.
+    solver.setStartupRampEnabled(false);
+    solver.reset();
 
     if (factor >= 2) {
         // Patch around the VG-merged solids, margins as the app defaults.

@@ -150,6 +150,9 @@ struct StretchInfo {
     bool   tauFloorClamped = false; ///< dxMax reduced to keep tauFar valid.
     double fluidCellSaving = 0.0;   ///< Fraction of cells coarser than the wall.
     double vramBytes = 0.0;   ///< Foot LUTs + per-cell tau field.
+    float  nearWallFactor = 1.0f;   ///< Sub-base refinement k: the finest cell
+                                    ///< is k-times finer than the base grid
+                                    ///< (dxMin = base/k). 1 = legacy base-wall.
 };
 
 /// @brief Host orchestrator for the D3Q19 TRT-Smagorinsky solver.
@@ -322,9 +325,13 @@ public:
     /// any cascade first. Rebuild on every geometry/AoA/STL edit (the mesh
     /// tracks the wall distance). Fails gracefully on OOM (reverts to Uniform).
     /// @param wallDist Per-cell wall distance, dims().cellCount() floats.
+    /// @param nearWallFactor Sub-base refinement k (>= 1; 1 = base-wall, the
+    ///                 legacy behavior). k > 1 makes the finest near-wall cells
+    ///                 k-times finer than the base grid (true local refinement).
     /// @param error    On failure, receives a human-readable reason.
     /// @return True on success (mode now ISLBM).
-    bool initStretchMode(const std::vector<float>& wallDist, std::string* error);
+    bool initStretchMode(const std::vector<float>& wallDist,
+                         float nearWallFactor, std::string* error);
 
     /// @brief Disable ISLBM mode and free the stretched mesh (reverts to a
     /// uniform grid). No-op when ISLBM is off.
@@ -636,6 +643,12 @@ public:
 
     /// @brief tau in effect right now (shows the ramp progressing in the UI).
     float currentTau() const;
+
+    /// @brief Pre-steps warmup progress for the status bar: the current
+    /// pre-step index in [0, total) while the zero-wind super-viscous phase is
+    /// running, with @p total set to the phase length. Returns -1 (and leaves
+    /// @p total untouched) once the wind has been released / outside a ramp.
+    long long preStepProgress(long long& total) const;
 
 private:
     // Pimpl keeps cuda_runtime types and the 4 GB of buffer handles out of

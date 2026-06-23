@@ -111,6 +111,31 @@ inline VGParams defaultVGParams() {
     return p;
 }
 
+/// @brief The CFD-tuned champion config from the FoilCFD sibling study
+/// (L:\Dev\glasair_vg_sim): a 6 mm DELTA vane, counter-rotating pairs, 10 deg
+/// TOE-OUT, on the NASA/Langley LS(1)-0413 at the Glasair III aileron mid-station
+/// (chord 0.9022 m). It was the study's double winner — highest steady Clmax
+/// (1.709 @ a=18 vs clean 1.443 @ a=15) AND the lowest cruise drag tax (+6.2%).
+/// Physical->chord-fraction mapping (chord = 902.2 mm): height 6/902.2 = 0.00665;
+/// pair pitch 70/902.2 = 0.0776; intra-pair vane spacing P/2 = 35 mm = 5.83 h.
+/// commonFlowDown=false encodes the measured toe-OUT optimum (splayed leading
+/// edges, beats toe-in here). NOTE: this is a SMALL vane (h/c 0.0067) — it needs
+/// the VG-resolution cascade to resolve honestly, exactly the path that exists.
+inline VGParams defaultGlasairVG() {
+    VGParams p{};
+    p.type           = VGType::CounterRotatingPair;
+    p.profile        = VGProfile::Delta;   // 6 mm delta (study winner)
+    p.x_c            = 0.07f;               // front tips at 7% chord
+    p.height_c       = 0.00665f;            // 6 mm / 902.2 mm
+    p.length_h       = 3.0f;                // l = 3h (~18 mm)
+    p.beta_deg       = 10.0f;               // 10 deg toe-OUT (measured optimum)
+    p.pitch_c        = 0.0776f;             // 70 mm pair-to-pair / chord
+    p.gap_h          = 5.83f;               // 35 mm intra-pair (P/2) / 6 mm
+    p.count          = 4;
+    p.commonFlowDown = false;               // toe-out (splayed LEs)
+    return p;
+}
+
 // ===========================================================================
 // Placement and voxelization
 // ===========================================================================

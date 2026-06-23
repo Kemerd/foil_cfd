@@ -1018,6 +1018,21 @@ void drawVGEditorPanel(UIContext& ctx) {
     helpMarker("Flight-proven preset (Strausak): counter-rotating vane pairs "
                "at x/c = 0.07, ~16 deg incidence, length 3h. A solid starting "
                "point before tuning against the guidance panel.");
+    ImGui::SameLine();
+    if (ImGui::Button("Glasair preset")) {
+        // CFD-tuned champion from the FoilCFD sibling study (glasair_vg_sim):
+        // 6 mm delta, 10 deg toe-out, counter-rotating pairs — defaultGlasairVG().
+        p.vgs.clear();
+        p.vgs.push_back(defaultGlasairVG());
+        p.selectedVG = 0;
+        ev.vgEdited = true;
+    }
+    helpMarker("CFD-tuned champion (FoilCFD sibling study, LS(1)-0413 @ Glasair "
+               "III chord): 6 mm DELTA vanes, 10 deg toe-out, 70 mm pitch, "
+               "counter-rotating pairs at x/c = 0.07. Highest steady Clmax "
+               "(1.709) at the lowest cruise drag tax of the study. It is a "
+               "small vane (h/c ~0.0067) — enable \"Resolve VGs to target\" in "
+               "the Mesh panel so it's resolved honestly.");
 
     int deleteIdx = -1, duplicateIdx = -1;
     for (int i = 0; i < static_cast<int>(p.vgs.size()); ++i) {
@@ -1270,6 +1285,12 @@ void drawVGGuidancePanel(UIContext& ctx) {
         p.selectedVG = 0;
         ev.vgEdited = true;
     }
+    if (ImGui::Button("Apply Glasair preset (6 mm delta, CFD-tuned)", ImVec2(-1, 0))) {
+        p.vgs.clear();
+        p.vgs.push_back(defaultGlasairVG());
+        p.selectedVG = 0;
+        ev.vgEdited = true;
+    }
     ImGui::End();
 }
 
@@ -1468,7 +1489,17 @@ void drawReadoutsPanel(UIContext& ctx) {
                "at this fidelity. Always verify a VG install with tuft or "
                "cotton-tape testing before drilling holes in your wing.");
 
-    if (!r.forces.valid) {
+    if (r.preStepCurrent >= 0 && r.preStepTotal > 0) {
+        // Zero-wind super-viscous warmup: settle the geometry before the wind
+        // is introduced (kills the from-rest VG shockwave). Show it as its own
+        // distinct phase so the user knows the sim is loading, not stalled.
+        ImGui::TextColored(kColWarn, "Pre-Steps (settling, no wind yet)  %lld / %lld",
+                           r.preStepCurrent, r.preStepTotal);
+        const float frac = std::clamp(
+            static_cast<float>(r.preStepCurrent)
+                / static_cast<float>(r.preStepTotal), 0.0f, 1.0f);
+        ImGui::ProgressBar(frac, ImVec2(-1, 0), "warming up");
+    } else if (!r.forces.valid) {
         // Gated: the first two flow-throughs of any cold start are transient
         // garbage for forces (plan 13) — show progress, not numbers.
         ImGui::TextDisabled("converging...  %.1f / %.1f flow-throughs",
@@ -1935,6 +1966,27 @@ void drawMeshPanel(UIContext& ctx) {
                        "rescale — trustworthy Cl/Cd, but ~4-5x slower in the "
                        "gather. Turn off when you want numbers, on when you want "
                        "frames.");
+
+            // Continuous near-wall refinement: anchor the finest cells finer than
+            // base at the action (VGs auto-drive it; otherwise the leading edge).
+            const bool vgDriven =
+                p.refine.vgTargetAuto && !p.vgs.empty();
+            ImGui::BeginDisabled(vgDriven);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##islbmk", &p.refine.islbmNearWallK, 1, 4,
+                             "Near-wall refine: %dx (finer than base)");
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                ev.meshRefinementChanged = true;
+            ImGui::EndDisabled();
+            helpMarker("Anchors the stretched mesh's FINEST cell k-times finer "
+                       "than the base grid, smoothly coarsening outward — true "
+                       "local refinement on the smooth grid (acoustic re-anchor, "
+                       "Reynolds preserved). The finest cells land where the "
+                       "action is: the VORTEX GENERATORS when present (the VG "
+                       "resolution target drives k automatically), else the "
+                       "LEADING EDGE. 1x = legacy base-wall stretch.");
+            if (vgDriven)
+                ImGui::TextDisabled("(k driven by the VG resolution target)");
         }
 
         // The stretched-mesh readout: dx range, growth, tau wall->far, savings.
@@ -2011,15 +2063,12 @@ void drawMeshPanel(UIContext& ctx) {
                     r.refine.vgHeightCellsLive, r.refine.vgTargetCells,
                     met ? "" : " — increase chord res or vane height");
             }
-            // Stretch mode can't honour the target: its grid keeps the base
-            // cell count (only the fluid spacing varies), so the vane stays at
-            // base resolution no matter what. Direct the user to Cascade.
-            if (p.refine.meshMode == UIParams::MeshMode::Stretch
-                && !p.vgs.empty()) {
-                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
-                                   "Stretch mesh keeps base VG resolution — "
-                                   "switch to Cascade to resolve VGs.");
-            }
+            // Stretch (ISLBM) NOW resolves VGs via the acoustic near-wall
+            // re-anchor: it anchors its finest cells at the vanes, finer than
+            // base, smoothly coarsening outward. The "current VG height" readout
+            // above already reflects the refined (k x) resolution, so no separate
+            // notice is needed — if it's still under target, the message above
+            // says to raise k / the target, same as the cascade.
         }
 
         // Nested VG patch: a tiny box at 2x the fine factor hugging only the

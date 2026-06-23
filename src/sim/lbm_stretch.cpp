@@ -140,7 +140,7 @@ void buildFootMaps(const std::vector<float>& dxAxis, int n, float dxMin,
 bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
                       const LatticeScaling& scaling,
                       const std::vector<float>& wallDist, cudaStream_t stream,
-                      std::string* error) {
+                      float nearWallFactor, std::string* error) {
     mesh.free(); // replace any previous mesh
     const int nx = dims.nx, ny = dims.ny, nz = dims.nz;
     const long long ncells = dims.cellCount();
@@ -150,15 +150,38 @@ bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
         return false;
     }
 
-    // Finest spacing = the base grid cell (the wall stays uniform-grid sharp);
-    // the gradient only COARSENS outward, so the wall tau == scaling.tau.
-    const float dxMin = scaling.dx;
+    // Sub-base refinement factor k (>= 1): the finest cell is k-times finer than
+    // the base grid. k == 1 reproduces the legacy base-wall behavior exactly.
+    const float k = std::max(1.0f, nearWallFactor);
+    mesh.nearWallFactor = k;
+
+    // Finest spacing = base/k. This REMAINS the global minimum spacing (the
+    // profile builder measures distance from the finest plane), so every foot
+    // ratio dxMin/dxi stays <= 1 and the kernel/foot-map/collar are untouched.
+    // The gradient still only coarsens OUTWARD from this finest plane.
+    const float dxMin = scaling.dx / k;
 
     // Choose the far-field coarsest spacing so the far-field lattice viscosity
     // (nu_lat ~ (dxMin/dx)^2 * nu_lat_wall) keeps tau >= kMinTau. tau falls as
     // dx grows: tau(dx) = 0.5 + 3*nu_lat_wall*(dxMin/dx)^2. The floor on dx/dxMin
     // is where that hits kMinTau; clamp dxMax to it (report when clamped).
-    const float nuWall = (scaling.tau - 0.5f) / 3.0f;       // == scaling.nu_lat
+    //
+    // ACOUSTIC RE-ANCHOR (refine-capable): nuWall is the lattice viscosity AT
+    // the finest cell. Refining the reference by k is acoustic scaling (dx/=k,
+    // dt/=k, nu_lat *= k — LINEAR, exactly as the cascade's refinedScaling does),
+    // NOT diffusive (k^2). The two distinct exponents, kept straight:
+    //   * ACROSS cells of ONE mesh (shared dt): nu_lat ~ (dxMin/dx)^2  [squared,
+    //     applied per-cell below — UNCHANGED and correct].
+    //   * RE-ANCHORING the reference (dxMin: base->base/k WITH dt: base->base/k):
+    //     nuWall scales LINEARLY in k.
+    // Derivation: nu_lat_ref = nu_phys * dt_global / dxMin^2 with dt_global =
+    // dt_base/k and dxMin = base/k gives nu_lat_ref = k * (nu_phys*dt_base/base^2)
+    // = k * nuBase. The earlier k^2 (and leaving dt unchanged) silently ran the
+    // sim at U/k, i.e. Re/k — which laminarized the wake. The paired dt/=k anchor
+    // (applied in the solver's scaling) is what keeps U, Re, and the fine-cell
+    // sound speed all invariant.
+    const float nuBase = (scaling.tau - 0.5f) / 3.0f;       // == scaling.nu_lat
+    const float nuWall = nuBase * k;
     const float nuFloor = (kMinTau - 0.5f) / 3.0f;
     // tau floor reached when (dxMin/dx)^2 = nuFloor/nuWall -> dx/dxMin = sqrt(nuWall/nuFloor).
     float ratioCap = (nuFloor > 0.0f && nuWall > nuFloor)
@@ -251,7 +274,9 @@ bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
     mesh.nx = nx; mesh.ny = ny; mesh.nz = nz;
     mesh.dxMin = dxMin; mesh.dxMax = dxMax;
     mesh.growthX = profX.growth; mesh.growthY = profY.growth;
-    mesh.tauWall = scaling.tau; mesh.tauFar = tauFarMin;
+    // The wall (finest cell) carries nuWall, which at k>1 is the re-anchored
+    // (k^2-scaled) viscosity, so tauWall is its tau — not scaling.tau.
+    mesh.tauWall = 0.5f + 3.0f * nuWall; mesh.tauFar = tauFarMin;
     // Rough "what the gradient buys": fraction of cells coarser than ~1.5*dxMin.
     long long coarser = 0;
     for (float t : hTau) if (t < 0.5f + 3.0f * nuWall * (1.0f / (1.5f * 1.5f))) ++coarser;

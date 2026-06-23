@@ -227,6 +227,8 @@ struct LBMSolver::Impl {
     // geometry edit; the host copy is kept so setFlags can rebuild it.
     StretchMesh stretch;                       ///< Device mesh + diagnostics.
     std::vector<float> stretchWallDist;        ///< Host wall-distance field copy.
+    float stretchNearWallFactor = 1.0f;        ///< Sub-base refinement k for a
+                                               ///< rebuild from the kept field.
 
     // ---- virtual transition strip (boundary-layer trip) -------------------
     // A per-cell mask marking a near-LE band where launchTransitionTrip injects
@@ -849,20 +851,35 @@ struct LBMSolver::Impl {
     /// @brief Steps in one flow-through at the current scaling.
     float flowThroughSteps() const { return scaling.flowThroughSteps(dims.nx); }
 
-    /// @brief tau for the step about to run, honoring the ramp state.
-    float effectiveTau() const {
-        return (rampActive && rampEnabled)
-                   ? rampedTau(scaling, steps - rampStartStep, dims.nx)
-                   : scaling.tau;
+    /// @brief Steps elapsed in the current fresh-start ramp (0 outside a ramp).
+    long long rampStep() const { return steps - rampStartStep; }
+
+    /// @brief True while the zero-wind super-viscous pre-steps phase is running.
+    /// The wind is held at rest and viscosity is huge so a freshly-voxelized
+    /// sharp solid (VG vane) can't emit a from-rest shockwave.
+    bool inPreSteps() const {
+        return rampActive && rampEnabled && kPreSteps > 0
+               && rampStep() < kPreSteps;
     }
 
-    /// @brief Inlet/freestream velocity for the step about to run, honoring the
-    /// startup velocity ramp (eases from rest so the impulsive-start pressure
-    /// shock never forms). Outside the ramp (or when disabled) it is u_lat.
+    /// @brief tau for the step about to run, honoring the ramp + pre-steps. The
+    /// pre-steps run at the absolute kPreStepTau (very viscous); afterwards the
+    /// normal viscosity ramp runs with its clock reset to the wind-on instant.
+    float effectiveTau() const {
+        if (!(rampActive && rampEnabled)) return scaling.tau;
+        const long long rs = rampStep();
+        if (kPreSteps > 0 && rs < kPreSteps) return kPreStepTau;
+        return rampedTau(scaling, rs - kPreSteps, dims.nx);
+    }
+
+    /// @brief Inlet/freestream velocity for the step about to run. Zero during
+    /// the pre-steps (no wind), then the normal velocity ramp eases from rest
+    /// against the already-calm field. Outside the ramp it is u_lat.
     float effectiveU() const {
-        return (rampActive && rampEnabled)
-                   ? rampedU(scaling, steps - rampStartStep, dims.nx)
-                   : scaling.u_lat;
+        if (!(rampActive && rampEnabled)) return scaling.u_lat;
+        const long long rs = rampStep();
+        if (kPreSteps > 0 && rs < kPreSteps) return 0.0f; // wind held off
+        return rampedU(scaling, rs - kPreSteps, dims.nx);
     }
 
     /// @brief Poll an event, absorbing ONLY the expected cudaErrorNotReady
@@ -2398,7 +2415,7 @@ void LBMSolver::setCascadeQLinks(int depth,
 // ---------------------------------------------------------------------------
 
 bool LBMSolver::initStretchMode(const std::vector<float>& wallDist,
-                                std::string* error) {
+                                float nearWallFactor, std::string* error) {
     Impl& s = *impl_;
     if (!s.initialized) {
         if (error) *error = "solver not initialized";
@@ -2407,10 +2424,11 @@ bool LBMSolver::initStretchMode(const std::vector<float>& wallDist,
     // Mutually exclusive with the cascade: tear down every refinement level
     // first (the single stretched grid replaces them).
     s.freeFine();
+    s.stretchNearWallFactor = std::max(1.0f, nearWallFactor);
     // Build + upload the stretched mesh from the wall-distance field. Keep the
     // host copy so setFlags/geometry edits can rebuild without re-deriving it.
     if (!buildStretchMesh(s.stretch, s.dims, s.scaling, wallDist, s.stream,
-                          error)) {
+                          s.stretchNearWallFactor, error)) {
         s.stretchWallDist.clear();
         return false; // graceful: mode stays uniform, coarse sim runs on
     }
@@ -2489,6 +2507,7 @@ StretchInfo LBMSolver::stretchInfo() const {
     info.tauFar          = s.stretch.tauFar;
     info.tauFloorClamped = s.stretch.tauFloorClamped;
     info.fluidCellSaving = s.stretch.fluidCellSaving;
+    info.nearWallFactor  = s.stretch.nearWallFactor;
     // Foot LUTs (2*nx + 2*ny entries of float+int8) + the per-cell tau field.
     info.vramBytes =
         static_cast<double>(2 * s.dims.nx + 2 * s.dims.ny) * (sizeof(float) + 1)
@@ -2629,6 +2648,13 @@ float LBMSolver::currentTau() const {
     const Impl& s = *impl_;
     if (!s.initialized) return 0.0f;
     return s.effectiveTau();
+}
+
+long long LBMSolver::preStepProgress(long long& total) const {
+    const Impl& s = *impl_;
+    if (!s.initialized || !s.inPreSteps()) return -1;
+    total = kPreSteps;
+    return s.rampStep(); // 0..kPreSteps-1 while the wind is held off
 }
 
 } // namespace foilcfd

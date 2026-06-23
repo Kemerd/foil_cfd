@@ -83,7 +83,7 @@ std::vector<double> runDecay(const GridDims& dims, const LatticeScaling& scaling
         return ke;
     }
     if (!wallDist.empty()) {
-        if (!solver.initStretchMode(wallDist, &err)) {
+        if (!solver.initStretchMode(wallDist, 1.0f, &err)) {
             std::printf("  initStretchMode failed: %s\n", err.c_str());
             ok = false;
             return ke;

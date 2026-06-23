@@ -120,11 +120,14 @@ struct StretchMesh {
     float dxMax   = 0.0f;   ///< Coarsest physical spacing (far field) [m].
     float growthX = 1.0f;   ///< Achieved per-cell growth ratio, X axis.
     float growthY = 1.0f;   ///< Achieved per-cell growth ratio, Y axis.
-    float tauWall = 0.0f;   ///< tau at the finest cell (== scaling.tau).
+    float tauWall = 0.0f;   ///< tau at the finest cell (the reference tau).
     float tauFar  = 0.0f;   ///< tau at the coarsest cell (>= kMinTau).
     bool  tauFloorClamped = false; ///< dxMax was reduced to keep tauFar>=kMinTau.
     double fluidCellSaving = 0.0;  ///< Fraction of cells coarser than dxMin
                                    ///< (rough "what the gradient buys" readout).
+    float nearWallFactor = 1.0f;   ///< Sub-base refinement k: the finest cell is
+                                   ///< k-times finer than the base grid dx (1.0 =
+                                   ///< legacy, wall == base). dxMin = base/k.
 
     int nx = 0, ny = 0, nz = 0;
     bool active = false;
@@ -158,23 +161,37 @@ struct StretchMesh {
 };
 
 /// @brief Build the stretched mesh from a wall-distance field and the base
-/// scaling, and upload it to the device. The finest spacing is the base grid's
-/// dx (so the wall stays as well-resolved as the uniform grid); dx grows
-/// smoothly outward at <= kMaxStretchGrowth per cell, saturating at a far-field
-/// dxMax chosen so the far-field tau stays >= kMinTau (clamped + reported if
-/// not). Per-cell tau follows nu_lat ~ 1/dx^2. Frees any previous mesh first;
-/// leaves @p mesh inactive and returns an error on OOM (caller falls back to
-/// uniform). All work is on @p stream; the upload is synchronized before return.
-/// @param mesh      Mesh to (re)build in place.
-/// @param dims      Grid dims (must match the wall-distance field).
-/// @param scaling   Base (finest-cell) scaling — its dx/tau anchor the wall.
-/// @param wallDist  buildWallDistanceField output (dims.cellCount() floats).
-/// @param stream    CUDA stream for the upload.
-/// @param error     On failure, receives a human-readable reason.
+/// scaling, and upload it to the device. By default the finest spacing is the
+/// base grid's dx (the wall stays as well-resolved as the uniform grid); dx
+/// grows smoothly outward at <= kMaxStretchGrowth per cell, saturating at a
+/// far-field dxMax chosen so the far-field tau stays >= kMinTau (clamped +
+/// reported if not). Per-cell tau follows nu_lat ~ 1/dx^2.
+///
+/// SUB-BASE REFINEMENT (@p nearWallFactor k > 1): the finest spacing becomes
+/// base/k, so the wall band gets cells FINER than the base grid — true local
+/// super-refinement inside the smooth-gradient framework. The whole scheme is
+/// ratio-based (foot = dxMin/dxi, tau = nuWall*(dxMin/dxEff)^2), so this is a
+/// pure RE-ANCHOR: dxMin shrinks and the wall viscosity reference nuWall scales
+/// by k^2 in lockstep, so the finest cell self-collapses to the exact integer
+/// pull (frac 0) and base-spacing cells correctly relax to the original base
+/// tau. No kernel / foot-map / collar change is needed — dxMin simply remains
+/// the global minimum spacing. dt is NOT referenced in the time integration, so
+/// no sub-cycling: the physics rides entirely in the per-cell tau field.
+///
+/// Frees any previous mesh first; leaves @p mesh inactive and returns an error
+/// on OOM (caller falls back to uniform). All work is on @p stream; the upload
+/// is synchronized before return.
+/// @param mesh           Mesh to (re)build in place.
+/// @param dims           Grid dims (must match the wall-distance field).
+/// @param scaling        Base (finest-cell) scaling — its dx/tau anchor the wall.
+/// @param wallDist       buildWallDistanceField output (dims.cellCount() floats).
+/// @param stream         CUDA stream for the upload.
+/// @param nearWallFactor Sub-base refinement k (>= 1; 1 = legacy base-wall).
+/// @param error          On failure, receives a human-readable reason.
 /// @return True on success (mesh.active == true), false on failure.
 bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
                       const LatticeScaling& scaling,
                       const std::vector<float>& wallDist, cudaStream_t stream,
-                      std::string* error);
+                      float nearWallFactor, std::string* error);
 
 } // namespace foilcfd

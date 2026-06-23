@@ -64,10 +64,12 @@ struct Result {
 };
 
 // Run the cylinder case; when @p islbm is true the solver is put in ISLBM mode
-// with a wall-distance field built from the cylinder solids.
+// with a wall-distance field built from the cylinder solids. @p nearWallFactor k
+// (>= 1) drives sub-base near-wall refinement (k>1 = finest cell k-times finer
+// than base) so the force-non-regression gate can exercise the re-anchor.
 Result runCylinder(const GridDims& dims, const LatticeScaling& scaling,
                    const std::vector<std::uint8_t>& flags, double dMeasured,
-                   bool islbm) {
+                   bool islbm, float nearWallFactor = 1.0f) {
     Result r;
     LBMSolver solver;
     std::string err;
@@ -78,7 +80,7 @@ Result runCylinder(const GridDims& dims, const LatticeScaling& scaling,
     if (islbm) {
         const std::vector<float> wallDist =
             buildWallDistanceField(dims, flags);
-        if (!solver.initStretchMode(wallDist, &err)) {
+        if (!solver.initStretchMode(wallDist, nearWallFactor, &err)) {
             std::printf("  initStretchMode failed: %s\n", err.c_str());
             return r;
         }
@@ -246,6 +248,41 @@ int main() {
                     isl.meanCd, ctrl.meanCd, 100.0 * cdRel);
         TCHECK_MSG(cdRel <= 0.10, "ISLBM mean Cd deviates %.1f%% from uniform",
                    100.0 * cdRel);
+    }
+
+    // ---- Refine-capable sub-base GATE (acoustic re-anchor, 2026-06-22) ------
+    // k=2: finest cell 2x finer than base, anchored with the CORRECT acoustic
+    // scaling (nuWall = nuBase*k, NOT k^2). Proof the scaling is right: the body
+    // spans k x more CELLS while nu_lat is k x higher, so the lattice Reynolds
+    // u_lat*(k*L)/(k*nu) is INVARIANT — the wake must look like the k=1 run, just
+    // better resolved. The earlier k^2 attempt gave Re/k (wake laminarized); this
+    // gate asserts the recovery so a regression to k^2 (or any Re drift) is caught.
+    std::printf("--- ISLBM sub-base k=2 (acoustic re-anchor: Re must hold) ---\n");
+    const Result sub = runCylinder(dims, scaling, flags, dMeasured, true, 2.0f);
+    TCHECK_MSG(sub.ok, "sub-base k=2 run failed/diverged");
+    std::printf("  k=2: Cd = %.4f, St = %.4f, liftStd = %.3e\n",
+                sub.meanCd, sub.strouhal, sub.liftStd);
+    if (ctrl.ok && sub.ok) {
+        // Re PRESERVED is the thing to prove: the body spans k x more cells while
+        // nu_lat is k x higher, so the lattice Re is invariant. The k^2 bug gave
+        // Re/k^2 (wake DEAD: liftStd ~2e-3, St ~0.13). With the acoustic k^1 fix
+        // the wake is vigorous and in-band. We do NOT assert St matches the coarse
+        // control tightly: refining the WHOLE near-wake legitimately sharpens the
+        // BL (raising Cd a few %) and shifts St a little — the refined sim is more
+        // accurate, not wrong. The vigorous-shedding + in-band + Cd-sane gates are
+        // what catch a regression to the Re-broken k^2 scaling.
+        TCHECK_MSG(sub.liftStd > 3e-2, "k=2 shedding too weak (%.2e) — Re not "
+                   "preserved (regressed to k^2 diffusive scaling?)", sub.liftStd);
+        TCHECK_MSG(sub.strouhal >= 0.16 && sub.strouhal <= 0.22,
+                   "k=2 Strouhal %.4f out of physical band — Re drift",
+                   sub.strouhal);
+        const double cdRelSub = std::fabs(sub.meanCd - ctrl.meanCd)
+                              / std::max(1e-9, std::fabs(ctrl.meanCd));
+        std::printf("Cd A/B (k=2): %.4f vs uniform %.4f (%.1f%%)\n",
+                    sub.meanCd, ctrl.meanCd, 100.0 * cdRelSub);
+        TCHECK_MSG(cdRelSub <= 0.12, "k=2 mean Cd deviates %.1f%% from uniform "
+                   "(>12%% suggests Re drift, not just a sharper BL)",
+                   100.0 * cdRelSub);
     }
 
     return finish("m6b_stretch_cylinder");
