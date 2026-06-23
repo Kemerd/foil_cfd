@@ -214,6 +214,7 @@ bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
     // tau falls toward kMinTau in the coarse far field; clamp defensively.
     std::vector<float> hTau(static_cast<std::size_t>(ncells));
     float tauFarMin = scaling.tau;
+    float achievedDxMax = dxMin; // largest cell size actually present (diagnostic)
     for (int z = 0; z < nz; ++z)
         for (int y = 0; y < ny; ++y) {
             const float dxy = profY.dx[static_cast<std::size_t>(y)];
@@ -227,6 +228,7 @@ bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
                     + static_cast<std::size_t>(nx) * (y + static_cast<long long>(ny) * z);
                 hTau[c] = tau;
                 tauFarMin = std::min(tauFarMin, tau);
+                achievedDxMax = std::max(achievedDxMax, dxEff);
             }
         }
 
@@ -272,10 +274,13 @@ bool buildStretchMesh(StretchMesh& mesh, const GridDims& dims,
 
     // ---- fill diagnostics + activate -------------------------------------
     mesh.nx = nx; mesh.ny = ny; mesh.nz = nz;
-    mesh.dxMin = dxMin; mesh.dxMax = dxMax;
+    // dxMax is the ACHIEVED coarsest cell present (not the tau-floor TARGET),
+    // so the resolution view + dxMax/dxMin readout reflect the real gradient
+    // rather than a far-field target the growth cap never reached.
+    mesh.dxMin = dxMin; mesh.dxMax = achievedDxMax;
     mesh.growthX = profX.growth; mesh.growthY = profY.growth;
-    // The wall (finest cell) carries nuWall, which at k>1 is the re-anchored
-    // (k^2-scaled) viscosity, so tauWall is its tau — not scaling.tau.
+    // The wall (finest cell) carries nuWall, the acoustic re-anchored (k-scaled)
+    // viscosity, so tauWall is its tau — not scaling.tau.
     mesh.tauWall = 0.5f + 3.0f * nuWall; mesh.tauFar = tauFarMin;
     // Rough "what the gradient buys": fraction of cells coarser than ~1.5*dxMin.
     long long coarser = 0;

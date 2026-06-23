@@ -209,7 +209,10 @@ struct UIParams {
         // finest-cell refinement vs base; 1 = legacy base-wall. When
         // vgTargetAuto + VGs, k is driven by the VG target; otherwise this manual
         // value applies (LE-anchored).
-        int   islbmNearWallK = 1; ///< Manual ISLBM near-wall refine factor (1..4).
+        int   islbmNearWallK = 2; ///< Manual ISLBM near-wall refine factor (1..4).
+                                  ///< Default 2: Stretch always refines the LE /
+                                  ///< wall (main.cpp floors it at
+                                  ///< kIslbmDefaultLEFactor regardless).
         bool  finerVGPatch = true; ///< Build the nested 4x box hugging the VGs
                                  ///< (2x the fine factor) when VGs are on. Only
                                  ///< effective with VGs + an active fine patch;
@@ -390,6 +393,12 @@ struct UIReadouts {
                                        ///< (post-cascade) resolution — what the
                                        ///< vane actually gets, not the base grid.
         int      vgTargetCells     = 0;    ///< The active target (0 = no VGs).
+        int      effChordCells     = 0;    ///< Base chord resolution times the
+                                       ///< live refinement factor (cascade level
+                                       ///< or ISLBM stretch k) — the EFFECTIVE
+                                       ///< resolution the under-resolved warnings
+                                       ///< must judge against, so they clear when
+                                       ///< the vane is genuinely refined.
     };
     RefinementReadout refine;
 

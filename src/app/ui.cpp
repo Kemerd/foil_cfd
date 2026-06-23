@@ -912,13 +912,13 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
     // height), so when the base vane is short, point the user there.
     if (vgUnderResolved(vg, chordCells)) {
         ImGui::TextColored(kColWarn,
-                           "VG under-resolved on the base grid (%.1f cells "
-                           "tall, need %d) —\nenable \"Resolve VGs to target\" "
-                           "in the Mesh panel, or\nincrease chord resolution or "
-                           "VG size",
+                           "VG under-resolved (%.1f cells tall, need %d) —\n"
+                           "raise \"Resolve VGs to target\" / the near-wall "
+                           "refine\nin the Mesh panel, or increase chord "
+                           "resolution or VG size",
                            vgHeightCells(vg, chordCells), kMinVGHeightCells);
     } else {
-        ImGui::TextDisabled("vane height: %.1f cells (base grid)",
+        ImGui::TextDisabled("vane height: %.1f cells (resolved)",
                             vgHeightCells(vg, chordCells));
     }
     return edited;
@@ -927,12 +927,14 @@ bool drawVGEntry(VGParams& vg, int chordCells, float xcMin, float xcMax,
 void drawVGEditorPanel(UIContext& ctx) {
     UIParams& p = *ctx.params;
     UIEvents& ev = *ctx.events;
-    // Under-resolution checks judge against the grid the vanes are actually
-    // voxelized on: the fine patch when it is active (plan M-refine —
-    // multiplying vane resolution is the patch's headline win), else the base.
+    // Under-resolution checks judge against the EFFECTIVE grid the vanes are
+    // actually resolved on — the live refinement factor (cascade fine/nested
+    // level OR the ISLBM stretch near-wall k), computed once in updateReadouts.
+    // Falls back to the base chord before the first readout populates it.
     const int chordCells =
-        std::max(1, ctx.readouts->refine.factor)
-        * ctx.readouts->scaling.chordCells;
+        ctx.readouts->refine.effChordCells > 0
+            ? ctx.readouts->refine.effChordCells
+            : ctx.readouts->scaling.chordCells;
     if (!ImGui::Begin("VG Editor")) { ImGui::End(); return; }
 
     if (p.source == AirfoilSource::StlImport) {
@@ -1273,7 +1275,9 @@ void drawVGGuidancePanel(UIContext& ctx) {
     // Under-resolution cross-check mirrored here because this is the panel
     // the user reads while choosing h (geom/vg guard, plan 6.1).
     if (haveVG && vgUnderResolved(p.vgs[static_cast<size_t>(p.selectedVG)],
-                                  r.scaling.chordCells)) {
+                                  r.refine.effChordCells > 0
+                                      ? r.refine.effChordCells
+                                      : r.scaling.chordCells)) {
         ImGui::TextColored(kColWarn, "Selected VG is under-resolved on this "
                                      "grid —\nresults will understate its effect.");
     }
@@ -1824,10 +1828,11 @@ void drawViewPanel(UIContext& ctx) {
             }
             if (sc.field == SliceField::Resolution)
                 helpMarker("Local lattice CELL SIZE on the ISLBM stretched mesh: "
-                           "dark/low = FINEST cells (at the VGs or leading edge), "
-                           "bright/high = coarsest far-field cells. Shows the "
-                           "continuous resolution gradient directly. Only varies "
-                           "in Stretch (ISLBM) mode; flat on a uniform/cascade grid.");
+                           "BRIGHT/hot = FINEST cells (concentrated at the VGs or "
+                           "the leading edge), dark = coarsest far-field cells. "
+                           "Shows the continuous resolution gradient directly. "
+                           "Only varies in Stretch (ISLBM) mode — it renders flat "
+                           "on a uniform or cascade grid (no per-cell dx field).");
             ImGui::Unindent();
         }
         ImGui::PopID();
@@ -1992,7 +1997,13 @@ void drawMeshPanel(UIContext& ctx) {
                        "Reynolds preserved). The finest cells land where the "
                        "action is: the VORTEX GENERATORS when present (the VG "
                        "resolution target drives k automatically), else the "
-                       "LEADING EDGE. 1x = legacy base-wall stretch.");
+                       "LEADING EDGE.\n\nISLBM refines the FLUID dx and gives the "
+                       "vane a sub-cell surface via q-LIBB, but keeps the same "
+                       "lattice cell count — it does NOT add solid voxels, so the "
+                       "vane's voxel staircase itself stays at base resolution. "
+                       "For more SOLID voxels on the vane, use Cascade (it adds "
+                       "real cells in a refinement box). ISLBM = cheap smooth "
+                       "gradient; Cascade = finer voxelization.");
             if (vgDriven)
                 ImGui::TextDisabled("(k driven by the VG resolution target)");
         }

@@ -421,15 +421,19 @@ __global__ void sliceFillKernel(cudaSurfaceObject_t surface,
     } else if (prm.field == 3) {
         // Grid resolution: recover the local cell size from the per-cell tau.
         // tau = 0.5 + 3*nuWall*(dxMin/dxEff)^2  ->  dxEff/dxMin =
-        // 1/sqrt((tau-0.5)/(3*nuWall)). Map dxEff/dxMin in [1, dxRatioMax] to
-        // [0,1]: 0 (palette low) = FINEST cells, 1 (palette high) = coarsest.
-        float ratio = 1.0f; // no stretch field -> flat finest (uniform grid)
+        // 1/sqrt((tau-0.5)/(3*nuWall)). FINEST cells (ratio ~ 1) map BRIGHT/HOT
+        // (palette high) so the refined VG / leading-edge band stands out; the
+        // coarse far field maps dark. The sqrt spreads the compressed fine end
+        // (most of the body sits near ratio 1) across the palette so the gradient
+        // is visible instead of crushed into one color.
+        float ratio = 1.0f; // null tauField (uniform/cascade) -> flat finest
         if (prm.tauField && prm.nuWall > 1e-12f) {
             const float nu = fmaxf((prm.tauField[c] - 0.5f) / 3.0f, 1e-12f);
             ratio = sqrtf(prm.nuWall / nu); // = dxEff/dxMin >= 1
         }
         const float span = fmaxf(prm.dxRatioMax - 1.0f, 1e-6f);
-        tNorm = (ratio - 1.0f) / span;
+        const float frac = fminf(fmaxf((ratio - 1.0f) / span, 0.0f), 1.0f);
+        tNorm = 1.0f - sqrtf(frac); // fine (frac 0) -> 1 bright; coarse -> 0 dark
     } else {
         // Speed magnitude.
         const float3 u = velocityAtCell(vel, x, y, z);

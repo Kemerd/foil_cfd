@@ -56,6 +56,13 @@ constexpr double kGuidancePeriod = 0.5;
 /// Chordwise stations sampled for the delta99 profile / guidance overlay.
 constexpr int kGuidanceStations = 32;
 
+/// Default ISLBM (Stretch) near-wall refinement factor when nothing else drives
+/// it: the leading edge / wall is always refined at least this much finer than
+/// the base grid, so Stretch mode genuinely concentrates resolution at the
+/// action (and the resolution view shows a real gradient) rather than sitting at
+/// a flat base-dx grid. VGs raise it further via the resolution target.
+constexpr int kIslbmDefaultLEFactor = 2;
+
 // z-face free-slip flags for STL mode (plan 7.4): CellFlag::SlipFront/SlipBack
 // landed in lbm_core.cuh and the fused kernel mirrors them via kMirZ, so the
 // stamped planes behave as proper specular walls.
@@ -797,7 +804,10 @@ void applyTransitionTrip(App& app) {
 /// the solver. Ray-casts every vane link against the analytic slabs
 /// (buildVaneQLinks), densifies to the per-cell device layout (densifyQLinks),
 /// counts resolved vs fallen-back links, and uploads via the level's setter.
-/// The solver only keeps it when q-LIBB is enabled. level: 1 = fine, 2 = finer.
+/// The solver only keeps it when q-LIBB is enabled. level: 0 = coarse/base
+/// (the ISLBM stretch grid uses this — its fluid refines but the vane SOLID
+/// stays a base-resolution voxel staircase, so q-LIBB is what actually gives the
+/// vane a sub-cell surface there), 1 = fine, 2 = finer.
 /// @param fallbackOut Receives the count of vane links left at half-way (links
 ///                    with no analytic hit / outside the clamp) for the readout.
 void uploadQLinksForLevel(App& app, const GridDims& dims,
@@ -818,8 +828,9 @@ void uploadQLinksForLevel(App& app, const GridDims& dims,
         for (std::size_t i = 0; i < ql.size(); ++i)
             if (!ql.ffFluid[i] && ql.q[i] < 0.5f) ++fallback;
     }
-    if (level == 1) app.solver.setFineQLinks(qFrac, ffMask, links, fallback);
-    else            app.solver.setFinerQLinks(qFrac, ffMask, links, fallback);
+    if (level == 0)      app.solver.setCoarseQLinks(qFrac, ffMask, links, fallback);
+    else if (level == 1) app.solver.setFineQLinks(qFrac, ffMask, links, fallback);
+    else                 app.solver.setFinerQLinks(qFrac, ffMask, links, fallback);
 }
 
 /// Build a coarse flag field holding ONLY the VG solids (no foil) at the live
@@ -954,28 +965,32 @@ void applyRefinement(App& app) {
         // Continuous near-wall refinement (acoustic re-anchor): drive the finest
         // stretch cell BELOW base dx so a band gets finer-than-base cells (true
         // "resolve the curve"), with the field smoothly coarsening outward.
-        // WHERE the finest cells land is set by the wall-distance field's anchor:
+        // WHERE the finest cells land is set by the wall-distance field's anchor,
+        // and Stretch ALWAYS refines something now (so there is a real gradient):
         //   - VGs present + target on  -> anchor at the VANES (VG-only field), k
-        //     from the VG resolution target,
-        //   - else, manual k > 1       -> anchor at the LEADING EDGE (where the
-        //     stagnation/suction/BL action is when there are no VGs),
-        //   - else (k == 1)            -> legacy: foil wall at base dx.
-        float nearWallK = 1.0f;
+        //     from the VG resolution target (but never below the LE default),
+        //   - else                     -> anchor at the LEADING EDGE (where the
+        //     stagnation / suction peak / BL birth lives), at k = the manual
+        //     slider OR kIslbmDefaultLEFactor, whichever is larger.
+        // k = 1 (no refinement at all) is no longer a default outcome — ISLBM's
+        // whole point is a finer-near-the-action grid.
+        float nearWallK = static_cast<float>(kIslbmDefaultLEFactor);
         std::vector<float> wallDist;
         const int manualK = std::clamp(app.params.refine.islbmNearWallK, 1, 4);
         if (app.params.refine.vgTargetAuto && !app.params.vgs.empty()) {
-            nearWallK = static_cast<float>(recommendedRefineFactorForVGs(
+            const int vgK = recommendedRefineFactorForVGs(
                 app.params.vgs, app.layout.chordCells,
-                app.params.refine.vgTargetCells, kMaxVGTargetFactor));
+                app.params.refine.vgTargetCells, kMaxVGTargetFactor);
+            // Never coarser than the LE default even if a big vane needs no extra
+            // refinement — the near-wall field always concentrates at the vanes.
+            nearWallK = static_cast<float>(std::max(vgK, kIslbmDefaultLEFactor));
             // VG-only distance field: only cells near the vanes become finest.
             wallDist = buildWallDistanceField(app.layout.dims, buildVGOnlyFlags(app));
-        } else if (manualK > 1) {
-            // No VGs (or auto off): anchor the finest cells at the leading edge.
-            nearWallK = static_cast<float>(manualK);
-            wallDist = buildWallDistanceField(app.layout.dims, buildLEAnchorFlags(app));
         } else {
-            // k == 1: the foil wall stays at base dx (legacy stretch behavior).
-            wallDist = buildWallDistanceField(app.layout.dims, app.activeFlags);
+            // No VGs (or VG-auto off): anchor the finest cells at the leading
+            // edge, at the manual k or the default, whichever is larger.
+            nearWallK = static_cast<float>(std::max(manualK, kIslbmDefaultLEFactor));
+            wallDist = buildWallDistanceField(app.layout.dims, buildLEAnchorFlags(app));
         }
         std::string serr;
         if (app.solver.initStretchMode(wallDist, nearWallK, &serr)) {
@@ -991,6 +1006,24 @@ void applyRefinement(App& app) {
                           si.tauFloorClamped ? " [tau-floor clamped]" : "",
                           si.nearWallFactor);
             logLine(msg);
+
+            // q-LIBB sub-cell vane surfaces on the BASE (stretch) grid. ISLBM
+            // refines the FLUID dx but keeps the same lattice cell count, so the
+            // VG SOLID stays a base-resolution voxel staircase — q-LIBB is what
+            // gives the vane a TRUE sub-cell surface there (the finer near-wall
+            // dx then actually resolves the vane curvature instead of a blocky
+            // edge). Build the analytic vane slabs at the base layout and upload
+            // them as the coarse-level q-links (the solver keeps them only when
+            // q-LIBB is on). No VGs -> no slabs -> a no-op clear.
+            app.solver.setQLIBBEnabled(app.params.refine.qlibbVanes);
+            std::vector<VaneSlab> baseSlabs;
+            std::vector<std::uint8_t> baseActive = app.cleanFlags;
+            for (const VGParams& vg : app.params.vgs)
+                voxelizeVG(vg, app.airfoil, app.params.aoaDeg, app.layout,
+                           baseActive, &baseSlabs, &app.vgMeshes);
+            closeTrailingEdgeGaps(app.layout.dims, baseActive);
+            uploadQLinksForLevel(app, app.layout.dims, baseActive, app.cleanFlags,
+                                 baseSlabs, /*level=*/0);
         } else {
             setStatus(app, "stretched mesh unavailable: " + serr
                                + " — running uniform grid");
@@ -1893,18 +1926,23 @@ void updateReadouts(App& app) {
         // box when active (factor * finerFactor), else the fine patch, else 1.
         rr.vgHeightCellsLive = 0.0f;
         rr.vgTargetCells     = 0;
-        if (!app.params.vgs.empty() && !app.stlActive) {
-            // Effective near-wall resolution factor: the cascade's finest level
-            // (nested VG box, else fine patch), OR the ISLBM stretch near-wall
-            // re-anchor k when the stretched mesh owns the resolution. Either way
-            // the vane lives in cells `effFactor` times finer than the base grid.
-            float effFactor = 1.0f;
+        // Effective near-wall resolution factor: the cascade's finest level
+        // (nested VG box, else fine patch), OR the ISLBM stretch near-wall
+        // re-anchor k when the stretched mesh owns the resolution. The vane (and
+        // the wall in general) lives in cells `effFactor` times finer than the
+        // base grid. Computed ALWAYS so the under-resolved warnings judge against
+        // the true effective resolution and clear when genuinely refined.
+        float effFactor = 1.0f;
+        {
             const StretchInfo sinfo = app.solver.stretchInfo();
             if (sinfo.active) effFactor = std::max(1.0f, sinfo.nearWallFactor);
             else if (ri.finerActive) effFactor = static_cast<float>(ri.factor * ri.finerFactor);
             else if (ri.active) effFactor = static_cast<float>(ri.factor);
-            const int effChord = static_cast<int>(std::lround(
-                app.layout.chordCells * std::max(1.0f, effFactor)));
+        }
+        const int effChord = static_cast<int>(std::lround(
+            app.layout.chordCells * std::max(1.0f, effFactor)));
+        rr.effChordCells = effChord;
+        if (!app.params.vgs.empty() && !app.stlActive) {
             // Pick the entry the panel's guidance follows: the selected VG, or
             // the first enabled one when nothing is selected.
             const VGParams* probe = nullptr;
