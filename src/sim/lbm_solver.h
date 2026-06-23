@@ -370,6 +370,18 @@ public:
     /// dx range, achieved growth, wall/far tau, and the fluid-cell saving.
     StretchInfo stretchInfo() const;
 
+    /// @brief Device inputs the slice renderer needs to colormap the LOCAL CELL
+    /// SIZE (grid-resolution view). The per-cell tau encodes dx via
+    /// tau = 0.5 + 3*nuWall*(dxMin/dxEff)^2, so the renderer inverts it to
+    /// dxEff/dxMin and maps it over [1, dxRatioMax]. tauField is null (and the
+    /// field renders flat) when ISLBM is inactive.
+    struct GridResolutionField {
+        const float* tauField = nullptr; ///< Per-cell tau (device, ncells).
+        float nuWall          = 0.0f;    ///< Wall (finest-cell) lattice viscosity.
+        float dxRatioMax      = 1.0f;    ///< dxMax/dxMin (palette coarse end).
+    };
+    GridResolutionField gridResolutionField() const;
+
     /// @brief Refinement status for the UI (zeroed RefinementInfo when off).
     RefinementInfo refinementInfo() const;
 

@@ -2610,10 +2610,13 @@ int runInteractive(App& app) {
         // the real freestream rather than a stale default.
         app.params.viz.freestreamLatticeSpeed = currentULat(app.params);
         if (!app.cudaFailure) {
+            const LBMSolver::GridResolutionField grf =
+                app.solver.gridResolutionField();
+            const GridResolution gridRes{grf.tauField, grf.nuWall, grf.dxRatioMax};
             if (const cudaError_t err = app.viz.updateFields(
                     app.solver.velocityField(), app.solver.deviceRho(),
                     app.solver.deviceFlags(),
-                    static_cast<float>(stepsThisFrame), app.params.viz);
+                    static_cast<float>(stepsThisFrame), app.params.viz, gridRes);
                 err != cudaSuccess) {
                 latchCudaFailure(app, "render field update", err);
             }

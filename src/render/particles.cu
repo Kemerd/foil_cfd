@@ -418,6 +418,18 @@ __global__ void sliceFillKernel(cudaSurfaceObject_t surface,
         // Pressure deviation: p = cs^2 * (rho - 1) in lattice units.
         const float pDev = rho ? kCs2 * (rho[c] - 1.0f) : 0.0f;
         tNorm = 0.5f + 0.5f * pDev / fmaxf(prm.scale, 1e-9f);
+    } else if (prm.field == 3) {
+        // Grid resolution: recover the local cell size from the per-cell tau.
+        // tau = 0.5 + 3*nuWall*(dxMin/dxEff)^2  ->  dxEff/dxMin =
+        // 1/sqrt((tau-0.5)/(3*nuWall)). Map dxEff/dxMin in [1, dxRatioMax] to
+        // [0,1]: 0 (palette low) = FINEST cells, 1 (palette high) = coarsest.
+        float ratio = 1.0f; // no stretch field -> flat finest (uniform grid)
+        if (prm.tauField && prm.nuWall > 1e-12f) {
+            const float nu = fmaxf((prm.tauField[c] - 0.5f) / 3.0f, 1e-12f);
+            ratio = sqrtf(prm.nuWall / nu); // = dxEff/dxMin >= 1
+        }
+        const float span = fmaxf(prm.dxRatioMax - 1.0f, 1e-6f);
+        tNorm = (ratio - 1.0f) / span;
     } else {
         // Speed magnitude.
         const float3 u = velocityAtCell(vel, x, y, z);

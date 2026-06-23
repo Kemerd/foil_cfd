@@ -400,6 +400,7 @@ float defaultSliceScale(SliceField field) {
         case SliceField::SpeedMag:   return 0.15f;
         case SliceField::VorticityZ: return 0.04f;
         case SliceField::Pressure:   return 0.01f;
+        case SliceField::Resolution: return 1.0f; // kernel self-normalizes by dxRatioMax
     }
     return 0.15f;
 }
@@ -1403,7 +1404,8 @@ void Visualizer::uploadStlMesh(const StlMesh& mesh) {
 
 cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
                                      const std::uint8_t* flags, float dtSteps,
-                                     const VizSettings& settings) {
+                                     const VizSettings& settings,
+                                     const GridResolution& gridRes) {
     Impl& im = *impl_;
     if (!im.initialized) return cudaSuccess;
     // The solver may not have valid macroscopic arrays yet (pre-init UI
@@ -1570,6 +1572,13 @@ cudaError_t Visualizer::updateFields(DeviceVelocityField vel, const float* rho,
         sp.scale = defaultSliceScale(cfg->field) * std::max(cfg->rangeScale, 1e-3f);
         sp.width = im.sliceW[axis];
         sp.height = im.sliceH[axis];
+        // Grid-resolution slice (field 3): hand the kernel the ISLBM tau field +
+        // the tau->dx inversion constants so it colormaps the local cell size.
+        if (cfg->field == SliceField::Resolution) {
+            sp.tauField   = gridRes.tauField;
+            sp.nuWall     = gridRes.nuWall;
+            sp.dxRatioMax = gridRes.dxRatioMax;
+        }
         note(launchSliceFill(im.slice[axis].surf, vel, rho, flags, sp, im.stream));
     }
 

@@ -39,8 +39,19 @@ enum class Colormap { Viridis, Coolwarm, Inferno, Rainbow };
 /// @brief What scalar drives particle color (plan 9.1).
 enum class ParticleColorBy { Speed, VorticityMag };
 
-/// @brief Scalar shown on a slice plane (plan 9.1 mode 2).
-enum class SliceField { SpeedMag, VorticityZ, Pressure };
+/// @brief Scalar shown on a slice plane (plan 9.1 mode 2). Resolution shows the
+/// local ISLBM cell size (dx) so the continuous stretched-mesh gradient — finest
+/// at the VG / leading edge, coarsening outward — is directly visible.
+enum class SliceField { SpeedMag, VorticityZ, Pressure, Resolution };
+
+/// @brief Device inputs for the grid-resolution slice (the per-cell tau encodes
+/// the local cell size). Defaults render the field flat (uniform/no-stretch).
+/// Plain POD so the renderer stays decoupled from the solver header.
+struct GridResolution {
+    const float* tauField = nullptr; ///< Per-cell tau (device, ncells).
+    float nuWall          = 0.0f;    ///< Wall (finest-cell) lattice viscosity.
+    float dxRatioMax      = 1.0f;    ///< dxMax/dxMin (palette coarse end).
+};
 
 /// @brief Which axis a slice plane is perpendicular to.
 enum class SliceAxis { X, Y, Z };
@@ -255,10 +266,13 @@ public:
     /// @param flags    Cell flags (particle respawn inside solids).
     /// @param dtSteps  Sim steps advanced this frame (advection time).
     /// @param settings Active view settings.
+    /// @param gridRes  Device tau field + constants for the grid-resolution slice
+    ///                 (default = flat; only consumed by a Resolution slice).
     /// @return CUDA error from the interop/kernel sequence (cudaSuccess normally).
     cudaError_t updateFields(DeviceVelocityField vel, const float* rho,
                              const std::uint8_t* flags, float dtSteps,
-                             const VizSettings& settings);
+                             const VizSettings& settings,
+                             const GridResolution& gridRes = {});
 
     /// @brief Draw the scene with current settings: foil/VG mesh (depth-
     /// tested), slice planes, then particles as additive-blended GL_POINTS

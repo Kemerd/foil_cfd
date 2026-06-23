@@ -1811,15 +1811,23 @@ void drawViewPanel(UIContext& ctx) {
         if (sc.enabled) {
             ImGui::Indent();
             ImGui::SliderInt("Position", &sc.cell, 0, std::max(axisMax[i], 1));
-            static const char* kFields[] = {"|u| speed", "Vorticity z", "Pressure"};
+            static const char* kFields[] = {"|u| speed", "Vorticity z",
+                                            "Pressure", "Grid resolution (dx)"};
             int f = static_cast<int>(sc.field);
-            if (ImGui::Combo("Field", &f, kFields, 3)) {
+            if (ImGui::Combo("Field", &f, kFields, 4)) {
                 sc.field = static_cast<SliceField>(f);
                 // Field choice implies the honest colormap pairing (plan 9.1):
-                // sequential for magnitudes, diverging for signed fields.
-                sc.colormap = (sc.field == SliceField::SpeedMag)
+                // sequential for magnitudes/resolution, diverging for signed.
+                sc.colormap = (sc.field == SliceField::SpeedMag
+                               || sc.field == SliceField::Resolution)
                                   ? Colormap::Viridis : Colormap::Coolwarm;
             }
+            if (sc.field == SliceField::Resolution)
+                helpMarker("Local lattice CELL SIZE on the ISLBM stretched mesh: "
+                           "dark/low = FINEST cells (at the VGs or leading edge), "
+                           "bright/high = coarsest far-field cells. Shows the "
+                           "continuous resolution gradient directly. Only varies "
+                           "in Stretch (ISLBM) mode; flat on a uniform/cascade grid.");
             ImGui::Unindent();
         }
         ImGui::PopID();

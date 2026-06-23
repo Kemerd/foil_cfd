@@ -96,12 +96,22 @@ cudaError_t launchParticleSeed(float4* positions, float* colorKeys, int count,
 struct SliceFillParams {
     int   axis     = 2;    ///< 0 = X, 1 = Y, 2 = Z (plane is perpendicular to it).
     int   cell     = 0;    ///< Plane position along `axis` (caller clamps).
-    int   field    = 0;    ///< 0 = |u|, 1 = vorticity-z, 2 = pressure (cs^2*(rho-1)).
+    int   field    = 0;    ///< 0 = |u|, 1 = vorticity-z, 2 = pressure, 3 = grid
+                           ///< resolution (local ISLBM cell size dx).
     int   colormap = 0;    ///< 0 = viridis (sequential), 1 = coolwarm (diverging).
     float scale    = 0.15f;///< Field value mapped to the palette end (signed
                            ///< fields use +/-scale around the palette center).
     int   width    = 0;    ///< Texture width in texels (see mapping above).
     int   height   = 0;    ///< Texture height in texels.
+
+    // ---- grid-resolution field (field == 3, ISLBM stretched mesh) ----------
+    // The per-cell relaxation tau encodes the local cell size: tau = 0.5 +
+    // 3*nuWall*(dxMin/dxEff)^2, so dxEff/dxMin = 1/sqrt((tau-0.5)/(3*nuWall)).
+    // We colormap dxEff/dxMin (1 = finest, dxRatioMax = coarsest). A null
+    // tauField (uniform/cascade, or no stretch) renders the field flat.
+    const float* tauField = nullptr; ///< Per-cell tau (StretchView::tauField).
+    float nuWall          = 0.0f;    ///< Wall (finest-cell) lattice viscosity.
+    float dxRatioMax      = 1.0f;    ///< dxMax/dxMin, the palette's coarse end.
 };
 
 /// @brief Fill one RGBA8 slice texture: derive the requested scalar at every

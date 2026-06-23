@@ -2515,6 +2515,21 @@ StretchInfo LBMSolver::stretchInfo() const {
     return info;
 }
 
+LBMSolver::GridResolutionField LBMSolver::gridResolutionField() const {
+    GridResolutionField g;
+    const Impl& s = *impl_;
+    if (!s.stretch.active || !s.stretch.dTauField) return g; // flat (uniform)
+    g.tauField = s.stretch.dTauField;
+    // Wall (finest-cell) lattice viscosity = base nu * k (the acoustic re-anchor
+    // — matches buildStretchMesh's nuWall), so the renderer's tau->dx inversion
+    // (dxEff/dxMin = sqrt(nuWall/nu)) is exact.
+    const float nuBase = (s.scaling.tau - 0.5f) / 3.0f;
+    g.nuWall = nuBase * std::max(1.0f, s.stretch.nearWallFactor);
+    g.dxRatioMax = (s.stretch.dxMin > 1e-12f)
+                       ? s.stretch.dxMax / s.stretch.dxMin : 1.0f;
+    return g;
+}
+
 RefinementInfo LBMSolver::refinementInfo() const {
     const Impl& s = *impl_;
     RefinementInfo info;
